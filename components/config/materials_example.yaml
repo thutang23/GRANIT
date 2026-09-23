@@ -1,0 +1,83 @@
+version: 1
+
+materials:
+  - id: 0
+    name: Basalt
+    dem:
+      density: 2700.0
+      youngs_modulus: 5.31e10
+      poisson_ratio: 0.17
+    sph:
+      reference_density: 2700.0
+      eos:
+        model: tillotson
+        a: 0.5
+        b: 1.5
+        A: 2.67e10
+        B: 2.67e10
+        alpha: 5.0
+        beta: 5.0
+        E0: 4.87e8
+        Eiv: 4.72e6
+        Ecv: 1.82e7
+      strength:
+        model: lundborg
+        shear_modulus: 2.27e10
+        Yi0: 1.0e8
+        Yd0: 0.0
+        Ym: 3.5e9
+        mui: 1.5
+        mud: 0.8
+      damage:
+        model: grady_kipp
+        k: 5.0e34
+        m: 8.5
+        crack_speed_fraction: 0.4
+        min_strain: 1.0e-6  # optional numerical activation floor
+      porosity:
+        model: none
+
+  - id: 1
+    name: Nylon
+    dem:
+      density: 1185.0
+      youngs_modulus: 2.19e8
+      poisson_ratio: 0.35
+    sph:
+      reference_density: 1185.0
+      eos:
+        model: tillotson
+        a: 0.6
+        b: 2.0
+        A: 1.01e10
+        B: 3.38e10
+        alpha: 10.0
+        beta: 5.0
+        E0: 7.0e6
+        Eiv: 2.0e6
+        Ecv: 2.4e6
+      strength:
+        model: von_mises
+        shear_modulus: 7.3e7
+        yield_strength_Y0: 1.0e7
+      damage:
+        model: none
+      porosity:
+        model: none
+
+dem_interactions:
+  - materials: [0, 0]
+    restitution: 0.45
+    friction: {static: 0.6, rolling: 0.1, twisting: 0.08}
+    shape_parameter: 0.7
+    cohesion: {model: scheeres, strength: 1000.0, cutoff_factor: 1.1}
+  - materials: [0, 1]
+    restitution: 0.50
+    friction: {static: 0.45, rolling: 0.06, twisting: 0.04}
+    shape_parameter: 0.7
+    cohesion: {model: none}
+  - materials: [1, 1]
+    restitution: 0.60
+    friction: {static: 0.35, rolling: 0.03, twisting: 0.02}
+    shape_parameter: 0.7
+    cohesion: {model: none}

@@ -1,0 +1,224 @@
+{
+  "schema": "granit-sph-integration-overlay-v1",
+  "utc": "2026-09-22T15:35:36.930755+00:00",
+  "upstream_commit": "beb3d5150e177e2c387e85f02a8a6bcf7067f37c",
+  "upstream_manifest_sha256": "c8ff1b26991322b0a370afad109a6a6e916517590521b391ade159a75fb3a89b",
+  "integration_commit": "92f53b8b9cdd25491efeeb86f08f6d5700d71518",
+  "tested_source_commit": "77e607195f54fe5a79cf720e1b23902ca5afdcf9",
+  "verification_report_sha256": "4369ea3ba7dfe0da4f9625d08d3f9108242675b9928af16804b138792e5310af",
+  "verification_receipt": "/home/tangzijie/ssd/paper-differentiated-asteroid-impact-accretion/runs/sph-current-integration-v1/validation-44685",
+  "checks_passed": 95,
+  "source_tree": "/home/tangzijie/ssd/paper-differentiated-asteroid-impact-accretion/.worktrees/granit-sph-current-integration",
+  "target_tree": "/home/tangzijie/ssd/GRANIT",
+  "note": "SOURCE_MANIFEST.json is retained as immutable upstream provenance. These files replace or extend that export; this tree is not pristine upstream.",
+  "files": [
+    {
+      "path": ".gitignore",
+      "sha256": "825d9fdbb3027a12f1210f85662658b0121b96e2c082b5ec4613c082e0f36bd9",
+      "bytes": 45,
+      "replaces_upstream": true
+    },
+    {
+      "path": "components/tests/integration_test/sph_multigpu_validation/README.md",
+      "sha256": "ca781ca59388ddfa04a31f220a61e9e7f96bc2c15fe7abdebb7ee5a170a7ba29",
+      "bytes": 2148,
+      "replaces_upstream": false
+    },
+    {
+      "path": "components/tests/integration_test/sph_multigpu_validation/run_validation.py",
+      "sha256": "ac8beca2feff50f4287f85729e407393492b66add72474be4216434ea55b2033",
+      "bytes": 25156,
+      "replaces_upstream": false
+    },
+    {
+      "path": "components/tests/integration_test/sph_multigpu_validation/validation.slurm",
+      "sha256": "2537f21f17e232c4cf6d62dd67d0af5b98c0b89c08c8df6ce0f7bd5c8bee84d4",
+      "bytes": 1741,
+      "replaces_upstream": false
+    },
+    {
+      "path": "components/tests/integration_test/sph_neighbor_validation/replay_sph_backends.py",
+      "sha256": "833d65553107acf44d40e33490f4cdfa8bb7060e8732cee33e0fd015706f6bba",
+      "bytes": 19348,
+      "replaces_upstream": false
+    },
+    {
+      "path": "components/tests/unit_test/material/check_eos_preservation.py",
+      "sha256": "77fb60f2e740b63087403ebd824d35f82d074c33a2e2fe941c740b2cd6e3d742",
+      "bytes": 1519,
+      "replaces_upstream": false
+    },
+    {
+      "path": "components/tests/unit_test/material/probe_sph_eos.cpp",
+      "sha256": "1d507474b34a89020ccd75c8e93685d5dda2230088b1c085829224edea719eab",
+      "bytes": 1532,
+      "replaces_upstream": false
+    },
+    {
+      "path": "components/tests/unit_test/material/test_material_database.cpp",
+      "sha256": "17c099c6ccbbc5494530cf853f97f7c70af7244210553aa0f13063ced97bfb49",
+      "bytes": 11353,
+      "replaces_upstream": false
+    },
+    {
+      "path": "components/tests/unit_test/material/test_sph_release.cpp",
+      "sha256": "0f533b40aea489e0bbf185f4cdfe3da1dd1102f86f3d58e98fa281422b686d2e",
+      "bytes": 1999,
+      "replaces_upstream": false
+    },
+    {
+      "path": "docs/SPH_MultiGPU_Integration.md",
+      "sha256": "ca3ee9fba1dc3b311238b1e281fee224cac44c2d0ae6b1f0d811f17a535595f3",
+      "bytes": 4021,
+      "replaces_upstream": false
+    },
+    {
+      "path": "docs/SPH_Physics_Stages.md",
+      "sha256": "3c3ff581545165309f8d6ac91752fb426519af0f865c3282c1c5579a5d1b7428",
+      "bytes": 8991,
+      "replaces_upstream": true
+    },
+    {
+      "path": "main_multigpu.cu",
+      "sha256": "6a9192906770bc984666e9b5338cff3e6d7d8e8c38605c25a23d7253a39d141e",
+      "bytes": 208898,
+      "replaces_upstream": true
+    },
+    {
+      "path": "main_sph.cu",
+      "sha256": "d649355f218823b4aa33fdf8c4ca0baee3bde4973b3b892a21798e643bd66fe9",
+      "bytes": 79551,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/body_fitted_fmm_manager.cu",
+      "sha256": "579b56593a441c42a55a5743302445a2493418196c1f03480a4d99bd0083bc49",
+      "bytes": 218101,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/p2p_remote_kernel.cuh",
+      "sha256": "7cde109b655e1fc9805789caf1b00d3584829dddd09abf07ecae507ca855923f",
+      "bytes": 3081,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/p2p_unified.cu",
+      "sha256": "97683c40435b5bc32fc507b77d12d05b95cc6f12d392b6e885591bebc926e829",
+      "bytes": 30171,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/core/acceleration/self_gravity.cu",
+      "sha256": "53cb5aa56f94048ca87302cf7b80dcdf5d9f0d15296a995f724b1a337b72d706",
+      "bytes": 87956,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/core/constant/config_host.cpp",
+      "sha256": "bd38e1e602fa7c86b99025b9c56409a59dd6bca1feda17eb304169292681ba5a",
+      "bytes": 129845,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/core/material/material_database.cpp",
+      "sha256": "0559b93b040c5fe21da680ed210d21d26d4ab8333d80c759099d80fa8762c561",
+      "bytes": 26917,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/core/material/material_database.h",
+      "sha256": "7bdb73261c32607fed9c1e9666c18af638c42b384c9cecc64da8451e528f280c",
+      "bytes": 4035,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/core/sph/sph_damage_math.cuh",
+      "sha256": "54cbb0d91d4ebac95e7254df8ecd8363bb20faa55e8ab0191163f87db227c96b",
+      "bytes": 6153,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/core/sph/sph_energy.cu",
+      "sha256": "666f57629496bc1c20922d0ef30c49f4722e70b4d8401b88e93203a54e9b7cb2",
+      "bytes": 8442,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/core/sph/sph_eos_math.cuh",
+      "sha256": "4f69b708a69e69bc266dd7a8b454a9cf99cd38a2e270a702f054c998bf9da60d",
+      "bytes": 7509,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/core/sph/sph_gravity_correction.h",
+      "sha256": "c92283ca4487379543de168166e8e0ea6488c030117d5123f3fe22edbbf6c088",
+      "bytes": 695,
+      "replaces_upstream": false
+    },
+    {
+      "path": "src/core/sph/sph_physics.cu",
+      "sha256": "c76352548acbbfcee430def28926142fc1eb05a6788ce2f8d442ca03f7eeb510",
+      "bytes": 32053,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/core/sph/sph_physics.h",
+      "sha256": "b8c303f514ea7f8edd877483bba9b349243a378bbe0d629241c11dbb2d51522a",
+      "bytes": 1926,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/core/sph/sph_stage.h",
+      "sha256": "abc9d612f0dae2007ecc429b67e33d02d045de9978ba96985d459b56b65c3356",
+      "bytes": 1376,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/domain/communicator.cu",
+      "sha256": "34af28b1bd99d0deeb09d490f68996ec5d799882238458f43f1b3b10fe905000",
+      "bytes": 73291,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/domain/communicator.h",
+      "sha256": "b97660b9dcd8f0bdf8368d820d718e53becf6bcefad7f6c8129271c220506074",
+      "bytes": 33065,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/domain/domain_manager.cu",
+      "sha256": "0d55d3570ffc213c06266823963fc5883afc864792a3ae802dd5ee3747107e38",
+      "bytes": 60656,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/domain/packer_kernel.cu",
+      "sha256": "92a59960b74a70dacdc97b3ac0e8d15f7eec2028bfa0d834c9f75587ef65c1b8",
+      "bytes": 43853,
+      "replaces_upstream": true
+    },
+    {
+      "path": "src/plugins/scripts/cudadem_pipeline/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "replaces_upstream": false
+    },
+    {
+      "path": "src/plugins/scripts/cudadem_pipeline/common/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "replaces_upstream": false
+    },
+    {
+      "path": "src/plugins/scripts/cudadem_pipeline/common/io.py",
+      "sha256": "fbf2404328fb86ab8d56f23a268e3a2c81b5f0917560a6397853afc89bf37207",
+      "bytes": 32282,
+      "replaces_upstream": false
+    }
+  ],
+  "backup": {
+    "path": "/home/tangzijie/ssd/paper-differentiated-asteroid-impact-accretion/runs/sph-current-integration-v1/delivery/upstream-export-before-integration.tar.gz",
+    "sha256": "10eb48c4256474b5865e0022ecf95daf702a8dce9c7857ab573fcf9648f4f531"
+  }
+}

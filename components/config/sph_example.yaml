@@ -1,0 +1,52 @@
+material_database: materials_example.yaml
+
+simulation:
+  name: SPH multi-material example
+  physics: sph
+  time: {start: 0.0, stop: 0.01, output_step: 0.001}
+
+domain:
+  box_min: [-1.0, -1.0, -1.0]
+  box_max: [1.0, 1.0, 1.0]
+
+sph_parameters:
+  viscosity: 1.0
+  smoothing_length: 0.02
+  num_neighbors: 64
+  density_update_mode: 1
+  enable_shepard_filter: true
+  use_kernel_correction: true
+  use_artificial_stress: true
+  artstr_epsilon: 0.3
+  artstr_n: 4.0
+  gravity_softening_len: 0.01
+  cfl_number: 0.3
+  dt_min: 1.0e-8
+  dt_max: 1.0e-4
+  kernel_cutoff_factor: 2.0
+  hsml_min: 0.005
+  hsml_max: 0.05
+  damage_seed: 12345678  # deterministic Grady-Kipp flaw realization
+
+neighbor:
+  method: lbvh
+
+io:
+  input:
+    particle_file: data/sph_particles_v3.bin
+  output:
+    directory: output/sph_example
+
+gpu: {device_id: 0, block_size: 256}
+
+# These reference examples use no gravity or prescribed frame/ephemeris forces.
+# Inactive FMM settings are explicit because configuration validation reads them.
+accelerations:
+  inertial: {enabled: false}
+  tidal: {enabled: false}
+  self_gravity:
+    enabled: false
+    method: direct
+    unified_fmm:
+      tree_dimension: 3
+      tree_depth: 10

@@ -1,0 +1,551 @@
+#include "distributed_fmm_depth_controller.h"
+
+#include <algorithm>
+#include <cmath>
+
+namespace cudadem {
+namespace {
+
+bool all_ready(const std::vector<bool>& ready) {
+    return !ready.empty() &&
+           std::all_of(ready.begin(), ready.end(), [](bool value) { return value; });
+}
+
+}  // namespace
+
+bool DistributedFMMDepthController::initialize(
+    const AdaptiveDepthConfig& config, int32_t gpu_count,
+    const std::vector<int32_t>& initial_depths) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (initialized_ || !config.enabled || gpu_count <= 0 || gpu_count > kMaxGpus ||
+        (!initial_depths.empty() && static_cast<int32_t>(initial_depths.size()) != gpu_count)) {
+        return false;
+    }
+    config_ = config;
+    gpu_count_ = gpu_count;
+    gpu_states_.assign(gpu_count_, DistributedFMMDepthGpuState{});
+    initial_depth_ready_.assign(gpu_count_, false);
+    stable_count_valid_.assign(gpu_count_, false);
+    mailbox_.resize(kMailboxSlots);
+    for (MailboxSlot& slot : mailbox_) {
+        slot.timings.resize(gpu_count_);
+        slot.present.assign(gpu_count_, false);
+    }
+    initialized_ = true;
+    if (!initial_depths.empty()) {
+        for (int32_t gpu = 0; gpu < gpu_count_; ++gpu) {
+            const int32_t depth = initial_depths[gpu];
+            if (depth < config_.min_depth || depth > config_.max_depth) {
+                freeze_locked("initial FMM depth is outside configured range", 0);
+                return false;
+            }
+            DistributedFMMDepthGpuState& state = gpu_states_[gpu];
+            state.selected_depth = depth;
+            state.candidate_depth = depth;
+            state.effective_max_depth = config_.max_depth;
+            initial_depth_ready_[gpu] = true;
+        }
+    }
+    emit_locked(DistributedFMMDepthEvent::Initialized, 0, -1);
+    return true;
+}
+
+bool DistributedFMMDepthController::set_initial_depth(
+    int32_t gpu, int32_t depth, int32_t effective_max_depth, uint64_t epoch) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_ || frozen_ || !valid_gpu_locked(gpu) ||
+        depth < config_.min_depth || effective_max_depth < config_.min_depth ||
+        effective_max_depth > config_.max_depth || depth > effective_max_depth) {
+        if (initialized_ && !frozen_) freeze_locked("invalid lazy FMM startup depth", epoch);
+        return false;
+    }
+    DistributedFMMDepthGpuState& state = gpu_states_[gpu];
+    if (initial_depth_ready_[gpu] && state.selected_depth != depth) {
+        freeze_locked("conflicting lazy FMM startup depth", epoch);
+        return false;
+    }
+    state.selected_depth = depth;
+    state.candidate_depth = depth;
+    state.effective_max_depth = effective_max_depth;
+    initial_depth_ready_[gpu] = true;
+    emit_locked(DistributedFMMDepthEvent::Initialized, epoch, gpu);
+    return true;
+}
+
+bool DistributedFMMDepthController::enabled() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return initialized_ && config_.enabled;
+}
+
+bool DistributedFMMDepthController::frozen() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return frozen_;
+}
+
+std::string DistributedFMMDepthController::failure_reason() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return failure_reason_;
+}
+
+int32_t DistributedFMMDepthController::gpu_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return gpu_count_;
+}
+
+DistributedFMMDepthCommand
+DistributedFMMDepthController::command_for_gpu(int32_t gpu) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    DistributedFMMDepthCommand command{};
+    if (!valid_gpu_locked(gpu) || !initial_depth_ready_[gpu]) return command;
+    const DistributedFMMDepthGpuState& state = gpu_states_[gpu];
+    command.launch_depth = state.selected_depth;
+    command.trial_id = active_trial_id_;
+    command.exclude_from_rcb = active_trial_id_ != 0;
+    if (!frozen_ && active_trial_id_ != 0 && gpu == active_owner_ &&
+        phase_uses_candidate_locked()) {
+        command.launch_depth = state.candidate_depth;
+    }
+    return command;
+}
+
+DistributedFMMDepthGpuState
+DistributedFMMDepthController::state_for_gpu(int32_t gpu) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return valid_gpu_locked(gpu) ? gpu_states_[gpu] : DistributedFMMDepthGpuState{};
+}
+
+bool DistributedFMMDepthController::trial_active() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return active_trial_id_ != 0;
+}
+
+uint64_t DistributedFMMDepthController::active_trial_id() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return active_trial_id_;
+}
+
+bool DistributedFMMDepthController::publish_timing(
+    int32_t gpu, const DistributedFMMDepthEpochTiming& timing) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_ || !valid_gpu_locked(gpu) || timing.epoch == 0) {
+        if (initialized_ && !frozen_) freeze_locked("invalid distributed FMM timing record", timing.epoch);
+        return false;
+    }
+    if (timing.epoch <= last_processed_epoch_ ||
+        timing.epoch < discarded_before_epoch_) {
+        emit_locked(DistributedFMMDepthEvent::SampleDropped, timing.epoch, gpu);
+        return false;
+    }
+    MailboxSlot& slot = mailbox_[timing.epoch % kMailboxSlots];
+    if (slot.epoch != 0 && slot.epoch != timing.epoch) {
+        if (slot.epoch < timing.epoch) {
+            const uint64_t overwritten = slot.epoch;
+            slot.epoch = 0;
+            std::fill(slot.present.begin(), slot.present.end(), false);
+            emit_locked(DistributedFMMDepthEvent::SampleDropped, overwritten, -1);
+            cancel_trial_locked(overwritten,
+                                DistributedFMMDepthCancelReason::IncompleteTelemetry);
+        } else {
+            emit_locked(DistributedFMMDepthEvent::SampleDropped, timing.epoch, gpu);
+            return false;
+        }
+    }
+    if (slot.epoch == 0) slot.epoch = timing.epoch;
+    if (slot.present[gpu]) {
+        freeze_locked("duplicate distributed FMM timing record", timing.epoch);
+        return false;
+    }
+    slot.timings[gpu] = timing;
+    slot.present[gpu] = true;
+    return true;
+}
+
+size_t DistributedFMMDepthController::process_ready_epochs() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_ || frozen_) return 0;
+    size_t processed = 0;
+    for (;;) {
+        MailboxSlot* ready = nullptr;
+        for (MailboxSlot& slot : mailbox_) {
+            if (slot.epoch == 0 || slot.epoch <= last_processed_epoch_ ||
+                !std::all_of(slot.present.begin(), slot.present.end(),
+                             [](bool value) { return value; })) {
+                continue;
+            }
+            if (!ready || slot.epoch < ready->epoch) ready = &slot;
+        }
+        if (!ready) break;
+        const uint64_t epoch = ready->epoch;
+        process_epoch_locked(epoch, ready->timings);
+        ready->epoch = 0;
+        std::fill(ready->present.begin(), ready->present.end(), false);
+        last_processed_epoch_ = epoch;
+        ++processed;
+        if (frozen_) break;
+    }
+    return processed;
+}
+
+void DistributedFMMDepthController::discard_timing_before(uint64_t epoch) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_) return;
+    discarded_before_epoch_ = std::max(discarded_before_epoch_, epoch);
+    for (MailboxSlot& slot : mailbox_) {
+        if (slot.epoch != 0 && slot.epoch < epoch) {
+            emit_locked(DistributedFMMDepthEvent::SampleDropped, slot.epoch, -1);
+            slot.epoch = 0;
+            std::fill(slot.present.begin(), slot.present.end(), false);
+            cancel_trial_locked(epoch, DistributedFMMDepthCancelReason::IncompleteTelemetry);
+        }
+    }
+}
+
+void DistributedFMMDepthController::notify_disruptive_event(
+    uint64_t epoch, DistributedFMMDepthCancelReason reason) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (initialized_ && !frozen_) cancel_trial_locked(epoch, reason);
+}
+
+void DistributedFMMDepthController::set_effective_max_depth(
+    int32_t gpu, int32_t effective_max_depth, uint64_t epoch) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_ || frozen_ || !valid_gpu_locked(gpu) ||
+        effective_max_depth < config_.min_depth || effective_max_depth > config_.max_depth) {
+        if (initialized_ && !frozen_) freeze_locked("invalid distributed FMM effective ceiling", epoch);
+        return;
+    }
+    DistributedFMMDepthGpuState& state = gpu_states_[gpu];
+    state.effective_max_depth = effective_max_depth;
+    state.selected_depth = std::min(state.selected_depth, effective_max_depth);
+    state.candidate_depth = state.selected_depth;
+    state.confirmation_count = 0;
+    cancel_trial_locked(epoch, DistributedFMMDepthCancelReason::CapacityService);
+    emit_locked(DistributedFMMDepthEvent::EffectiveCeilingChanged, epoch, gpu);
+}
+
+void DistributedFMMDepthController::freeze(const std::string& reason, uint64_t epoch) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    freeze_locked(reason, epoch);
+}
+
+std::vector<DistributedFMMDepthDiagnostic>
+DistributedFMMDepthController::diagnostics() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return diagnostics_;
+}
+
+uint64_t DistributedFMMDepthController::dropped_diagnostics() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return dropped_diagnostics_;
+}
+
+bool DistributedFMMDepthController::valid_gpu_locked(int32_t gpu) const {
+    return gpu >= 0 && gpu < gpu_count_;
+}
+
+void DistributedFMMDepthController::process_epoch_locked(
+    uint64_t epoch, const std::vector<DistributedFMMDepthEpochTiming>& timings) {
+    if (timings.size() != static_cast<size_t>(gpu_count_)) {
+        freeze_locked("incomplete distributed FMM timing vector", epoch);
+        return;
+    }
+    if (!all_ready(initial_depth_ready_)) return;
+    if (std::any_of(timings.begin(), timings.end(),
+                    [](const DistributedFMMDepthEpochTiming& t) { return t.rcb_accepted; })) {
+        cancel_trial_locked(epoch, DistributedFMMDepthCancelReason::Rebalance);
+        return;
+    }
+    if (std::any_of(timings.begin(), timings.end(),
+                    [](const DistributedFMMDepthEpochTiming& t) { return t.capacity_event; })) {
+        cancel_trial_locked(epoch, DistributedFMMDepthCancelReason::CapacityService);
+        return;
+    }
+    if (std::any_of(timings.begin(), timings.end(),
+                    [](const DistributedFMMDepthEpochTiming& t) { return t.yorp_transition; })) {
+        cancel_trial_locked(epoch, DistributedFMMDepthCancelReason::YorpTransition);
+        return;
+    }
+    if (std::any_of(timings.begin(), timings.end(),
+                    [](const DistributedFMMDepthEpochTiming& t) { return t.local_count_changed; })) {
+        cancel_trial_locked(epoch, DistributedFMMDepthCancelReason::LocalCountChange);
+        return;
+    }
+    // Do not let an asynchronously completed record be interpreted against a
+    // newer controller state.  A dropped record is an optimization miss, not
+    // a physics failure, so the current selected depths remain live.
+    const bool command_matches = active_trial_id_ == 0
+        ? timing_matches_selected_commands_locked(timings)
+        : timing_matches_active_phase_locked(timings);
+    if (!command_matches) {
+        emit_locked(DistributedFMMDepthEvent::SampleDropped, epoch, active_owner_);
+        return;
+    }
+    for (const auto& timing : timings) {
+        if (!timing.telemetry_valid || timing.elapsed_ns == 0) {
+            freeze_locked("invalid distributed FMM telemetry", epoch);
+            return;
+        }
+    }
+    if (counts_changed_locked(timings)) {
+        for (int32_t gpu = 0; gpu < gpu_count_; ++gpu) {
+            gpu_states_[gpu].stable_local_owned_particles = timings[gpu].local_owned_particles;
+            stable_count_valid_[gpu] = true;
+        }
+        cancel_trial_locked(epoch, DistributedFMMDepthCancelReason::LocalCountChange);
+        return;
+    }
+    for (int32_t gpu = 0; gpu < gpu_count_; ++gpu) {
+        gpu_states_[gpu].stable_local_owned_particles = timings[gpu].local_owned_particles;
+        stable_count_valid_[gpu] = true;
+    }
+
+    if (active_trial_id_ == 0) {
+        for (DistributedFMMDepthGpuState& state : gpu_states_)
+            ++state.selected_evaluations_since_trial;
+        if (gpu_states_[next_owner_].selected_evaluations_since_trial >=
+            config_.trial_interval_evaluations) {
+            begin_next_trial_locked(epoch);
+        }
+        return;
+    }
+
+    const Aggregate aggregate = aggregate_locked(timings);
+    if (warmups_remaining_ > 0) {
+        --warmups_remaining_;
+        return;
+    }
+    if (phase_uses_candidate_locked()) {
+        total_b_.max_ms += aggregate.max_ms;
+        total_b_.mean_ms += aggregate.mean_ms;
+        total_b_.let_bytes += aggregate.let_bytes;
+        ++samples_b_;
+    } else {
+        total_a_.max_ms += aggregate.max_ms;
+        total_a_.mean_ms += aggregate.mean_ms;
+        total_a_.let_bytes += aggregate.let_bytes;
+        ++samples_a_;
+    }
+    ++phase_samples_;
+    emit_locked(DistributedFMMDepthEvent::TrialSample, epoch, active_owner_, &aggregate);
+    // Every A/B/B/A phase owns a full, independently sized sample block.
+    // This preserves the time-symmetric order even when trial_samples is one.
+    if (phase_samples_ < static_cast<uint64_t>(config_.trial_samples)) return;
+    if (phase_ == TrialPhase::SelectedA2) {
+        finish_trial_locked(epoch);
+        return;
+    }
+    advance_phase_locked();
+}
+
+void DistributedFMMDepthController::begin_next_trial_locked(uint64_t epoch) {
+    if (frozen_ || !all_ready(initial_depth_ready_)) return;
+    const int32_t owner = next_owner_;
+    next_owner_ = (next_owner_ + 1) % gpu_count_;
+    DistributedFMMDepthGpuState& state = gpu_states_[owner];
+    state.candidate_depth = candidate_for_locked(owner);
+    if (state.candidate_depth == state.selected_depth) {
+        state.search_direction = -state.search_direction;
+        state.candidate_depth = candidate_for_locked(owner);
+    }
+    if (state.candidate_depth == state.selected_depth) {
+        state.selected_evaluations_since_trial = 0;
+        return;
+    }
+    active_owner_ = owner;
+    active_trial_id_ = next_trial_id_++;
+    phase_ = TrialPhase::SelectedA;
+    warmups_remaining_ = 0;
+    phase_samples_ = 0;
+    samples_a_ = samples_b_ = 0;
+    total_a_ = Aggregate{};
+    total_b_ = Aggregate{};
+    state.selected_evaluations_since_trial = 0;
+    emit_locked(DistributedFMMDepthEvent::TrialStarted, epoch, owner);
+}
+
+void DistributedFMMDepthController::cancel_trial_locked(
+    uint64_t epoch, DistributedFMMDepthCancelReason reason) {
+    if (active_trial_id_ == 0) return;
+    DistributedFMMDepthGpuState& state = gpu_states_[active_owner_];
+    state.candidate_depth = state.selected_depth;
+    state.confirmation_count = 0;
+    state.selected_evaluations_since_trial = 0;
+    emit_locked(DistributedFMMDepthEvent::TrialCancelled, epoch, active_owner_, nullptr, 0.0, reason);
+    active_trial_id_ = 0;
+    active_owner_ = -1;
+    warmups_remaining_ = 0;
+    phase_samples_ = 0;
+    samples_a_ = samples_b_ = 0;
+    total_a_ = Aggregate{};
+    total_b_ = Aggregate{};
+}
+
+void DistributedFMMDepthController::finish_trial_locked(uint64_t epoch) {
+    const int32_t owner = active_owner_;
+    DistributedFMMDepthGpuState& state = gpu_states_[owner];
+    Aggregate baseline = total_a_;
+    Aggregate candidate = total_b_;
+    baseline.max_ms /= static_cast<double>(samples_a_);
+    baseline.mean_ms /= static_cast<double>(samples_a_);
+    baseline.let_bytes /= samples_a_;
+    candidate.max_ms /= static_cast<double>(samples_b_);
+    candidate.mean_ms /= static_cast<double>(samples_b_);
+    candidate.let_bytes /= samples_b_;
+    const double primary = baseline.max_ms > 0.0
+        ? (baseline.max_ms - candidate.max_ms) / baseline.max_ms : 0.0;
+    const double secondary = baseline.mean_ms > 0.0
+        ? (baseline.mean_ms - candidate.mean_ms) / baseline.mean_ms : 0.0;
+    const double threshold = config_.min_improvement_fraction;
+    bool candidate_wins = false;
+    if (std::fabs(primary) >= threshold) {
+        candidate_wins = primary > 0.0;
+    } else if (std::fabs(secondary) >= threshold) {
+        candidate_wins = secondary > 0.0;
+    } else if (candidate.let_bytes != baseline.let_bytes) {
+        candidate_wins = candidate.let_bytes < baseline.let_bytes;
+    }
+    if (candidate_wins) {
+        ++state.confirmation_count;
+        emit_locked(DistributedFMMDepthEvent::TrialConfirmed, epoch, owner,
+                    &candidate, primary);
+        if (state.confirmation_count >= config_.confirmation_trials) {
+            const int32_t previous_selected = state.selected_depth;
+            state.selected_depth = state.candidate_depth;
+            state.candidate_depth = state.selected_depth;
+            state.confirmation_count = 0;
+            state.search_direction = state.selected_depth > previous_selected ? 1 : -1;
+            emit_locked(DistributedFMMDepthEvent::DepthAdopted, epoch, owner,
+                        &candidate, primary);
+        }
+    } else {
+        state.confirmation_count = 0;
+        state.search_direction = -state.search_direction;
+        state.candidate_depth = state.selected_depth;
+        emit_locked(DistributedFMMDepthEvent::CandidateRejected, epoch, owner,
+                    &candidate, primary);
+    }
+    state.selected_evaluations_since_trial = 0;
+    active_trial_id_ = 0;
+    active_owner_ = -1;
+    samples_a_ = samples_b_ = 0;
+    phase_samples_ = 0;
+    total_a_ = Aggregate{};
+    total_b_ = Aggregate{};
+}
+
+void DistributedFMMDepthController::freeze_locked(const std::string& reason, uint64_t epoch) {
+    if (frozen_) return;
+    frozen_ = true;
+    failure_reason_ = reason;
+    if (active_owner_ >= 0) gpu_states_[active_owner_].candidate_depth =
+        gpu_states_[active_owner_].selected_depth;
+    active_trial_id_ = 0;
+    active_owner_ = -1;
+    emit_locked(DistributedFMMDepthEvent::Frozen, epoch, -1);
+}
+
+void DistributedFMMDepthController::emit_locked(
+    DistributedFMMDepthEvent event, uint64_t epoch, int32_t gpu,
+    const Aggregate* aggregate, double improvement,
+    DistributedFMMDepthCancelReason reason) {
+    DistributedFMMDepthDiagnostic record{};
+    record.sequence = next_sequence_++;
+    record.epoch = epoch;
+    record.trial_id = active_trial_id_;
+    record.gpu_id = gpu;
+    if (valid_gpu_locked(gpu)) {
+        record.selected_depth = gpu_states_[gpu].selected_depth;
+        record.candidate_depth = gpu_states_[gpu].candidate_depth;
+    }
+    if (aggregate) {
+        record.global_max_ms = aggregate->max_ms;
+        record.global_mean_ms = aggregate->mean_ms;
+        record.let_bytes = aggregate->let_bytes;
+    }
+    record.primary_relative_improvement = improvement;
+    record.event = event;
+    record.cancel_reason = reason;
+    if (diagnostics_.size() == kDiagnosticCapacity) {
+        diagnostics_.erase(diagnostics_.begin());
+        ++dropped_diagnostics_;
+    }
+    diagnostics_.push_back(record);
+}
+
+DistributedFMMDepthController::Aggregate
+DistributedFMMDepthController::aggregate_locked(
+    const std::vector<DistributedFMMDepthEpochTiming>& timings) const {
+    Aggregate result{};
+    for (const auto& timing : timings) {
+        const double ms = static_cast<double>(timing.elapsed_ns) / 1.0e6;
+        result.max_ms = std::max(result.max_ms, ms);
+        result.mean_ms += timing.aggregate_mean_ns ? static_cast<double>(timing.aggregate_mean_ns)/1.0e6 : ms;
+        result.let_bytes += timing.let_bytes;
+    }
+    result.mean_ms /= static_cast<double>(timings.size());
+    return result;
+}
+
+bool DistributedFMMDepthController::counts_changed_locked(
+    const std::vector<DistributedFMMDepthEpochTiming>& timings) const {
+    for (int32_t gpu = 0; gpu < gpu_count_; ++gpu) {
+        if (!stable_count_valid_[gpu]) continue;
+        const double prior = std::fabs(static_cast<double>(
+            gpu_states_[gpu].stable_local_owned_particles));
+        const double delta = std::fabs(static_cast<double>(timings[gpu].local_owned_particles) -
+                                       static_cast<double>(gpu_states_[gpu].stable_local_owned_particles));
+        const double denominator = std::max(1.0, prior);
+        if (delta / denominator > config_.multigpu.local_count_reset_fraction) return true;
+    }
+    return false;
+}
+
+bool DistributedFMMDepthController::timing_matches_active_phase_locked(
+    const std::vector<DistributedFMMDepthEpochTiming>& timings) const {
+    if (active_trial_id_ == 0 || !valid_gpu_locked(active_owner_)) return false;
+    const DistributedFMMDepthGpuState& owner = gpu_states_[active_owner_];
+    const int32_t expected_depth = phase_uses_candidate_locked()
+        ? owner.candidate_depth : owner.selected_depth;
+    const DistributedFMMDepthEpochTiming& timing = timings[active_owner_];
+    return timing.command_trial_id == active_trial_id_ &&
+           timing.launch_depth == expected_depth;
+}
+
+bool DistributedFMMDepthController::timing_matches_selected_commands_locked(
+    const std::vector<DistributedFMMDepthEpochTiming>& timings) const {
+    // A completed command from a just-finished trial must not be counted as a
+    // selected-depth interval of the next trial.  Check every GPU here because
+    // there is no active owner to identify the stale one.
+    for (int32_t gpu = 0; gpu < gpu_count_; ++gpu) {
+        if (timings[gpu].command_trial_id != 0 ||
+            timings[gpu].launch_depth != gpu_states_[gpu].selected_depth) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool DistributedFMMDepthController::phase_uses_candidate_locked() const {
+    return phase_ == TrialPhase::CandidateB || phase_ == TrialPhase::CandidateB2;
+}
+
+void DistributedFMMDepthController::advance_phase_locked() {
+    const bool old_candidate = phase_uses_candidate_locked();
+    switch (phase_) {
+        case TrialPhase::SelectedA: phase_ = TrialPhase::CandidateB; break;
+        case TrialPhase::CandidateB: phase_ = TrialPhase::CandidateB2; break;
+        case TrialPhase::CandidateB2: phase_ = TrialPhase::SelectedA2; break;
+        case TrialPhase::SelectedA2: phase_ = TrialPhase::SelectedA; break;
+    }
+    if (old_candidate != phase_uses_candidate_locked())
+        warmups_remaining_ = config_.trial_warmup_evaluations;
+    phase_samples_ = 0;
+}
+
+int32_t DistributedFMMDepthController::candidate_for_locked(int32_t gpu) const {
+    const DistributedFMMDepthGpuState& state = gpu_states_[gpu];
+    const int32_t raw = state.selected_depth + (state.search_direction >= 0 ? 1 : -1);
+    return std::max(config_.min_depth, std::min(raw, state.effective_max_depth));
+}
+
+}  // namespace cudadem

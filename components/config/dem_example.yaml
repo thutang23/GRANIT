@@ -1,0 +1,43 @@
+material_database: materials_example.yaml
+
+simulation:
+  name: DEM multi-material example
+  physics: dem
+  time: {start: 0.0, stop: 1.0, output_step: 0.1, dt_factor: 0.2}
+
+dem:
+  damping_model: restitution
+
+domain:
+  box_min: [-1.0, -1.0, -1.0]
+  box_max: [1.0, 1.0, 1.0]
+
+walls:
+  - id: 1
+    type: plain
+    material_id: 0
+    position: [0.0, 0.0, -1.0]
+    normal: [0.0, 0.0, 1.0]
+
+neighbor:
+  method: cll
+
+io:
+  input:
+    particle_file: data/dem_particles_v3.bin
+  output:
+    directory: output/dem_example
+
+gpu: {device_id: 0, block_size: 256}
+
+# These reference examples use no gravity or prescribed frame/ephemeris forces.
+# Inactive FMM settings are explicit because configuration validation reads them.
+accelerations:
+  inertial: {enabled: false}
+  tidal: {enabled: false}
+  self_gravity:
+    enabled: false
+    method: direct
+    unified_fmm:
+      tree_dimension: 3
+      tree_depth: 10

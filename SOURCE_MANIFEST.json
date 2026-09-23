@@ -1,0 +1,1326 @@
+{
+  "schema": "granit-production-source-v1",
+  "source_commit": "beb3d5150e177e2c387e85f02a8a6bcf7067f37c",
+  "source_dirty": false,
+  "source_status": [],
+  "source_entrypoints": [
+    "main.cu",
+    "main_multigpu.cu",
+    "main_sph.cu",
+    "src/core/acceleration/acceleration_field_texture.cu",
+    "src/core/acceleration/body_fitted_fmm/body_fitted_fmm_manager.cu",
+    "src/core/acceleration/external_bodies.cu",
+    "src/core/acceleration/inertial_acceleration.cu",
+    "src/core/acceleration/self_gravity.cu",
+    "src/core/acceleration/tidal_acceleration.cu",
+    "src/core/constant/binary_reader.cpp",
+    "src/core/constant/config_device.cu",
+    "src/core/constant/config_host.cpp",
+    "src/core/constant/system_initialize_host.cpp",
+    "src/core/material/material_database.cpp",
+    "src/core/neighbor/cll/cll_kernels.cu",
+    "src/core/neighbor/direct/direct_kernels.cu",
+    "src/core/neighbor/lbvh/lbvh_kernels.cu",
+    "src/core/neighbor/rt/rt_backend.cu",
+    "src/core/neighbor/rt/rt_device.cu",
+    "src/core/particle_model/clump.cu",
+    "src/core/particle_model/clump_init.cpp",
+    "src/core/particle_model/sphere_dynamic.cu",
+    "src/core/shear/shear_box.cu",
+    "src/core/shear/shear_phase.cpp",
+    "src/core/sph/sph_boundary.cu",
+    "src/core/sph/sph_config_printer.cpp",
+    "src/core/sph/sph_damage.cu",
+    "src/core/sph/sph_energy.cu",
+    "src/core/sph/sph_history.cu",
+    "src/core/sph/sph_input.cpp",
+    "src/core/sph/sph_physics.cu",
+    "src/core/sph/sph_porosity.cu",
+    "src/core/sph/sph_strength.cu",
+    "src/core/sph/sph_timestep.cu",
+    "src/core/wall/bonded_rect_wall.cu",
+    "src/core/wall/funnel_wall.cu",
+    "src/core/wall/periodical_boundary.cu",
+    "src/core/wall/plain_wall.cu",
+    "src/core/wall/sphere_wall.cu",
+    "src/core/wall/trimesh_loader.cpp",
+    "src/core/wall/trimesh_wall.cu",
+    "src/core/wall/wall_manager.cu",
+    "src/domain/communicator.cu",
+    "src/domain/distributed_fmm_depth_controller.cpp",
+    "src/domain/domain_manager.cu",
+    "src/domain/let_communicator.cu",
+    "src/domain/let_kernels_fmm.cu",
+    "src/domain/packer_kernel.cu",
+    "src/domain/rcb_balancer.cu",
+    "src/domain/rcb_kernels.cu",
+    "src/domain/rcb_work_model.cpp"
+  ],
+  "production_code_count": 176,
+  "source_code_excluded": [
+    "include/cuda_mock.h",
+    "include/thrust_mock.h",
+    "src/core/acceleration/body_fitted_fmm/body_fitted_validate.cu",
+    "src/core/acceleration/body_fitted_fmm/body_fitted_validate_census.cuh",
+    "src/core/acceleration/body_fitted_fmm/body_fitted_validate_checkpoint.cuh",
+    "src/core/acceleration/body_fitted_fmm/body_fitted_validate_expansion_reset.cuh",
+    "src/core/acceleration/body_fitted_fmm/body_fitted_validate_tree_rebuild.cuh",
+    "src/core/acceleration/body_fitted_fmm/morton_helpers.cuh",
+    "src/domain/rcb_weight_projector.h"
+  ],
+  "conditional_headers_excluded": [
+    "include/cuda_mock.h",
+    "include/thrust_mock.h"
+  ],
+  "external_or_generated_includes": [
+    "algorithm",
+    "array",
+    "atomic",
+    "cassert",
+    "cfloat",
+    "chrono",
+    "climits",
+    "cmath",
+    "condition_variable",
+    "cstddef",
+    "cstdint",
+    "cstdio",
+    "cstdlib",
+    "cstring",
+    "ctime",
+    "cub/cub.cuh",
+    "cub/device/device_segmented_reduce.cuh",
+    "cuco/static_map.cuh",
+    "cuda.h",
+    "cuda/std/atomic",
+    "cuda_runtime.h",
+    "cuda_texture_types.h",
+    "cufft.h",
+    "filesystem",
+    "fstream",
+    "functional",
+    "iomanip",
+    "iostream",
+    "limits",
+    "map",
+    "math_constants.h",
+    "memory",
+    "mma.h",
+    "mochi_ptx.h",
+    "mutex",
+    "new",
+    "numeric",
+    "nvml.h",
+    "nvtx3/nvToolsExt.h",
+    "omp.h",
+    "optix.h",
+    "optix_device.h",
+    "optix_function_table_definition.h",
+    "optix_stack_size.h",
+    "optix_stubs.h",
+    "set",
+    "sstream",
+    "stdexcept",
+    "string",
+    "thread",
+    "thrust/device_ptr.h",
+    "thrust/execution_policy.h",
+    "thrust/extrema.h",
+    "thrust/fill.h",
+    "thrust/functional.h",
+    "thrust/gather.h",
+    "thrust/iterator/constant_iterator.h",
+    "thrust/iterator/counting_iterator.h",
+    "thrust/iterator/zip_iterator.h",
+    "thrust/reduce.h",
+    "thrust/scan.h",
+    "thrust/sequence.h",
+    "thrust/sort.h",
+    "thrust/tuple.h",
+    "thrust/unique.h",
+    "type_traits",
+    "unordered_map",
+    "unordered_set",
+    "utility",
+    "vector",
+    "yaml-cpp/yaml.h"
+  ],
+  "dependencies": {
+    "cucollections": "7c27c5a12b52be30c0c900595a469d1c35bf9714",
+    "yaml-cpp": "f7320141120f720aecc4c32be25586e7da9eb978",
+    "optix": "f60c1e44f18426f426a2ed948f28515b3cf67b8a"
+  },
+  "package_policy": "Production CUDA/C++ include closure; no tests, CPU mocks, Python, build artifacts, experiments, profiles, or results",
+  "files": [
+    {
+      "path": ".gitignore",
+      "origin": "production-export-template",
+      "sha256": "05197bbcdab59b90d932b158275dd63c8e22fa9b250e6da98d2f688bc000729b",
+      "bytes": 25
+    },
+    {
+      "path": "CMakeLists.txt",
+      "origin": "production-export-template",
+      "sha256": "8b45a4034ebda05d45d35d4eff411295bb429fd63c65a6bc97b0ff2f9ecc49ea",
+      "bytes": 8348
+    },
+    {
+      "path": "CONTRIBUTING.md",
+      "origin": "existing-public-notices",
+      "sha256": "0aba0d38e21e1eb2e7dd9d634802a7dd2cf3102c8305e01297f6eaa8efd9cb10",
+      "bytes": 771
+    },
+    {
+      "path": "LICENSE",
+      "origin": "existing-public-notices",
+      "sha256": "3a7619f3cb970fb240c26e5a5cba3a031319822685f02d4c47d2c5ea916cd41a",
+      "bytes": 1496
+    },
+    {
+      "path": "README.md",
+      "origin": "production-export-template",
+      "sha256": "d33017527695eb4ae8eb4925b7ad3b174937ef8cc70a8bff32f240f49ae8fd7c",
+      "bytes": 3638
+    },
+    {
+      "path": "THIRD_PARTY.md",
+      "origin": "existing-public-notices; production dependency scope",
+      "sha256": "e759d6a5057d0245df214f23c90301453be37d2b437fc991f3627338a10db0a8",
+      "bytes": 2616
+    },
+    {
+      "path": "cmake/EmbedOptixPtx.cmake",
+      "origin": "integrated-main",
+      "sha256": "7219a2d49cc97f69666c050cde82f46cec83faa6cc7121c4f843475c2f9f1f87",
+      "bytes": 572
+    },
+    {
+      "path": "cmake/GranitOptix.cmake",
+      "origin": "integrated-main; export default OptiX OFF",
+      "sha256": "f1e123e5f055a4924f0c53acf87edd33277624ae38ae45f31a781bc05669a808",
+      "bytes": 5669
+    },
+    {
+      "path": "components/config/dem_example.yaml",
+      "origin": "integrated-main; explicit inactive accelerations for reference configuration",
+      "sha256": "194e0b46ee29437bb17e18360c4ff8988c7022431fc472d399b65c88fb4132b8",
+      "bytes": 899
+    },
+    {
+      "path": "components/config/materials_example.yaml",
+      "origin": "integrated-main",
+      "sha256": "294613b3b50aa7c21d25947f024bdc1d8c51e5d4502d59faef833e6298c30239",
+      "bytes": 1801
+    },
+    {
+      "path": "components/config/sph_example.yaml",
+      "origin": "integrated-main; explicit inactive accelerations for reference configuration",
+      "sha256": "46c92a22ecd4fc2106ea109641a34288d8b0f838e74376ecbf533fb81e1ed64a",
+      "bytes": 1186
+    },
+    {
+      "path": "docs/DEM_Auxiliary_Input_Formats.md",
+      "origin": "integrated-main; runtime documentation excerpt",
+      "sha256": "67d61ca4cd80133f3be31f8c985a3da9fcf415781b48fbf7b981169604de7c4f",
+      "bytes": 7243
+    },
+    {
+      "path": "docs/SPH_Physics_Stages.md",
+      "origin": "integrated-main; runtime documentation excerpt",
+      "sha256": "2031ce4054d92eee0e6c0e23160e64d2575eeb863af58167bdf5be705bbc96a4",
+      "bytes": 8603
+    },
+    {
+      "path": "docs/YAML_Configuration_Guide.md",
+      "origin": "integrated-main; runtime documentation excerpt",
+      "sha256": "2ad2afe539cc639088cdc4e7d0e10008dda25fa17fb05b3fd42d5ee41aa90b35",
+      "bytes": 15199
+    },
+    {
+      "path": "docs/io_formats.md",
+      "origin": "integrated-main; runtime documentation excerpt",
+      "sha256": "f3b4d8f31665394ce1a3b3bcc294fed331dea972dd979174556516f5f3387f8a",
+      "bytes": 6249
+    },
+    {
+      "path": "docs/material_database.md",
+      "origin": "integrated-main; runtime documentation excerpt",
+      "sha256": "487483c10a7920881e8b948af9b3254296cdb4ab8a511419d43c6e835ef4f67c",
+      "bytes": 4056
+    },
+    {
+      "path": "docs/neighbor_rt.md",
+      "origin": "integrated-main; runtime documentation excerpt",
+      "sha256": "48e2e76aa66f1312c703950126b4396d36b956ba39c9364c09bd92393154fd7a",
+      "bytes": 8963
+    },
+    {
+      "path": "docs/shear_box.md",
+      "origin": "integrated-main; runtime documentation excerpt",
+      "sha256": "db0ef929ba87a75abab0121a1d8aa0073ee33ba028e90bbef7040925565f89ac",
+      "bytes": 7722
+    },
+    {
+      "path": "include/cuda_utils.h",
+      "origin": "integrated-main",
+      "sha256": "fbb1f33224fe11413710d4bbb563561e29e2d6ac4327025d9335475ce08c3ce8",
+      "bytes": 1020
+    },
+    {
+      "path": "licenses/CubicInterpolationCUDA.txt",
+      "origin": "existing-public-notices",
+      "sha256": "bc2bc705ef59adcc650ebb62f7d4200811c203262e0975a8bd0f1b2b272f0fa3",
+      "bytes": 2154
+    },
+    {
+      "path": "main.cu",
+      "origin": "integrated-main",
+      "sha256": "7a11a040fbeebb229138551cce0f9947c6fea6b30a156ebf8139e50ecccdf9a3",
+      "bytes": 153402
+    },
+    {
+      "path": "main_multigpu.cu",
+      "origin": "integrated-main",
+      "sha256": "ad88ca5f93b883e30ba46b2b2ee6f3828299ab461851758421eddb1241d52f2d",
+      "bytes": 200528
+    },
+    {
+      "path": "main_sph.cu",
+      "origin": "integrated-main",
+      "sha256": "259947f1b3261ed9b33d4195e827d68e335b9084a004e9e5df2bf6c61663dd4f",
+      "bytes": 78937
+    },
+    {
+      "path": "src/core/acceleration/acceleration.h",
+      "origin": "integrated-main",
+      "sha256": "1bec792d969112153bc1dcf75a4f5288d7742802d6728aa9f504a77c55164139",
+      "bytes": 16751
+    },
+    {
+      "path": "src/core/acceleration/acceleration_field_texture.cu",
+      "origin": "integrated-main",
+      "sha256": "5c86e94c35c41c8b59ddd9206bcf54de5d0d701f65b16233cf52ccf253ce9c05",
+      "bytes": 55577
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/body_fitted_fmm_manager.cu",
+      "origin": "integrated-main",
+      "sha256": "8a13ff60372582c7ce80d96016ca444e060ec95ffa4947521e1e01e3c649f486",
+      "bytes": 217059
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/body_fitted_fmm_manager.h",
+      "origin": "integrated-main",
+      "sha256": "fe2236b7c43cf02e2fa0385b69d56d87fe4f244bff9286a47e0e00d53417700d",
+      "bytes": 12638
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/body_fitted_fmm_types.h",
+      "origin": "integrated-main",
+      "sha256": "23370a92b7a4003e7703382b489883aa0438dc928257d6366912f5a264707c4d",
+      "bytes": 2150
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/clump_gravity_body_view.cuh",
+      "origin": "integrated-main",
+      "sha256": "014f5e2c696ee9ec146cb49629469d67328f187bbec7c67d4878fd77d72efe96",
+      "bytes": 1607
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/clump_p3_gravity.cuh",
+      "origin": "integrated-main",
+      "sha256": "dbf3ba9c7ca52d113e645b65d17c7663ac3f3c04c15b8c0baa965fa580f8e19a",
+      "bytes": 10493
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/dense_level_map.cuh",
+      "origin": "integrated-main",
+      "sha256": "46ecc8d8cd32b5042fb5b9438c366e6c45628a1c3952ce2e9e045a0ed29f3fe5",
+      "bytes": 9180
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/distributed_fmm.cuh",
+      "origin": "integrated-main",
+      "sha256": "bf496997a17e01275b56fd4fa67606e2535916ef47635101609fb48c4cb72c73",
+      "bytes": 15472
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/distributed_fmm_gpu.cuh",
+      "origin": "integrated-main",
+      "sha256": "d1499af8eab1655992d51de0b97a658d822bee2de18657b0a02940dd39013f05",
+      "bytes": 44549
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/fmm_halo_geometry.h",
+      "origin": "integrated-main",
+      "sha256": "c5f09c4736338928880780589eeb22d635a7c356786bc66f245e290c090b8998",
+      "bytes": 5362
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/fmm_image_sources.cuh",
+      "origin": "integrated-main",
+      "sha256": "ec92cbf48cde455f5e0e768802f43946cf7a68dc2805d2d9c585a763342c10bf",
+      "bytes": 9811
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/g_table_lookup.cuh",
+      "origin": "integrated-main",
+      "sha256": "c0241b3c3115a36dd17c3bb4a4b90a78b58248e31d9491d06231c0e555b187e0",
+      "bytes": 2930
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/g_tables.h",
+      "origin": "integrated-main",
+      "sha256": "1a14866b85b9050e3a65c0c170f794a1009f8b97f900889ccab51814ff30d4bf",
+      "bytes": 4342322
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/grouped_interaction_arena.cu",
+      "origin": "integrated-main",
+      "sha256": "dab75a344de7bf291ae917b011aeb66091a57bd536f83049f253ab77e59f8f76",
+      "bytes": 1078
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/grouped_interaction_arena.cuh",
+      "origin": "integrated-main",
+      "sha256": "a9a3caf87f4941dbcf3ece558c2032fb347524d8f952b281588f65255d8355ac",
+      "bytes": 3602
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/grouped_stencil_tables.cuh",
+      "origin": "integrated-main",
+      "sha256": "3fba82a91a334b9d770ac868ef3823dbeb7cb6727dca7fe2dbbd7ae11306bf46",
+      "bytes": 43728
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/grouped_stencil_traits.cuh",
+      "origin": "integrated-main",
+      "sha256": "dad2fc99523d9bd4912e8a7acaec3ef4d6a1cc6102399cec1e71444f7fd28f6e",
+      "bytes": 3007
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/karras_octree_build.cu",
+      "origin": "integrated-main",
+      "sha256": "b66b0aae7838e352a75ece9246e12e8cf866acc94e84059e121bc7004e4f6b6e",
+      "bytes": 42791
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/karras_octree_build.cuh",
+      "origin": "integrated-main",
+      "sha256": "1a8f4aab356a81e63b3edccdeccd65a04e665837019ae60988c4bbd667a4d7ac",
+      "bytes": 1076
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/karras_radix_tree.cuh",
+      "origin": "integrated-main",
+      "sha256": "c9705de45d274cb9abf9460be69fd583eb26f4e9fd79f469bea476c04c987f00",
+      "bytes": 5025
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/local_expansion_math.cuh",
+      "origin": "integrated-main",
+      "sha256": "1bcb501d9584315b8d4609220e789936cb4b447dea6460baee5c16c9ec0868b3",
+      "bytes": 15327
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/local_expansion_unified.cu",
+      "origin": "integrated-main",
+      "sha256": "3d06a1f156cd06e3df1213366563493fea111d0dad747b5cceea9dbbfd3ae29d",
+      "bytes": 11565
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/m2l_group_diagnostics.cuh",
+      "origin": "integrated-main",
+      "sha256": "145156f42862639d676ca1700a9de88116b93d189a3b5106a54bb2f9064e4db1",
+      "bytes": 4853
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/m2l_remote_kernel.cuh",
+      "origin": "integrated-main",
+      "sha256": "e82cfa4d4f97abe1d6d2df503056a0bee85d416b6be1e2a65ede15685ae74983",
+      "bytes": 5662
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/m2l_warpsync_kernel.cu",
+      "origin": "integrated-main",
+      "sha256": "4a72a53cdfd6b96c7523996ea3fe456e01d492f1f6f82c5b4f445043d35221f9",
+      "bytes": 32431
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/morton_unified.cuh",
+      "origin": "integrated-main",
+      "sha256": "91d4d9a1f9532264a6621162c88376ce3476287d33e594c859ec1e90abe169c2",
+      "bytes": 5176
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/multipole_compute_unified.cu",
+      "origin": "integrated-main",
+      "sha256": "7cfb219493401e29e677d1d503ad871191ceeba00ba42d2ad990adc40c891556",
+      "bytes": 25270
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/p2p_remote_kernel.cuh",
+      "origin": "integrated-main",
+      "sha256": "fa06d8eab1f652ef3823312fd7778e5834677ad8b89100410cbe88186279ff6a",
+      "bytes": 3060
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/p2p_unified.cu",
+      "origin": "integrated-main",
+      "sha256": "d6eb9d3fb7e0e43ba28cc17d93d7b2959edc25ee8fa0587257d38e076828522c",
+      "bytes": 29179
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/persistent_tree_traversal.cu",
+      "origin": "integrated-main",
+      "sha256": "83a5b36d3eeead57f1363ff5a9e1af66b7a84f5b105b559c7f8fedf2efc70a93",
+      "bytes": 67859
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/persistent_tree_traversal.cuh",
+      "origin": "integrated-main",
+      "sha256": "de6dbd53a865806a38b4bbba705b3c5a029a7b9212475c52fbe4167a1274a145",
+      "bytes": 22104
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/planar_gap1_operator_table.h",
+      "origin": "integrated-main",
+      "sha256": "3e3472b8f9513f438bdf78fd196253ab6ed7f65336fb71e8b1614787ee63ca38",
+      "bytes": 95434
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/remote_interaction_lists.cuh",
+      "origin": "integrated-main",
+      "sha256": "c37d0e84b27725773adbb4100e296f1eec7f6e292d05734c657abe1305c7b661",
+      "bytes": 2041
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/remote_interaction_plan.cuh",
+      "origin": "integrated-main",
+      "sha256": "089b1f2fd48f2837eff621603290c7d2f375b1cff879095c858208e29ede07c1",
+      "bytes": 10746
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/shear_fmm_capacity.h",
+      "origin": "integrated-main",
+      "sha256": "7245c5c25df4323fc6438289b3d9554cdc9a1a46af14a01689e13e37a3645cc4",
+      "bytes": 5220
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/task_structs.cuh",
+      "origin": "integrated-main",
+      "sha256": "8b0cdafb9a160f3dfbd10ae4ddd0f7cbfcedff7f95a530809b9d6f5123eaa7fa",
+      "bytes": 1882
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/tree_traits.cuh",
+      "origin": "integrated-main",
+      "sha256": "f302d26e29aa0476c3574f2967ee9ab88bab1f12dcd9b353e662d59ac5b57aad",
+      "bytes": 621
+    },
+    {
+      "path": "src/core/acceleration/body_fitted_fmm/unified_node.cuh",
+      "origin": "integrated-main",
+      "sha256": "6d6e456d33eae84e243173940b694b4ebe3d0f85ac36f0e305d89f81cd55dc2c",
+      "bytes": 4689
+    },
+    {
+      "path": "src/core/acceleration/device_state_array.h",
+      "origin": "integrated-main",
+      "sha256": "ae141b8e90f0d5c2725ceed840474d5d89e8f8ee7879539066f93cae6cfba172",
+      "bytes": 1156
+    },
+    {
+      "path": "src/core/acceleration/external_bodies.cu",
+      "origin": "integrated-main",
+      "sha256": "742946b57f8df2400637aa180b47e183453f235bdc6901a5f1988f422404bc90",
+      "bytes": 13770
+    },
+    {
+      "path": "src/core/acceleration/external_bodies.h",
+      "origin": "integrated-main",
+      "sha256": "4258c01efccc6d327137004d5e71dd51a1604b03957b3549a0ca511bff0b835f",
+      "bytes": 4442
+    },
+    {
+      "path": "src/core/acceleration/fmm/fmm_types.h",
+      "origin": "integrated-main",
+      "sha256": "3b6474f0fc09fc3bc9327fbfbba3237e5f80b3ff5e5be854872a2c9396bc407d",
+      "bytes": 439507
+    },
+    {
+      "path": "src/core/acceleration/inertial_acceleration.cu",
+      "origin": "integrated-main",
+      "sha256": "87441d088dd531f6fe3ac1be4234884e5f417b366743539cb7469623a2a2be45",
+      "bytes": 28875
+    },
+    {
+      "path": "src/core/acceleration/self_gravity.cu",
+      "origin": "integrated-main",
+      "sha256": "f46fef8fca8342d9282bc1e126f46eafd968222f308a906ba817c98c74d667f7",
+      "bytes": 84900
+    },
+    {
+      "path": "src/core/acceleration/shear_gravity_images.cuh",
+      "origin": "integrated-main",
+      "sha256": "eead7da4711812c2c60f0ce61bcce2e8f85b8d1a75241f5a9a663c01d216909a",
+      "bytes": 3522
+    },
+    {
+      "path": "src/core/acceleration/tidal_acceleration.cu",
+      "origin": "integrated-main",
+      "sha256": "a2f31944faa5e8fd340882d96f085b7ca1d0d5ccf1d7264c28b7be73b7484651",
+      "bytes": 30497
+    },
+    {
+      "path": "src/core/constant/binary_format.h",
+      "origin": "integrated-main",
+      "sha256": "62e9445088cfc8bae97ec0593b70a47845b10ab2f1abdd2e696159cf9986e4b5",
+      "bytes": 26306
+    },
+    {
+      "path": "src/core/constant/binary_reader.cpp",
+      "origin": "integrated-main",
+      "sha256": "a84632b0bdd060dec7a12d6694332072e005c972340f5aee7dced8dba2836ad5",
+      "bytes": 43061
+    },
+    {
+      "path": "src/core/constant/binary_reader.h",
+      "origin": "integrated-main",
+      "sha256": "cfc27103a44fe382ba635177c40f97212876710e55c0ac502ccd098294327750",
+      "bytes": 721
+    },
+    {
+      "path": "src/core/constant/command_line_interface.h",
+      "origin": "integrated-main",
+      "sha256": "c77019c3e011996d968b11374a385e70b93c6d827014d5b5babb0217b9e22ff7",
+      "bytes": 45174
+    },
+    {
+      "path": "src/core/constant/config_device.cu",
+      "origin": "integrated-main",
+      "sha256": "70c5f112b8e98df047039a5263363785cad0df23b316b35035664493f4923d1d",
+      "bytes": 716
+    },
+    {
+      "path": "src/core/constant/config_host.cpp",
+      "origin": "integrated-main",
+      "sha256": "f4d739e341706ac238042ed2edc32380291ebbd5d87e82fefc90856de6694917",
+      "bytes": 128572
+    },
+    {
+      "path": "src/core/constant/final_output_tracker.h",
+      "origin": "integrated-main",
+      "sha256": "f3ff2fbe1a24e49711938d6d9962b7af6303a52ad703bbd5135e232b0c453ef1",
+      "bytes": 571
+    },
+    {
+      "path": "src/core/constant/load_or_resume.h",
+      "origin": "integrated-main",
+      "sha256": "94158974d9d1c479f27307d21c20ca8fa2ba30f2a51b16a7142f6dd26ecb922f",
+      "bytes": 42222
+    },
+    {
+      "path": "src/core/constant/system_initialize.h",
+      "origin": "integrated-main",
+      "sha256": "d2597f7c863b18452ede5857d66bbd975b90ebaff5e9cdabd63ec3e35b8b6dfe",
+      "bytes": 18583
+    },
+    {
+      "path": "src/core/constant/system_initialize_host.cpp",
+      "origin": "integrated-main",
+      "sha256": "57b9222772f1608f1a18f867216bd672dcecbb461502369913eb361788671b22",
+      "bytes": 51730
+    },
+    {
+      "path": "src/core/constant/time_step_schedule.h",
+      "origin": "integrated-main",
+      "sha256": "635838c05afddc56192d9083de7bbfefe56bd602678175f179a242348f3b03a5",
+      "bytes": 1372
+    },
+    {
+      "path": "src/core/material/material_database.cpp",
+      "origin": "integrated-main",
+      "sha256": "7ac28ff060529d36a4ce627858274c7cf9aaecb27a4ca3c838ad50d90dd6631f",
+      "bytes": 22823
+    },
+    {
+      "path": "src/core/material/material_database.h",
+      "origin": "integrated-main",
+      "sha256": "b98eb37c3fa88b46b7cf05def08d5e1d50206ee4ef1cd398df4a654a5c96aebc",
+      "bytes": 3859
+    },
+    {
+      "path": "src/core/math/cubic_interpolation.cuh",
+      "origin": "integrated-main",
+      "sha256": "396c306c3139cb51edb08ae3a10ec81be2c7268451f3cacbb476cc10be6ea88c",
+      "bytes": 33099
+    },
+    {
+      "path": "src/core/math/linear_interpolation.cuh",
+      "origin": "integrated-main",
+      "sha256": "880264149665181be78d26571d43b279ff0f85b1aeff7957a3247568158e0d30",
+      "bytes": 31034
+    },
+    {
+      "path": "src/core/math/verlet_integration.cuh",
+      "origin": "integrated-main",
+      "sha256": "ad948a027ae1983a786e5e764b921163b8e8a052530af8573dabe352b13999f7",
+      "bytes": 35339
+    },
+    {
+      "path": "src/core/math/verlet_respa_kernels.cuh",
+      "origin": "integrated-main",
+      "sha256": "cea063fae2465c8531687bb5d72e70b8cb45cd83becd26708f324bec9a921c93",
+      "bytes": 2417
+    },
+    {
+      "path": "src/core/math/yorp.cuh",
+      "origin": "integrated-main",
+      "sha256": "2d12d31b18f91cfe0fd1be16e355d2605680485c2fa38c58c9f7b50856d69757",
+      "bytes": 27426
+    },
+    {
+      "path": "src/core/neighbor/cll/cll_kernels.cu",
+      "origin": "integrated-main",
+      "sha256": "c09b5e4707e395f4b250a4fa72a8a744ad643240ad787ec12e8dfe42a1fde407",
+      "bytes": 86651
+    },
+    {
+      "path": "src/core/neighbor/cll/cll_manager.h",
+      "origin": "integrated-main",
+      "sha256": "aa152b9c3fa0356a34abe2f22786aa39aa587f59f2c04463d83ea5b64dc12881",
+      "bytes": 3082
+    },
+    {
+      "path": "src/core/neighbor/cll/cll_types.h",
+      "origin": "integrated-main",
+      "sha256": "20e2a1e738cc973b373ee18a7d3fdadb23c14c7f28b5eb001a1587ba7d73033d",
+      "bytes": 3442
+    },
+    {
+      "path": "src/core/neighbor/contact_geometry.cuh",
+      "origin": "integrated-main",
+      "sha256": "85981f30de452d00454837c436893aca68203fb930b9c108d803f4cb77311348",
+      "bytes": 2726
+    },
+    {
+      "path": "src/core/neighbor/direct/direct_kernels.cu",
+      "origin": "integrated-main",
+      "sha256": "ecb881da9f96dbc13e59a74ac2812b2eb868ac268471b0ebf7ee6c8f8d22db50",
+      "bytes": 6682
+    },
+    {
+      "path": "src/core/neighbor/direct/direct_manager.h",
+      "origin": "integrated-main",
+      "sha256": "82a52df90f882bf678aae383c687181a58243de6dc790945a51481104d9dcc71",
+      "bytes": 3178
+    },
+    {
+      "path": "src/core/neighbor/lbvh/lbvh_kernels.cu",
+      "origin": "integrated-main",
+      "sha256": "002664e200c7765e7a047c7ad9fed4a0102060edb431cf17f2939a3ee8513ad6",
+      "bytes": 102240
+    },
+    {
+      "path": "src/core/neighbor/lbvh/lbvh_manager.h",
+      "origin": "integrated-main",
+      "sha256": "a7ebbfb241b4e0767fd81169cf97c759bc97855d05b415c9b2c7e0fa1d8c2e14",
+      "bytes": 2833
+    },
+    {
+      "path": "src/core/neighbor/lbvh/lbvh_periodic.cuh",
+      "origin": "integrated-main",
+      "sha256": "18edcd7d6a22d854a77ae9d464231c3b6edae790125653dc14319d5e92988072",
+      "bytes": 7816
+    },
+    {
+      "path": "src/core/neighbor/lbvh/lbvh_sph.cuh",
+      "origin": "integrated-main",
+      "sha256": "f8c366d8a305365959a18b16b2b3ad7eec0db7550a7dfa808042456b39504ac1",
+      "bytes": 17146
+    },
+    {
+      "path": "src/core/neighbor/lbvh/lbvh_types.h",
+      "origin": "integrated-main",
+      "sha256": "c84d97ee029f6108e1cc71b13852c6411561e84cbf1003fa5886bdd1e2b40bb4",
+      "bytes": 7463
+    },
+    {
+      "path": "src/core/neighbor/neighbor_api.h",
+      "origin": "integrated-main",
+      "sha256": "404be981a2ad6f0c80a79c65c411ea734a591b9df23f9dfba2a0e40b40293609",
+      "bytes": 10437
+    },
+    {
+      "path": "src/core/neighbor/neighbor_types.h",
+      "origin": "integrated-main",
+      "sha256": "6cf9b8f782bb4e1937cd42cd27f318abec8bc9e1952fbd05a0f98875f359162d",
+      "bytes": 12631
+    },
+    {
+      "path": "src/core/neighbor/rt/rt_backend.cu",
+      "origin": "integrated-main",
+      "sha256": "21abf840a8769a9da55c5ab5d97da9cc2d6714c84b6e53450fc022a638f73c96",
+      "bytes": 15706
+    },
+    {
+      "path": "src/core/neighbor/rt/rt_backend.h",
+      "origin": "integrated-main",
+      "sha256": "5eeac501134bcfba2b541dc0e0c9213494c3509ae5528219cdabff669577d334",
+      "bytes": 1204
+    },
+    {
+      "path": "src/core/neighbor/rt/rt_device.cu",
+      "origin": "integrated-main",
+      "sha256": "963d9dafcc87904c1d5e0994d34d5cabd0a24a930fd5c9454755bf156d879d58",
+      "bytes": 3861
+    },
+    {
+      "path": "src/core/neighbor/rt/rt_launch_params.h",
+      "origin": "integrated-main",
+      "sha256": "6fb726d25e01c542611355bec3b507bb531cf928cc6c5aba333f9c0ba46e931f",
+      "bytes": 262
+    },
+    {
+      "path": "src/core/neighbor/sph_pair.cuh",
+      "origin": "integrated-main",
+      "sha256": "00951d7bb400e09456c403a8541794791c5c0f026cea5b4556c0f95a7a07797c",
+      "bytes": 1112
+    },
+    {
+      "path": "src/core/particle_model/clump.cu",
+      "origin": "integrated-main",
+      "sha256": "fd5bb57e4e3784e58583d3d310d560afa5b8a6057510bab43958fa565f53a888",
+      "bytes": 26487
+    },
+    {
+      "path": "src/core/particle_model/clump.h",
+      "origin": "integrated-main",
+      "sha256": "f538188d5b8cfe7ac5b70b42ce3178760a5db0d0e4e4fffb9520724535e3c970",
+      "bytes": 13992
+    },
+    {
+      "path": "src/core/particle_model/clump_init.cpp",
+      "origin": "integrated-main",
+      "sha256": "e29fabea3ddf4d23a817ccb15ec41eda9dd350aca258eebb8eab30191a83e806",
+      "bytes": 17703
+    },
+    {
+      "path": "src/core/particle_model/clump_rigid_math.cuh",
+      "origin": "integrated-main",
+      "sha256": "dac764ca9ed60555594c9cba9950bebdbd1d285f84a07ebe54cb8a9ac1db1d8e",
+      "bytes": 2658
+    },
+    {
+      "path": "src/core/particle_model/particle.h",
+      "origin": "integrated-main",
+      "sha256": "0806d20faf11a3b915b8a7636ca21e9335e91d7ed428b0bf84c28ec310de8cfe",
+      "bytes": 36020
+    },
+    {
+      "path": "src/core/particle_model/sphere_dynamic.cu",
+      "origin": "integrated-main",
+      "sha256": "ee92e3b427049291c6d2840967ccf4c1faf65d971ea535d34e393595a6012573",
+      "bytes": 57684
+    },
+    {
+      "path": "src/core/shear/shear_box.cu",
+      "origin": "integrated-main",
+      "sha256": "701bab14743cea01a82cfc4201a9a5f090e731f1f65e4d82ad1ab34c6111bbf4",
+      "bytes": 12979
+    },
+    {
+      "path": "src/core/shear/shear_box.h",
+      "origin": "integrated-main",
+      "sha256": "fa14bf035fab3d9a7818921c4678851505e8b19d3813c319c69ec728d2c770fb",
+      "bytes": 8042
+    },
+    {
+      "path": "src/core/shear/shear_phase.cpp",
+      "origin": "integrated-main",
+      "sha256": "23c71af57abe48906dce82db7611ec163268be0ced8f077ea57a2eb8ca75fcae",
+      "bytes": 2068
+    },
+    {
+      "path": "src/core/sph/sph_artificial_stress.cuh",
+      "origin": "integrated-main",
+      "sha256": "dbbc2e33901774d0fd61f6541b25abd283f979cc680fae2e43a9b742c7a37473",
+      "bytes": 6556
+    },
+    {
+      "path": "src/core/sph/sph_boundary.cu",
+      "origin": "integrated-main",
+      "sha256": "13dc7c55ba28a98454c553a9e946aa48c5e57a7a63b1d69c870539a8a2f9d6dc",
+      "bytes": 6414
+    },
+    {
+      "path": "src/core/sph/sph_boundary.h",
+      "origin": "integrated-main",
+      "sha256": "f3072227a7571f6b4091f7a99ad6699f746e80ff3e2bc319524e45ce258b2d41",
+      "bytes": 798
+    },
+    {
+      "path": "src/core/sph/sph_boundary_math.cuh",
+      "origin": "integrated-main",
+      "sha256": "eff0fa1cbb1db05e1b1a5d7641413592629fbab245edd1326d29266cd775bea3",
+      "bytes": 1299
+    },
+    {
+      "path": "src/core/sph/sph_config_printer.cpp",
+      "origin": "integrated-main",
+      "sha256": "51f7b87289c4c19a109056509d2286f9c5acc5ba599c219a64845ad1cf5b9675",
+      "bytes": 2193
+    },
+    {
+      "path": "src/core/sph/sph_config_printer.h",
+      "origin": "integrated-main",
+      "sha256": "63d9b7daa75435a7cfc0d90195fc2cc54ffb520e9c707da7112129584938ba62",
+      "bytes": 732
+    },
+    {
+      "path": "src/core/sph/sph_damage.cu",
+      "origin": "integrated-main",
+      "sha256": "1a234f83be26d4fbb7ff83d63893d1d0089325edaa942be1db0ebb9b88b9f1c5",
+      "bytes": 13164
+    },
+    {
+      "path": "src/core/sph/sph_damage.h",
+      "origin": "integrated-main",
+      "sha256": "9e0eb75a01014d36df2180413d45ac96313134cf90933262b11714226e3fab70",
+      "bytes": 2113
+    },
+    {
+      "path": "src/core/sph/sph_damage_math.cuh",
+      "origin": "integrated-main",
+      "sha256": "5307b688e5b2d1a3640ba3ecb7e501dfaaf6e4d03d2d530be7043ddc998933fb",
+      "bytes": 6148
+    },
+    {
+      "path": "src/core/sph/sph_device_helpers.cuh",
+      "origin": "integrated-main",
+      "sha256": "077dd02f0edb2d23b86ad301f3a914b0ef58381327113510058076aa0dec5835",
+      "bytes": 1981
+    },
+    {
+      "path": "src/core/sph/sph_eigen_3x3.cuh",
+      "origin": "integrated-main",
+      "sha256": "aac3a59bc5cf715721a38116df35ce3d00aba36545640d808a0708f9c9ec38b1",
+      "bytes": 3607
+    },
+    {
+      "path": "src/core/sph/sph_energy.cu",
+      "origin": "integrated-main",
+      "sha256": "677fc809bb9d9c359df2c60b9e44be391a021c348bd721fce065ec6bc79001af",
+      "bytes": 8313
+    },
+    {
+      "path": "src/core/sph/sph_energy.h",
+      "origin": "integrated-main",
+      "sha256": "10d8c8051fa4ac1b501e30228de2cfcc12b952c0369625db1e1e9e5daf89b804",
+      "bytes": 670
+    },
+    {
+      "path": "src/core/sph/sph_energy_math.cuh",
+      "origin": "integrated-main",
+      "sha256": "cd2bc32568d2b6481369dc1395914144cfeac5aa143aea68f5793c1acdff4620",
+      "bytes": 871
+    },
+    {
+      "path": "src/core/sph/sph_eos_math.cuh",
+      "origin": "integrated-main",
+      "sha256": "7215f4a9b2090327741beb81726af3a914c3c777473a371a7b1c5265424d14a0",
+      "bytes": 6302
+    },
+    {
+      "path": "src/core/sph/sph_gravity_kernel.cuh",
+      "origin": "integrated-main",
+      "sha256": "12c086e85b9475d75d4e13365010935f85d258302d5a59277874c3c15db27ece",
+      "bytes": 6426
+    },
+    {
+      "path": "src/core/sph/sph_history.cu",
+      "origin": "integrated-main",
+      "sha256": "fd27099d288edaafd9a6308fae79f5398bd2145a7a38dec13aebdc60624086f8",
+      "bytes": 4676
+    },
+    {
+      "path": "src/core/sph/sph_history.h",
+      "origin": "integrated-main",
+      "sha256": "a59c07bf3a734954d04279d660144f2911b4cc6a1e9b5d0038c4199b42789807",
+      "bytes": 511
+    },
+    {
+      "path": "src/core/sph/sph_history_math.cuh",
+      "origin": "integrated-main",
+      "sha256": "a995a751dfaf25ee8cf5e233c10316a060033f64021aad9efe970ab538c7b351",
+      "bytes": 891
+    },
+    {
+      "path": "src/core/sph/sph_input.cpp",
+      "origin": "integrated-main",
+      "sha256": "b8efbe42d78808b684ae11114fd427ec7de710773cda2e9a09af4d319c7dcd1a",
+      "bytes": 1721
+    },
+    {
+      "path": "src/core/sph/sph_input.h",
+      "origin": "integrated-main",
+      "sha256": "99d24ce3ececdd8f7b729c2ee2351effed563c5e0b4563c6ea38d0114d42c0ab",
+      "bytes": 872
+    },
+    {
+      "path": "src/core/sph/sph_kernel_correction.cuh",
+      "origin": "integrated-main",
+      "sha256": "b012b57c8242b0e46000bd9c7726c153a1f2fcf50ae4f1f7bf0c254e9343dcc6",
+      "bytes": 4436
+    },
+    {
+      "path": "src/core/sph/sph_neighbor_query.cuh",
+      "origin": "integrated-main",
+      "sha256": "a81f201aac0b496ccc8727c568976111e9b48051261073559afb4a921ff999a1",
+      "bytes": 12185
+    },
+    {
+      "path": "src/core/sph/sph_numerical_safeguards.cuh",
+      "origin": "integrated-main",
+      "sha256": "80e3606b2cf8b5cf6d2a52c0b97e659effd14f2f8a299118e6d0db61a25aef2b",
+      "bytes": 2441
+    },
+    {
+      "path": "src/core/sph/sph_physics.cu",
+      "origin": "integrated-main",
+      "sha256": "f277fc2e4ac7712b6c4b94a25f783682c917d06d45efddd2fa9b162cd89378ad",
+      "bytes": 31720
+    },
+    {
+      "path": "src/core/sph/sph_physics.h",
+      "origin": "integrated-main",
+      "sha256": "77d5cec74d3cc4df01ab4f47bb0cd1151bb3274220772b250de3b020c7126529",
+      "bytes": 1827
+    },
+    {
+      "path": "src/core/sph/sph_porosity.cu",
+      "origin": "integrated-main",
+      "sha256": "62a5d10a384f435798f618357ce2ab6cf45854607d737bb489b0b4182c9be00c",
+      "bytes": 8166
+    },
+    {
+      "path": "src/core/sph/sph_porosity.h",
+      "origin": "integrated-main",
+      "sha256": "fd3df1149c52761eecc7d10c89b166a151757d4ea7464aab1f42be2332770aeb",
+      "bytes": 1331
+    },
+    {
+      "path": "src/core/sph/sph_porosity_math.cuh",
+      "origin": "integrated-main",
+      "sha256": "2bf64d1616c14e77ce2fa699abec753b96e655970aef036d13d6dfb5b82cb9f3",
+      "bytes": 6984
+    },
+    {
+      "path": "src/core/sph/sph_stage.h",
+      "origin": "integrated-main",
+      "sha256": "eb18579b26292a716f859526b264d9d6e533cfe05f165cbf16c3df5f4df099ee",
+      "bytes": 924
+    },
+    {
+      "path": "src/core/sph/sph_stage_math.h",
+      "origin": "integrated-main",
+      "sha256": "a29bfa41fd3c273f968b543deb0d920110caedb721e74f8d1f4d5b7541dca8cd",
+      "bytes": 1675
+    },
+    {
+      "path": "src/core/sph/sph_strength.cu",
+      "origin": "integrated-main",
+      "sha256": "95c3f8378908665cd67eef84ff07aa0dbfe770bfdb138b0f7407ec519295c530",
+      "bytes": 23840
+    },
+    {
+      "path": "src/core/sph/sph_strength.h",
+      "origin": "integrated-main",
+      "sha256": "e5c975a2bcd25d4fa3261111ac8ff3606e5a8655c5a33732c23f48da28103a4d",
+      "bytes": 2097
+    },
+    {
+      "path": "src/core/sph/sph_timestep.cu",
+      "origin": "integrated-main",
+      "sha256": "0ac65eb2ed5faeb2844e095883bf293c374b362b6e91db13ecd2705d966be627",
+      "bytes": 16721
+    },
+    {
+      "path": "src/core/sph/sph_timestep.h",
+      "origin": "integrated-main",
+      "sha256": "f7f59873ab9670992b7bdbc19182f55860f5215ca7698411cefe8b82cf364998",
+      "bytes": 3034
+    },
+    {
+      "path": "src/core/sph/sph_timestep_math.cuh",
+      "origin": "integrated-main",
+      "sha256": "58532e416290764889deb2e47706bb616ec93d977e52f31fc95ff9b0e79334ad",
+      "bytes": 1071
+    },
+    {
+      "path": "src/core/wall/bonded_rect_wall.cu",
+      "origin": "integrated-main",
+      "sha256": "189fee74c1c250eadfd1140fee917b9cd5c241259ec02d64f48b469c26210fdb",
+      "bytes": 26061
+    },
+    {
+      "path": "src/core/wall/bonded_rect_wall.h",
+      "origin": "integrated-main",
+      "sha256": "d65f3f5d3b4b7a27bf9cc74ab75c6eebb074822c7684fcc25849d1533b7a7569",
+      "bytes": 4830
+    },
+    {
+      "path": "src/core/wall/funnel_wall.cu",
+      "origin": "integrated-main",
+      "sha256": "0f3333d7a9d39aaf156967ae874e96a3b27efc84f9b94d4dbf2a5a62d5a41877",
+      "bytes": 20793
+    },
+    {
+      "path": "src/core/wall/periodical_boundary.cu",
+      "origin": "integrated-main",
+      "sha256": "963bd61ab60b1092d5b7ba4e59e3a6e2b66fe29d6effe67e044f2e144c75abcc",
+      "bytes": 12901
+    },
+    {
+      "path": "src/core/wall/plain_wall.cu",
+      "origin": "integrated-main",
+      "sha256": "dfb467bba3deabe1491f6300d25b6ef1fa1fbc066fffac77b07f1febfa0646b6",
+      "bytes": 33172
+    },
+    {
+      "path": "src/core/wall/rigid_pose_trajectory.h",
+      "origin": "integrated-main",
+      "sha256": "0940555f8e45ece40d3936a6921388795ac9347e9e84cd0bc021e36f7f50ecef",
+      "bytes": 6800
+    },
+    {
+      "path": "src/core/wall/sphere_wall.cu",
+      "origin": "integrated-main",
+      "sha256": "730ced2f846c608d311115b3147af9aeab03092ad982080743b992565fdb550d",
+      "bytes": 23539
+    },
+    {
+      "path": "src/core/wall/sphere_wall.h",
+      "origin": "integrated-main",
+      "sha256": "ec2ffb309268dd35cfa22fb40954f85bd955b46f184c37a7de81f2ec2247c0a0",
+      "bytes": 12290
+    },
+    {
+      "path": "src/core/wall/trimesh_loader.cpp",
+      "origin": "integrated-main",
+      "sha256": "4e3c4c15314dbda0c7bd3700fe1602ef610446c70d25024369cf0c8b8afb0199",
+      "bytes": 8275
+    },
+    {
+      "path": "src/core/wall/trimesh_wall.cu",
+      "origin": "integrated-main",
+      "sha256": "b86d8573d491332d22e39d523f97faee427e8535cfa27d8ea3ba615ceec843bc",
+      "bytes": 41438
+    },
+    {
+      "path": "src/core/wall/trimesh_wall.h",
+      "origin": "integrated-main",
+      "sha256": "cd00be0f22e4518bc2b2b7203de41424d7d19b8ec8c995780881c864ccbfba91",
+      "bytes": 22134
+    },
+    {
+      "path": "src/core/wall/wall.h",
+      "origin": "integrated-main",
+      "sha256": "958966d5e2903c28d059a392f351f3e7fdd9f522b0c37e6ea8a7cadde19ddd20",
+      "bytes": 42806
+    },
+    {
+      "path": "src/core/wall/wall_contact_force.cuh",
+      "origin": "integrated-main",
+      "sha256": "9f59576cbdaf99a3feb0bfade544b836c2eedf14ca62284a47fd206666624793",
+      "bytes": 19353
+    },
+    {
+      "path": "src/core/wall/wall_manager.cu",
+      "origin": "integrated-main",
+      "sha256": "5ae9352da5520f029ea4a8ab21db7478211c4ee3400bf84edfe8891ac609c355",
+      "bytes": 34568
+    },
+    {
+      "path": "src/domain/async_rebalance.h",
+      "origin": "integrated-main",
+      "sha256": "68efde2675ad28595840ff90a43967aa6b0f2b7174505ae6bc83bcd3099fc16e",
+      "bytes": 6080
+    },
+    {
+      "path": "src/domain/communicator.cu",
+      "origin": "integrated-main",
+      "sha256": "58d46c953d6b96d7d5b7a2ffd8a8334e2926bf214665c71b782cbe1dc41390d8",
+      "bytes": 72648
+    },
+    {
+      "path": "src/domain/communicator.h",
+      "origin": "integrated-main",
+      "sha256": "b5ac02d719d0999c97ff94319d44752c4276848a4329c12b095c3dc2494bf3be",
+      "bytes": 32627
+    },
+    {
+      "path": "src/domain/distributed_fmm_depth_controller.cpp",
+      "origin": "integrated-main",
+      "sha256": "0ee35985a8a9dad19ce8b18b39cd73543635cdb22595259c56610bd943fdea98",
+      "bytes": 22607
+    },
+    {
+      "path": "src/domain/distributed_fmm_depth_controller.h",
+      "origin": "integrated-main",
+      "sha256": "4382ca4c6d59b82f57a8c2cf3127aa8f9a3402f776b87cc7eaf016cb39bb1268",
+      "bytes": 8177
+    },
+    {
+      "path": "src/domain/distributed_yorp_coordinator.h",
+      "origin": "integrated-main",
+      "sha256": "15bed37381e54fdfc1ed8df780d418dcad84894fa93bf217881a914d9237896d",
+      "bytes": 10806
+    },
+    {
+      "path": "src/domain/domain_manager.cu",
+      "origin": "integrated-main",
+      "sha256": "dc072bc13a6b7e1564f8661b0c12cefd92ce5ad1ddda3b8592e26866ff72bfb2",
+      "bytes": 60700
+    },
+    {
+      "path": "src/domain/domain_manager.h",
+      "origin": "integrated-main",
+      "sha256": "c3bcc5e7b7f5d5d631863b5c284a7fd7b99d9ad67113e785b4e2afd8c9961140",
+      "bytes": 11187
+    },
+    {
+      "path": "src/domain/let_communicator.cu",
+      "origin": "integrated-main",
+      "sha256": "50c615429c8c56fa01bf5922fcb3c51a65435c208183115755213fd006d39c12",
+      "bytes": 54307
+    },
+    {
+      "path": "src/domain/let_communicator.h",
+      "origin": "integrated-main",
+      "sha256": "c82445e95d4007f3d7f53a894cdfb0cc7dce2ddf2b7adb0413e39858d8b85dc8",
+      "bytes": 7759
+    },
+    {
+      "path": "src/domain/let_force_polynomial.cuh",
+      "origin": "integrated-main",
+      "sha256": "10585f60f3b0dd2dedd5ed5b8938394a27ec9c957311a3357075b50b8569ee77",
+      "bytes": 6491
+    },
+    {
+      "path": "src/domain/let_kernels_fmm.cu",
+      "origin": "integrated-main",
+      "sha256": "eff54d7061700171cdbcbe1b2decd164e90619fd771d88a8d99fd5305443d4ff",
+      "bytes": 33646
+    },
+    {
+      "path": "src/domain/let_types.h",
+      "origin": "integrated-main",
+      "sha256": "f2442d714acd9f0daf266261d7788344f5897e23a44131c031f99bd6a88cbe3b",
+      "bytes": 14692
+    },
+    {
+      "path": "src/domain/morton_gpu_work_balance.cuh",
+      "origin": "integrated-main",
+      "sha256": "f554ae91803a84f740d9aaa4c2e8115f14c2e31991dd0bb471e195d17c9a5037",
+      "bytes": 9785
+    },
+    {
+      "path": "src/domain/morton_partition.h",
+      "origin": "integrated-main",
+      "sha256": "0b3932f5c62476f0228a9af642eddc4fcc6223d706e2d688fc09a6da751baa8b",
+      "bytes": 6222
+    },
+    {
+      "path": "src/domain/morton_root_service.cuh",
+      "origin": "integrated-main",
+      "sha256": "0edd88ae5b510598ccf712b111e234acd2137af779ab2eb30b096e4c8caf2f89",
+      "bytes": 5516
+    },
+    {
+      "path": "src/domain/morton_work_balance.h",
+      "origin": "integrated-main",
+      "sha256": "0e245742a122666312e580a2090f458ebb442e7dbec642bbaecd0dd5ff1dec3e",
+      "bytes": 4410
+    },
+    {
+      "path": "src/domain/morton_work_kernels.cuh",
+      "origin": "integrated-main",
+      "sha256": "93cdc1447699ffbb9a2125b1f832d2186624c7ee55f5b26f5f63439ae206b578",
+      "bytes": 2731
+    },
+    {
+      "path": "src/domain/multigpu_phase_coordinator.h",
+      "origin": "integrated-main",
+      "sha256": "0572ebcab04d1173b7f027bf08fa53b873cb720c4410a9394271074c0d746ae0",
+      "bytes": 18548
+    },
+    {
+      "path": "src/domain/p2p_topology.h",
+      "origin": "integrated-main",
+      "sha256": "df877f10edf80b9e05da615a33ea18c69f7f7e49d3700dc48143cd4a68cfea8d",
+      "bytes": 1646
+    },
+    {
+      "path": "src/domain/packer_kernel.cu",
+      "origin": "integrated-main",
+      "sha256": "f7dbd1ee5582c431a8216e22914c3c692aea803814578944f9d11e941981a478",
+      "bytes": 43527
+    },
+    {
+      "path": "src/domain/peer_transfer.h",
+      "origin": "integrated-main",
+      "sha256": "0c142bb00c5429f2e40860cb462f6f3fb3b8af93309ec818b37c02b081ac2a46",
+      "bytes": 6730
+    },
+    {
+      "path": "src/domain/rcb_balancer.cu",
+      "origin": "integrated-main",
+      "sha256": "44c0bf4c0ef0901d1208c0dd43ad5fc69723e87bd59e411cae372bff093455bb",
+      "bytes": 21761
+    },
+    {
+      "path": "src/domain/rcb_balancer.h",
+      "origin": "integrated-main",
+      "sha256": "e41c342724ed83297dc93e047d363d281fe9a73f6a93f533d5b2262ac06c785f",
+      "bytes": 5161
+    },
+    {
+      "path": "src/domain/rcb_kernels.cu",
+      "origin": "integrated-main",
+      "sha256": "562358751450c192e774f4cd07a29d51eaf28a9bc08c2694c6773b52c151f156",
+      "bytes": 13199
+    },
+    {
+      "path": "src/domain/rcb_math.h",
+      "origin": "integrated-main",
+      "sha256": "2815aee4e1b79fec8153aac9c6400d7648403036ee58adcf0f0997274dafe6d7",
+      "bytes": 6590
+    },
+    {
+      "path": "src/domain/rcb_work_model.cpp",
+      "origin": "integrated-main",
+      "sha256": "eb158d62967b19edbd261a41f70c471ec409b956b1231a27ba3e0537b9bebae1",
+      "bytes": 8126
+    },
+    {
+      "path": "src/domain/rcb_work_model.h",
+      "origin": "integrated-main",
+      "sha256": "0f2507555a788097d4830ed6c50b7c520cd98e416d47fb56ffc2d8d6fb60fe5e",
+      "bytes": 5607
+    },
+    {
+      "path": "src/domain/rebalance_trigger.h",
+      "origin": "integrated-main",
+      "sha256": "ef4c53edd28fac52e8e98336a1b9abdd895f5b36a44d524f69e657f4fd8b26f8",
+      "bytes": 1414
+    },
+    {
+      "path": "src/domain/shear_source_routing.h",
+      "origin": "integrated-main",
+      "sha256": "be9b58c427bbefe43f5d7e47dc30cea776f0976d3ec8d7078235024d00cd886c",
+      "bytes": 3547
+    }
+  ]
+}
