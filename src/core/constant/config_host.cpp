@@ -31,6 +31,19 @@ namespace cudadem {
 
 namespace detail {
 
+// Reject removed or misspelled performance controls instead of silently ignoring them.
+void require_keys(const YAML::Node& node, const char* path,
+                  std::initializer_list<const char*> allowed) {
+    if (!node.IsMap()) throw std::runtime_error(std::string(path) + " must be a mapping");
+    for (const auto& entry : node) {
+        const auto key = entry.first.as<std::string>();
+        if (std::none_of(allowed.begin(), allowed.end(),
+                         [&](const char* candidate) { return key == candidate; }))
+            throw std::runtime_error(std::string(path) + "." + key +
+                                     " is unsupported or obsolete");
+    }
+}
+
 // Safe string copy for fixed-size arrays
 template<size_t N>
 void safe_strcpy(char (&dest)[N], const std::string& src) {
@@ -194,6 +207,9 @@ SimConfig parse_yaml(const std::string& yaml_path) {
         throw std::runtime_error("Failed to load YAML file: " + yaml_path + "\n" + e.what());
     }
 
+    detail::require_keys(root, "configuration", {"material_database", "simulation", "dem",
+        "domain", "walls", "accelerations", "neighbor", "damping", "io", "gpu",
+        "multigpu", "clumps", "sph_parameters", "shear_box", "particle"});
     if (!root["simulation"] || !root["simulation"]["physics"]) {
         throw std::runtime_error("simulation.physics is required");
     }
@@ -255,14 +271,8 @@ SimConfig parse_yaml(const std::string& yaml_path) {
                     config.rotating_frame.omega.z = omega_mag;  // default: z-axis
                 }
             }
-            if (auto sett = rf["settlement"]) {
-                config.rotating_frame.settlement_enabled = true;
-                if (sett["steps"]) config.rotating_frame.settlement_steps = sett["steps"].as<int32_t>();
-                if (sett["omega_start_fraction"])
-                    config.rotating_frame.settlement_omega_start = sett["omega_start_fraction"].as<float>();
-                if (sett["step_duration"])
-                    config.rotating_frame.settlement_step_duration = sett["step_duration"].as<float>();
-            }
+            if (rf["settlement"])
+                throw std::runtime_error("simulation.rotating_frame.settlement is unsupported; no runtime settlement controller exists");
         }
 
         // Time configuration
@@ -625,8 +635,7 @@ SimConfig parse_yaml(const std::string& yaml_path) {
                 if (w["sphere_mass"])
                     wc.sphere_mass = w["sphere_mass"].as<float>();
                 if (w["sphere_cohesive_strength"])
-                    wc.sphere_cohesive_strength = w["sphere_cohesive_strength"].as<float>();
-                else wc.sphere_cohesive_strength = 0.0f;
+                    throw std::runtime_error("sphere_cohesive_strength is unsupported; use material_database interactions");
                 if (w["sphere_trajectory_path"]) {
                     detail::safe_strcpy(wc.sphere_trajectory_path,
                                        w["sphere_trajectory_path"].as<std::string>());
@@ -754,6 +763,9 @@ SimConfig parse_yaml(const std::string& yaml_path) {
 
         // Self-gravity
         if (auto sg = acc["self_gravity"]) {
+            detail::require_keys(sg, "accelerations.self_gravity",
+                {"enabled", "method", "gravity_update_rate", "gravity_macro_dt",
+                 "displacement_threshold", "direct", "unified_fmm", "tree_rebuild_rate"});
             if (sg["enabled"]) config.acceleration.enable_self_gravity = sg["enabled"].as<bool>();
             if (sg["method"]) {
                 std::string m = sg["method"].as<std::string>();
@@ -779,8 +791,11 @@ SimConfig parse_yaml(const std::string& yaml_path) {
                     "gravity evaluation");
             }
             if (sg["gravity_update_rate"]) config.acceleration.gravity_update_rate = sg["gravity_update_rate"].as<int>();
-            if (sg["gravity_macro_dt"]) config.acceleration.gravity_macro_dt = sg["gravity_macro_dt"].as<double>();
-            if (sg["tree_rebuild_interval"]) config.acceleration.tree_rebuild_interval = sg["tree_rebuild_interval"].as<int>();
+            if (sg["gravity_macro_dt"]) {
+                config.acceleration.gravity_macro_dt = sg["gravity_macro_dt"].as<double>();
+                if (config.acceleration.gravity_macro_dt > 0.0 && !sg["gravity_update_rate"])
+                    config.acceleration.gravity_update_rate = 1;
+            }
             if (sg["displacement_threshold"]) config.acceleration.displacement_threshold = sg["displacement_threshold"].as<float>();
 
             if (auto direct = sg["direct"]) {
@@ -823,33 +838,26 @@ SimConfig parse_yaml(const std::string& yaml_path) {
 
             // Unified FMM parameters (under self_gravity section)
             if (auto unified_fmm = sg["unified_fmm"]) {
+                detail::require_keys(unified_fmm, "unified_fmm",
+                    {"theta_far", "softening_factor", "gravitational_constant", "tree_dimension",
+                     "tree_depth", "adaptive_depth", "particle_overallocate_factor", "min_nodes_estimate",
+                     "enable_global_projection", "verbose", "direct_threshold_leaf",
+                     "direct_threshold_internal", "force_tree_type"});
                 auto& c = config.acceleration.unified_fmm;
-                static const std::set<std::string> obsolete_topology_keys = {
-                    "rebuild_threshold", "enable_topology_freeze", "update_rate",
-                    "full_rebuild_rate", "tree_check_interval",
-                    "min_residence_checks", "consecutive_pass_for_downgrade",
-                    "shape_ratio_quadtree"
-                };
-                for (const auto& entry : unified_fmm) {
-                    const std::string key = entry.first.as<std::string>();
-                    if (obsolete_topology_keys.count(key)) {
-                        throw std::runtime_error(
-                            "unified_fmm." + key + " is obsolete: BFFMM rebuilds "
-                            "its topology for every gravity evaluation");
-                    }
-                }
                 if (unified_fmm["theta_far"])                    c.theta_far = unified_fmm["theta_far"].as<float>();
                 if (unified_fmm["softening_factor"])             c.softening_factor = unified_fmm["softening_factor"].as<float>();
                 if (unified_fmm["gravitational_constant"])       c.gravitational_constant = unified_fmm["gravitational_constant"].as<double>();
+
+                c.adaptive_depth.enabled = false;
 
                 // An explicit integer without an adaptive block preserves the
                 // fixed-depth compatibility path. Omitted depth or `auto`
                 // enables the selected-dimension adaptive controller.
                 if (auto adaptive = unified_fmm["adaptive_depth"]) {
-                    if (!adaptive.IsMap()) {
-                        throw std::runtime_error(
-                            "unified_fmm.adaptive_depth must be a mapping");
-                    }
+                    detail::require_keys(adaptive, "unified_fmm.adaptive_depth",
+                        {"enabled", "min_depth", "max_depth", "trial_interval_evaluations",
+                         "trial_warmup_evaluations", "trial_samples", "min_improvement_fraction",
+                         "confirmation_trials", "capacity_headroom", "capacity_growth_trigger", "multigpu"});
                     c.adaptive_depth.enabled = true;
                     if (adaptive["enabled"])
                         c.adaptive_depth.enabled = adaptive["enabled"].as<bool>();
@@ -878,10 +886,8 @@ SimConfig parse_yaml(const std::string& yaml_path) {
                         c.adaptive_depth.capacity_growth_trigger =
                             adaptive["capacity_growth_trigger"].as<float>();
                     if (auto distributed = adaptive["multigpu"]) {
-                        if (!distributed.IsMap()) {
-                            throw std::runtime_error(
-                                "unified_fmm.adaptive_depth.multigpu must be a mapping");
-                        }
+                        detail::require_keys(distributed, "unified_fmm.adaptive_depth.multigpu",
+                            {"local_count_reset_fraction", "secondary_objective", "trial_order"});
                         if (distributed["local_count_reset_fraction"]) {
                             c.adaptive_depth.multigpu.local_count_reset_fraction =
                                 distributed["local_count_reset_fraction"].as<float>();
@@ -952,22 +958,14 @@ SimConfig parse_yaml(const std::string& yaml_path) {
                     }
                 }
                 if (unified_fmm["particle_overallocate_factor"]) c.particle_overallocate_factor = unified_fmm["particle_overallocate_factor"].as<float>();
-                if (unified_fmm["node_overallocate_factor"])     c.node_overallocate_factor = unified_fmm["node_overallocate_factor"].as<float>();
-                if (unified_fmm["p2p_queue_initial_factor"])     c.p2p_queue_initial_factor = unified_fmm["p2p_queue_initial_factor"].as<int>();
-                if (unified_fmm["p2p_queue_resize_factor"])      c.p2p_queue_resize_factor = unified_fmm["p2p_queue_resize_factor"].as<float>();
                 if (unified_fmm["min_nodes_estimate"])           c.min_nodes_estimate = unified_fmm["min_nodes_estimate"].as<int>();
-                if (unified_fmm["m2l_warps_per_block"])          c.m2l_warps_per_block = unified_fmm["m2l_warps_per_block"].as<int>();
                 if (unified_fmm["enable_global_projection"])     c.enable_global_projection = unified_fmm["enable_global_projection"].as<bool>();
                 if (unified_fmm["verbose"])                      c.verbose = unified_fmm["verbose"].as<bool>();
                 const bool has_dimension = static_cast<bool>(unified_fmm["tree_dimension"]);
                 const bool has_legacy_dimension = static_cast<bool>(unified_fmm["force_tree_type"]);
-                if (!has_dimension && !has_legacy_dimension) {
-                    throw std::runtime_error(
-                        "unified_fmm.tree_dimension is required and must be 2 or 3");
-                }
                 const int dimension = has_dimension
                     ? unified_fmm["tree_dimension"].as<int>()
-                    : unified_fmm["force_tree_type"].as<int>();
+                    : (has_legacy_dimension ? unified_fmm["force_tree_type"].as<int>() : c.tree_dimension);
                 if (has_dimension && has_legacy_dimension &&
                     unified_fmm["force_tree_type"].as<int>() != dimension) {
                     throw std::runtime_error(
@@ -987,11 +985,9 @@ SimConfig parse_yaml(const std::string& yaml_path) {
             }
         }
 
-        // Gravity update parameters (siblings to self_gravity in YAML)
-        if (acc["gravity_update_rate"]) config.acceleration.gravity_update_rate = acc["gravity_update_rate"].as<int>();
-        if (acc["gravity_macro_dt"]) config.acceleration.gravity_macro_dt = acc["gravity_macro_dt"].as<double>();
-        if (acc["tree_rebuild_interval"]) config.acceleration.tree_rebuild_interval = acc["tree_rebuild_interval"].as<int>();
-        if (acc["displacement_threshold"]) config.acceleration.displacement_threshold = acc["displacement_threshold"].as<float>();
+        if (acc["gravity_update_rate"] || acc["gravity_macro_dt"] ||
+            acc["tree_rebuild_interval"] || acc["displacement_threshold"])
+            throw std::runtime_error("gravity controls belong under accelerations.self_gravity; tree_rebuild_interval was removed");
 
         // YORP
         if (auto yorp = acc["yorp"]) {
@@ -1026,9 +1022,6 @@ SimConfig parse_yaml(const std::string& yaml_path) {
                     "axis_ratio_drop_fraction", "epsilon_reduction_fraction_per_cycle",
                     "minimum_epsilon_fraction", "max_omega_rad_s"
                 };
-                if (!adaptive.IsMap()) {
-                    throw std::runtime_error("accelerations.yorp.adaptive must be a mapping");
-                }
                 for (const auto& entry : adaptive) {
                     const std::string key = entry.first.as<std::string>();
                     if (allowed_adaptive_keys.count(key) == 0) {
@@ -1059,7 +1052,6 @@ SimConfig parse_yaml(const std::string& yaml_path) {
             }
         }
 
-
         // Acceleration fields
         if (auto fields = acc["fields"]) {
             if (!fields.IsSequence()) throw std::runtime_error("accelerations.fields must be a sequence");
@@ -1088,10 +1080,8 @@ SimConfig parse_yaml(const std::string& yaml_path) {
                     }
                 }
 
-                if (auto ver = f["verify"]) {
-                    if (ver["time"]) fc.verify_time = ver["time"].as<bool>();
-                    if (ver["space"]) fc.verify_space = ver["space"].as<bool>();
-                }
+                if (f["verify"])
+                    throw std::runtime_error("accelerations.fields.verify is unsupported; it had no runtime effect");
 
                 config.acceleration.num_accel_fields++;
             }
@@ -1106,9 +1096,8 @@ SimConfig parse_yaml(const std::string& yaml_path) {
 
     // --- Neighbor section ---
     if (auto neigh = root["neighbor"]) {
-        if (!neigh.IsMap()) {
-            throw std::runtime_error("neighbor must be a mapping");
-        }
+        detail::require_keys(neigh, "neighbor",
+            {"method", "backend", "cell_size_factor", "update_frequency", "lbvh_skin_factor", "lbvh_rebuild_threshold", "verlet_buffer_enabled", "verlet_skin"});
         if (neigh["method"]) {
             std::string m = neigh["method"].as<std::string>();
             if (m == "lbvh" || m == "LBVH") {
@@ -1139,9 +1128,6 @@ SimConfig parse_yaml(const std::string& yaml_path) {
         if (neigh["update_frequency"]) {
             config.neighbor.update_frequency = neigh["update_frequency"].as<int32_t>();
         }
-        if (neigh["use_hash_table"]) {
-            config.neighbor.use_hash_table = neigh["use_hash_table"].as<bool>();
-        }
         if (neigh["lbvh_skin_factor"]) {
             config.neighbor.lbvh_skin_factor = neigh["lbvh_skin_factor"].as<float>();
         }
@@ -1154,13 +1140,11 @@ SimConfig parse_yaml(const std::string& yaml_path) {
         if (neigh["verlet_skin"]) {
             config.neighbor.verlet_skin = neigh["verlet_skin"].as<float>();
         }
-        if (neigh["verlet_skin_factor"]) {
-            config.neighbor.verlet_skin_factor = neigh["verlet_skin_factor"].as<float>();
-        }
     }
 
     // --- Damping section ---
     if (auto damp = root["damping"]) {
+        detail::require_keys(damp, "damping", {"enabled", "type", "coefficient"});
         if (damp["enabled"]) config.damping.enabled = damp["enabled"].as<bool>();
         if (damp["type"]) config.damping.type = detail::parse_damping_type(damp["type"].as<std::string>());
         if (damp["coefficient"]) config.damping.coefficient = damp["coefficient"].as<float>();
@@ -1177,10 +1161,11 @@ SimConfig parse_yaml(const std::string& yaml_path) {
             }
         }
         if (auto out = io["output"]) {
+            detail::require_keys(out, "io.output",
+                {"directory", "initial_state", "scalar_interval", "times", "timing", "timing_receipt_path", "fields"});
             if (out["directory"]) {
                 detail::safe_strcpy(config.io.output_directory, out["directory"].as<std::string>());
             }
-            if (out["damage"]) config.io.output_damage = out["damage"].as<bool>();
             if (out["initial_state"])
                 config.io.output_initial_state = out["initial_state"].as<bool>();
             if (out["scalar_interval"])
@@ -1196,15 +1181,16 @@ SimConfig parse_yaml(const std::string& yaml_path) {
                 detail::safe_strcpy(config.io.timing_receipt_path,
                                    out["timing_receipt_path"].as<std::string>());
 
-            // Parse fields list for flag output
+            // Standard binary fields are fixed; this list enables optional sidecars.
             if (auto fields = out["fields"]) {
-                if (fields.IsSequence()) {
+                if (!fields.IsSequence()) throw std::runtime_error("io.output.fields must be a sequence");
+                {
                     for (const auto& field : fields) {
                         std::string field_name = field.as<std::string>();
-                        if (field_name == "flag") {
-                            config.io.output_flag = true;
-                        } else if (field_name == "gravity_force") {
+                        if (field_name == "gravity_force") {
                             config.io.output_gravity_force = true;
+                        } else {
+                            throw std::runtime_error("io.output.fields supports only gravity_force; standard v3 fields are always written");
                         }
                     }
                 }
@@ -1233,19 +1219,20 @@ SimConfig parse_yaml(const std::string& yaml_path) {
 
     // --- GPU section ---
     if (auto gpu = root["gpu"]) {
+        detail::require_keys(gpu, "gpu",
+            {"device_id", "block_size"});
         if (gpu["device_id"]) config.gpu.device_id = gpu["device_id"].as<int32_t>();
         if (gpu["block_size"]) config.gpu.block_size = gpu["block_size"].as<int32_t>();
-        if (gpu["use_double_buffer"]) config.gpu.use_double_buffer = gpu["use_double_buffer"].as<bool>();
-        if (gpu["texture_memory"]) config.gpu.use_texture_memory = gpu["texture_memory"].as<bool>();
     }
 
     // --- Multi-GPU section ---
     if (auto mg = root["multigpu"]) {
+        if (mg["rebalance_frequency"])
+            throw std::runtime_error("multigpu.rebalance_frequency is obsolete; use rebalance_min_interval and rebalance_threshold");
         if (mg["enabled"]) config.multigpu.enabled = mg["enabled"].as<bool>();
         if (mg["max_gpus"]) config.multigpu.max_gpus = mg["max_gpus"].as<int32_t>();
         if (mg["morton_ownership"]) config.multigpu.morton_ownership = mg["morton_ownership"].as<bool>();
         if (mg["partition_depth"]) config.multigpu.partition_depth = mg["partition_depth"].as<int>();
-        if (mg["rebalance_frequency"]) config.multigpu.rebalance_frequency = mg["rebalance_frequency"].as<int32_t>();
         if (mg["halo_width_factor"]) config.multigpu.halo_width_factor = mg["halo_width_factor"].as<float>();
         if (mg["buffer_capacity_factor"]) config.multigpu.buffer_capacity_factor = mg["buffer_capacity_factor"].as<float>();
         if (mg["let"]) {
@@ -1643,24 +1630,18 @@ SimConfig parse_yaml(const std::string& yaml_path) {
                     relaxation["disable_damage"].as<bool>();
         }
 
-        // Input format
-        if (sph["input_format"]) {
-            detail::safe_strcpy(config.sph.input_format, sph["input_format"].as<std::string>());
-        }
-        if (sph["input_path"]) {
-            detail::safe_strcpy(config.sph.input_path, sph["input_path"].as<std::string>());
-        }
-
     }
+
+    // Inactive FMM defaults must not activate controllers in non-gravity runners.
+    if (!config.acceleration.enable_self_gravity ||
+        config.acceleration.gravity_method != SelfGravityMethod::BFFMM)
+        config.acceleration.unified_fmm.adaptive_depth.enabled = false;
 
     // The compact-support gravity correction traverses the current CUDA BVH
     // after h evolves, rather than a cached hydro adjacency from before it.
     if (config.physics == SimulationPhysics::SPH &&
         config.acceleration.enable_self_gravity &&
         config.acceleration.gravity_method == SelfGravityMethod::BFFMM) {
-#ifdef FMM_P2P_LOCAL_FP32
-        throw std::runtime_error("SPH BFFMM requires a build with FMM_P2P_LOCAL_FP32=OFF");
-#endif
         if (!(std::isfinite(config.sph.hsml_min) && config.sph.hsml_min > 0 &&
               std::isfinite(config.sph.hsml_max) && config.sph.hsml_max >= config.sph.hsml_min))
             throw std::runtime_error("SPH BFFMM requires finite positive ordered h bounds");
@@ -1940,15 +1921,7 @@ SimConfig parse_yaml(const std::string& yaml_path) {
     if (config.acceleration.gravity_macro_dt > 0.0 &&
         config.acceleration.gravity_update_rate != 1) {
         throw std::runtime_error(
-            "gravity_macro_dt and a non-default gravity_update_rate are mutually exclusive");
-    }
-    if (config.physics == SimulationPhysics::SPH &&
-        config.acceleration.enable_self_gravity &&
-        (config.acceleration.gravity_update_rate > 1 ||
-         config.acceleration.gravity_macro_dt > 0.0)) {
-        throw std::runtime_error(
-            "SPH self-gravity does not support macro cadence; use "
-            "gravity_update_rate: 1 and gravity_macro_dt: 0");
+            "gravity_macro_dt requires gravity_update_rate: 1 or an omitted gravity_update_rate");
     }
     {
         const DirectGravityConfig& direct = config.acceleration.direct_gravity;
@@ -1976,6 +1949,8 @@ SimConfig parse_yaml(const std::string& yaml_path) {
     {
         const UnifiedFMMConfig& fmm = config.acceleration.unified_fmm;
         const AdaptiveDepthConfig& adaptive = fmm.adaptive_depth;
+        if (!std::isfinite(fmm.theta_far) || std::abs(fmm.theta_far - 0.8f) > 1.0e-6f)
+            throw std::runtime_error("unified_fmm.theta_far must be 0.8 for the bundled G/stencil tables");
         if (fmm.tree_dimension != 2 && fmm.tree_dimension != 3) {
             throw std::runtime_error("unified_fmm.tree_dimension must be 2 or 3");
         }
@@ -1983,7 +1958,8 @@ SimConfig parse_yaml(const std::string& yaml_path) {
             (fmm.tree_depth < 2 || fmm.tree_depth > 20)) {
             throw std::runtime_error("unified_fmm.tree_depth must be in [2, 20]");
         }
-        if (adaptive.enabled) {
+        if (adaptive.enabled && config.acceleration.enable_self_gravity &&
+            config.acceleration.gravity_method == SelfGravityMethod::BFFMM) {
             if (adaptive.min_depth < 2 || adaptive.min_depth > 20 ||
                 adaptive.max_depth < 2 || adaptive.max_depth > 20 ||
                 adaptive.min_depth > adaptive.max_depth) {
@@ -2029,13 +2005,6 @@ SimConfig parse_yaml(const std::string& yaml_path) {
                 throw std::runtime_error(
                     "unified_fmm.adaptive_depth.multigpu.local_count_reset_fraction "
                     "must be finite and in (0, 1]");
-            if (!config.acceleration.enable_self_gravity ||
-                config.acceleration.gravity_method != SelfGravityMethod::BFFMM)
-                throw std::runtime_error(
-                    "adaptive FMM depth requires enabled unified_fmm self-gravity");
-            if (config.physics != SimulationPhysics::DEM)
-                throw std::runtime_error(
-                    "adaptive FMM depth currently supports simulation.physics: dem only");
             if (config.shear_box.enabled) {
                 if (!config.multigpu.enabled || !config.multigpu.morton_ownership)
                     throw std::runtime_error(
@@ -2191,12 +2160,7 @@ void print_config(const SimConfig& config) {
         if (omega_mag > 1e-10) {
             std::cout << "Rotation period: " << (2.0 * M_PI / omega_mag / 3600.0) << " h" << std::endl;
         }
-        if (config.rotating_frame.settlement_enabled) {
-            std::cout << "Settlement: enabled, " << config.rotating_frame.settlement_steps
-                      << " steps, start=" << config.rotating_frame.settlement_omega_start
-                      << "×Ω, duration=" << config.rotating_frame.settlement_step_duration
-                      << " s/step" << std::endl;
-        }
+
     }
     std::cout << "\n--- Physics and materials ---" << std::endl;
     std::cout << "Physics: " << (config.physics == SimulationPhysics::DEM ? "DEM" : "SPH") << std::endl;

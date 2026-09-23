@@ -20,7 +20,7 @@ walls:
     normal: [0.0, 0.0, 1.0]
 
 neighbor:
-  method: cll
+  method: lbvh
 
 io:
   input:
@@ -30,14 +30,8 @@ io:
 
 gpu: {device_id: 0, block_size: 256}
 
-# These reference examples use no gravity or prescribed frame/ephemeris forces.
-# Inactive FMM settings are explicit because configuration validation reads them.
-accelerations:
-  inertial: {enabled: false}
-  tidal: {enabled: false}
-  self_gravity:
-    enabled: false
-    method: direct
-    unified_fmm:
-      tree_dimension: 3
-      tree_depth: 10
+# Self-gravity and prescribed frame/ephemeris accelerations default to disabled.
+# For DEM gravity, enable self_gravity below: FMM, RESPA=2, projection and
+# adaptive depth then use their production defaults.
+# accelerations:
+#   self_gravity: {enabled: true}

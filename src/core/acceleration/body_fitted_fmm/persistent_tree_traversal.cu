@@ -501,6 +501,27 @@ __global__ void persistent_complete_kernel(PersistentTreeContext* ctx) {
 
 }
 
+__global__ void limit_sph_depth_kernel(PersistentTreeContext* ctx, int ceiling) {
+    if (threadIdx.x || blockIdx.x) return;
+    const int dimension = ctx->command.tree_dimension;
+    for (int slot = 0; slot < PERSISTENT_TREE_DIMENSIONS; ++slot) {
+        auto& state = ctx->adaptive_depth[slot];
+        if (state.effective_max_depth <= ceiling) continue;
+        state.effective_max_depth = ceiling;
+        state.selected_depth = min(state.selected_depth, ceiling);
+        state.candidate_depth = state.selected_depth;
+        state.launch_depth = state.selected_depth;
+        state.trial_phase = 0;
+        state.trial_warmups = 0;
+        state.trial_sample_count = 0;
+        state.selected_time_ns = 0;
+        state.selected_sample_count = 0;
+        state.candidate_time_ns = 0;
+        if (slot == adaptive_dimension_slot(dimension))
+            adaptive_emit_diagnostic(ctx, dimension, state, AdaptiveDepthTransition::EffectiveCeilingChanged);
+    }
+}
+
 __global__ void persistent_scheduler_kernel(PersistentTreeContext* ctx,
                                             cudaGraphExec_t graph_d2,
                                             cudaGraphExec_t graph_d3) {
@@ -1136,6 +1157,12 @@ PersistentTreeMetadata snapshot_persistent_tree_metadata(
         cudaMemcpyDeviceToHost, runtime.graph_upload_stream));
     CUDA_CHECK(cudaStreamSynchronize(runtime.graph_upload_stream));
     return metadata;
+}
+
+void limit_persistent_sph_depth(PersistentTreeRuntime& runtime, int ceiling, cudaStream_t stream) {
+    // Resolve before a subsequent scheduler can wait on this stream.
+    limit_sph_depth_kernel<<<1,1,0,stream>>>(runtime.device_context, ceiling);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void record_persistent_depth_evaluation(PersistentTreeRuntime& runtime,

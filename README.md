@@ -9,19 +9,23 @@ dependencies, configuration references, and redistribution notices.
 
 Use Linux, a CUDA-compatible C++17 compiler with OpenMP, CUDA Toolkit 12.1,
 and CMake 3.18 or newer. The multi-GPU executable also requires MPI development
-headers and libraries. yaml-cpp and cuCollections are fetched from their
-official upstream repositories at fixed revisions. The first configuration
+headers and libraries. yaml-cpp is fetched from its official upstream
+repository at a fixed revision. The first configuration
 needs network access unless their sources are already cached.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.1/bin/nvcc \
-  -DCMAKE_CUDA_ARCHITECTURES=89
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.1/bin/nvcc
 cmake --build build -j
 ```
 
-Architecture `89` targets Ada GPUs such as the L40; select the architecture
-and installed CUDA compiler for your machine. Executables are written to
+The default architecture list is `70;75;80;86;87;89;90`: native code and PTX
+for Volta, Turing, Ampere (including Orin), Ada and Hopper. For a faster local
+build, override it with `-DCMAKE_CUDA_ARCHITECTURES=89` on an L40. CUDA 12.1
+cannot emit native Blackwell code; bundled PTX provides the forward-compatibility
+route described by [NVIDIA](https://docs.nvidia.com/cuda/archive/12.9.0/blackwell-compatibility-guide/index.html).
+Blackwell hardware execution is not part of this checkout's local validation.
+Executables are written to
 `build/bin/`:
 
 | Executable | Purpose |
@@ -36,15 +40,21 @@ with `-DGRANIT_ENABLE_OPTIX=ON`, supplying `-DOPTIX_INCLUDE_DIR=/path/to/include
 or allowing CMake to fetch the pinned NVIDIA headers. The backend requires
 an appropriate NVIDIA driver.
 
-The production precision defaults are `FMM_M2L_MODE=FP64` and
+The production precision defaults are `FMM_M2L_MODE=TF32_TC` and
 `FMM_P2P_LOCAL_FP32=ON`. The available M2L modes are `FP64`, `FP32_SIMT_LINEAR`,
 `FP32_SIMT_DUAL`, and `TF32_TC`; TF32 Tensor Core execution requires SM80 or
-newer. Changing these options changes the numerical execution mode.
+newer; SM70/75 use the FP32 SIMT fallback. Release is the default build type.
+DEM P2P uses FP32 arithmetic with FP64 particle storage; multipole storage/scaling
+and final accumulation remain FP64. SPH compact-softening P2P automatically
+uses FP64 within the same binary to preserve cancellation accuracy. Changing precision options changes numerical
+behavior; these defaults are not an accuracy or conservation guarantee.
 
 For an offline configuration, pass existing dependency directories through
-`FETCHCONTENT_SOURCE_DIR_CUCOLLECTIONS` and `FETCHCONTENT_SOURCE_DIR_YAML-CPP`.
+`FETCHCONTENT_SOURCE_DIR_YAML-CPP`.
 OptiX can use `OPTIX_INCLUDE_DIR`. Dependency revisions and source hashes are
-recorded in [SOURCE_MANIFEST.json](SOURCE_MANIFEST.json).
+recorded in the historical export [SOURCE_MANIFEST.json](SOURCE_MANIFEST.json).
+The current Git tree records subsequent release changes; that manifest is not
+a checksum inventory of the current tree.
 
 ## Configure and run
 
@@ -63,17 +73,27 @@ references and require suitable particle inputs and paths. See the
 [binary input/output formats](docs/io_formats.md), and
 [SPH physics stages](docs/SPH_Physics_Stages.md).
 
-The DEM and SPH reference configurations explicitly disable self-gravity,
-inertial acceleration, and tidal acceleration. They also specify valid inactive
-FMM settings required by configuration validation. Enable and configure these
-forces deliberately for a simulation that requires them.
+Self-gravity, prescribed inertial/tidal acceleration, and global damping are
+disabled until requested. Enabling self-gravity selects unified FMM with
+θ=0.8, global force/torque projection, adaptive depth, and RESPA with two inner
+steps. SPH selects CFL once per macro and holds equal inner timesteps, including
+pairs shortened together to land on output/stage/terminal times. Neighbor search
+defaults to LBVH. The shear gravity cutoff defaults to zero (disabled); finite
+shear replicas retain their projection restriction. See the
+[defaults audit](docs/Configuration_Defaults.md) for the
+full inventory, retained controls, removed keys, and exceptions.
 
-Particle generation, analysis utilities, tests, experiments, profiling
-campaigns, and results remain in the development checkout. This source
-package does not include those tools or their datasets.
+Particle generation, analysis utilities, experiments, profiling campaigns, and
+results remain in the development checkout. The release configuration and
+G-table regression tests are available with `-DBUILD_TESTING=ON`, followed by
+`cmake --build build -j` and `ctest --test-dir build --output-on-failure`.
 
-Generated FMM coefficient and stencil tables are included as C++ headers;
-building the solver does not require Python or regenerating those tables.
+The precomposed binary [FMM G table](data/fmm/README.md) is committed and
+verified during configuration. CMake copies it into `build/share/granit/fmm/`
+and installs it alongside the executables via `cmake --install build --prefix
+/path/to/install`. Keep the `bin/` and `share/granit/` layout together when
+moving a build or installation. Stencils/canonical tables remain in C++ headers;
+normal builds need no table generation or Python.
 Some source names and runtime banners retain the historical CudaDEM name.
 
 ## License

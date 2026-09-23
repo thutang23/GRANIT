@@ -2,7 +2,6 @@
 // Cell-Linked List Implementation for DEM Simulation
 // =============================================================================
 // GPU-optimized neighbor search using:
-// - cuCollections hash table for sparse grid tracking
 // - Thrust sorting for particle reordering by cell ID
 // - Historical state comparison to skip unnecessary rebuilds
 // - 27-cell neighborhood search with periodic boundary support
@@ -37,18 +36,6 @@
 #include <thrust/tuple.h>
 // CUB for efficient reduction
 #include <cub/cub.cuh>
-#endif
-// cuCollections for GPU hash table
-// NOTE: CCCL 3.0.0+ is required by cuCollections, which requires CUDA 12.3+
-// CUDA 12.1 ships with an older CCCL version, so cuCollections is disabled
-#if !defined(CUDADEM_CPU_MOCK) && defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13
-// Enable cuCollections only for CUDA 13+ where CCCL 3.0+ is available
-#define CUDADEM_USE_CUCO 1
-#include <cuco/static_map.cuh>
-#include <cuda/std/atomic>
-#else
-// Fall back to standard cell-linked list neighbor search
-#define CUDADEM_USE_CUCO 0
 #endif
 #include <iostream>
 #include <algorithm>
@@ -184,21 +171,7 @@ CLLGPUState& CLLSearchImpl::get_gpu_state(int32_t gpu_id) {
     return it->second;
 }
 
-// =============================================================================
-// cuCollections Hash Table Type Definition
-// =============================================================================
-// Key: cell linear index, Value: marker (1 = occupied)
-// Used for sparse grid tracking when domain is large but particles are localized
 
-#if CUDADEM_USE_CUCO
-using CellHashMap = cuco::static_map<int32_t, int32_t>;
-// Global hash table pointer (optional, used when config.neighbor.use_hash_table = true)
-static CellHashMap* g_cell_hash_table = nullptr;
-#else
-// Hash table disabled for CUDA < 12.0
-// Use array-based cell tracking instead
-static void* g_cell_hash_table = nullptr;  // Placeholder
-#endif
 
 // =============================================================================
 // CUDA Kernels
@@ -1012,35 +985,6 @@ void CLLSearchImpl::initialize(
     gpu_state.async_readback_pending = false;
     gpu_state.steps_since_rebuild = 0;
 
-    // Initialize cuCollections hash table if requested and available
-#if CUDADEM_USE_CUCO
-    if (config.neighbor.use_hash_table) {
-        // Estimate capacity: ~2x expected occupied cells for good load factor (50%)
-        // Per guide: capacity = num_elements / load_factor
-        constexpr double load_factor = 0.5;
-        size_t capacity = static_cast<size_t>(std::ceil(num_particles / load_factor));
-        capacity = std::max(capacity, static_cast<size_t>(1024));
-
-        // Define sentinel values (must not appear in actual data)
-        // Cell IDs are always >= 0, so -1 is a safe sentinel
-        constexpr int32_t empty_key_sentinel = -1;
-        constexpr int32_t empty_value_sentinel = -1;
-
-        // Create hash table per cuCollections guide
-        g_cell_hash_table = new CellHashMap(
-            capacity,
-            cuco::empty_key{empty_key_sentinel},
-            cuco::empty_value{empty_value_sentinel}
-        );
-    }
-#else
-    if (config.neighbor.use_hash_table) {
-        std::cerr << "WARNING: Hash table requested but cuCollections requires CUDA 12.0+"
-                  << std::endl;
-        std::cerr << "         Falling back to array-based neighbor search" << std::endl;
-    }
-#endif
-
     // Reset statistics
     gpu_state.stats = NeighborSearchStats();
 
@@ -1072,8 +1016,6 @@ void CLLSearchImpl::initialize(
     std::cout << "  Periodic: (" << (pbc.periodic_x ? "X" : "-") << ", "
               << (pbc.periodic_y ? "Y" : "-") << ", "
               << (pbc.periodic_z ? "Z" : "-") << ")" << std::endl;
-    std::cout << "  Hash table: " << (config.neighbor.use_hash_table ? "Enabled" : "Disabled")
-              << std::endl;
 }
 
 bool CLLSearchImpl::needs_rebuild(

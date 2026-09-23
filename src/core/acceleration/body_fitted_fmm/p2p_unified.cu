@@ -28,24 +28,25 @@ using p2p_compute_t = double;
 // explicitly double.
 #define p2p_real_t p2p_compute_t
 
+template<class Compute>
 __device__ __forceinline__
 void compute_gravitational_acceleration_from_delta_unified(
-    p2p_real_t dx, p2p_real_t dy, p2p_real_t dz,
-    p2p_real_t mj, p2p_real_t softening_sq, p2p_real_t G,
-    p2p_real_t& fx, p2p_real_t& fy, p2p_real_t& fz)
+    Compute dx, Compute dy, Compute dz,
+    Compute mj, Compute softening_sq, Compute G,
+    Compute& fx, Compute& fy, Compute& fz)
 {
-    p2p_real_t raw_r_sq = dx*dx + dy*dy + dz*dz;
+    Compute raw_r_sq = dx*dx + dy*dy + dz*dz;
     // Negative softening_sq encodes the SPH compact, finite baseline. DEM
     // retains its original Plummer denominator for nonnegative values.
-    p2p_real_t r_sq = softening_sq < 0 ? fmax(raw_r_sq, -softening_sq)
+    Compute r_sq = softening_sq < 0 ? fmax(raw_r_sq, -softening_sq)
                                       : raw_r_sq + softening_sq;
-    if (!(r_sq > BF_P2P_REAL(0.0))) {
-        fx = fy = fz = BF_P2P_REAL(0.0);
+    if (!(r_sq > Compute(0))) {
+        fx = fy = fz = Compute(0);
         return;
     }
-    p2p_real_t r_inv = BF_P2P_REAL(1.0) / BF_P2P_SQRT(r_sq);
-    p2p_real_t r_inv3 = r_inv * r_inv * r_inv;
-    p2p_real_t f_mag = G * mj * r_inv3;
+    Compute r_inv = Compute(1) / sqrt(r_sq);
+    Compute r_inv3 = r_inv * r_inv * r_inv;
+    Compute f_mag = G * mj * r_inv3;
     fx = f_mag * dx; fy = f_mag * dy; fz = f_mag * dz;
 }
 
@@ -339,18 +340,18 @@ __global__ void fmm_p2p_self_outer_unified(
 }
 
 
-template<bool OUTER>
+template<bool OUTER, class Compute = p2p_compute_t>
 __device__ __forceinline__ void grouped_p2p_source_warp(
     int source, bool target_active, unsigned int target_mask, int orig_i,
-    double xi, double yi, double zi, p2p_real_t mi,
-    p2p_real_t& ax, p2p_real_t& ay, p2p_real_t& az,
+    double xi, double yi, double zi, Compute mi,
+    Compute& ax, Compute& ay, Compute& az,
     const UnifiedNode* __restrict__ nodes,
     const double* __restrict__ pos_x, const double* __restrict__ pos_y,
     const double* __restrict__ pos_z, const float* __restrict__ mass,
     const int* __restrict__ sorted_indices, int lane,
     double* sh_pos_x, double* sh_pos_y, double* sh_pos_z,
-    p2p_real_t* sh_mass,
-    p2p_real_t G, p2p_real_t softening_sq, double cutoff_sq)
+    Compute* sh_mass,
+    Compute G, Compute softening_sq, double cutoff_sq)
 {
     const UnifiedNode& source_node = nodes[source];
     const int source_begin = static_cast<int>(source_node.begin);
@@ -362,7 +363,7 @@ __device__ __forceinline__ void grouped_p2p_source_warp(
             sh_pos_x[lane] = pos_x[orig_j];
             sh_pos_y[lane] = pos_y[orig_j];
             sh_pos_z[lane] = pos_z[orig_j];
-            sh_mass[lane] = static_cast<p2p_real_t>(mass[orig_j]);
+            sh_mass[lane] = static_cast<Compute>(mass[orig_j]);
         }
         __syncwarp();
         if (__popc(target_mask) <= 4) {
@@ -379,7 +380,7 @@ __device__ __forceinline__ void grouped_p2p_source_warp(
                 const double target_x = __shfl_sync(0xffffffffu, xi, target_lane);
                 const double target_y = __shfl_sync(0xffffffffu, yi, target_lane);
                 const double target_z = __shfl_sync(0xffffffffu, zi, target_lane);
-                p2p_real_t dax = 0, day = 0, daz = 0;
+                Compute dax = 0, day = 0, daz = 0;
                 bool contributes = lane < tile_size;
                 if (contributes) {
                     const int orig_j = sorted_indices[source_begin + tile + lane];
@@ -392,9 +393,9 @@ __device__ __forceinline__ void grouped_p2p_source_warp(
                             rdx * rdx + rdy * rdy + rdz * rdz > cutoff_sq);
                         if (contributes) {
                             compute_gravitational_acceleration_from_delta_unified(
-                                static_cast<p2p_real_t>(rdx),
-                                static_cast<p2p_real_t>(rdy),
-                                static_cast<p2p_real_t>(rdz), sh_mass[lane],
+                                static_cast<Compute>(rdx),
+                                static_cast<Compute>(rdy),
+                                static_cast<Compute>(rdz), sh_mass[lane],
                                 softening_sq, G, dax, day, daz);
                         }
                     }
@@ -405,9 +406,9 @@ __device__ __forceinline__ void grouped_p2p_source_warp(
                     source_mask &= source_mask - 1u;
                     // All lanes participate in every shuffle, including image
                     // lanes and lanes beyond this source tile's last particle.
-                    const p2p_real_t sx = __shfl_sync(0xffffffffu, dax, j);
-                    const p2p_real_t sy = __shfl_sync(0xffffffffu, day, j);
-                    const p2p_real_t sz = __shfl_sync(0xffffffffu, daz, j);
+                    const Compute sx = __shfl_sync(0xffffffffu, dax, j);
+                    const Compute sy = __shfl_sync(0xffffffffu, day, j);
+                    const Compute sz = __shfl_sync(0xffffffffu, daz, j);
                     if (lane == target_lane) {
                         if constexpr (OUTER) {
                             ax += sx; ay += sy; az += sz;
@@ -427,10 +428,10 @@ __device__ __forceinline__ void grouped_p2p_source_warp(
                 if (cutoff_sq > 0.0 &&
                     rdx * rdx + rdy * rdy + rdz * rdz > cutoff_sq)
                     continue;
-                const p2p_real_t dx = static_cast<p2p_real_t>(rdx);
-                const p2p_real_t dy = static_cast<p2p_real_t>(rdy);
-                const p2p_real_t dz = static_cast<p2p_real_t>(rdz);
-                p2p_real_t dax, day, daz;
+                const Compute dx = static_cast<Compute>(rdx);
+                const Compute dy = static_cast<Compute>(rdy);
+                const Compute dz = static_cast<Compute>(rdz);
+                Compute dax, day, daz;
                 compute_gravitational_acceleration_from_delta_unified(
                     dx, dy, dz, sh_mass[j], softening_sq, G, dax, day, daz);
                 if constexpr (OUTER) {
@@ -454,11 +455,11 @@ struct GroupedParticleSources {
     bool remote;
 };
 
-template<int D, bool OUTER>
+template<int D, bool OUTER, class Compute = p2p_compute_t>
 __device__ __forceinline__ void grouped_p2p_leaf_routes(
     int leaf, int num_nodes, bool target_active, unsigned int target_mask, int orig_i,
-    double xi, double yi, double zi, p2p_real_t mi,
-    p2p_real_t& ax, p2p_real_t& ay, p2p_real_t& az,
+    double xi, double yi, double zi, Compute mi,
+    Compute& ax, Compute& ay, Compute& az,
     const GroupedInteractionArena& arena, const UnifiedNode* __restrict__ nodes,
     const UnifiedNode* __restrict__ source_nodes,
     const int* __restrict__ children,
@@ -466,8 +467,8 @@ __device__ __forceinline__ void grouped_p2p_leaf_routes(
     const double* __restrict__ pos_z, const float* __restrict__ mass,
     const int* __restrict__ sorted_indices, int lane,
     double* sh_pos_x, double* sh_pos_y, double* sh_pos_z,
-    p2p_real_t* sh_mass,
-    p2p_real_t G, p2p_real_t softening_sq, double cutoff_sq)
+    Compute* sh_mass,
+    Compute G, Compute softening_sq, double cutoff_sq)
 {
     using T = GroupedStencilTraits<D>;
     int target = leaf;
@@ -522,7 +523,7 @@ __device__ __forceinline__ void grouped_p2p_leaf_routes(
     }
 }
 
-template<bool OUTER>
+template<bool OUTER, class Compute = p2p_compute_t>
 __device__ __forceinline__ void fmm_p2p_grouped_leaf_body(
     const GroupedInteractionArena arena,
     const PersistentTreeMetadata* __restrict__ metadata,
@@ -532,14 +533,14 @@ __device__ __forceinline__ void fmm_p2p_grouped_leaf_body(
     const double* __restrict__ pos_z, const float* __restrict__ mass,
     double* __restrict__ out_x, double* __restrict__ out_y,
     double* __restrict__ out_z, const int* __restrict__ sorted_indices,
-    p2p_real_t G, p2p_real_t softening, GroupedParticleSources sources)
+    Compute G, Compute softening, GroupedParticleSources sources)
 {
     constexpr int WARPS_PER_BLOCK = 4;
     __shared__ double sh_pos_x[WARPS_PER_BLOCK][32];
     __shared__ double sh_pos_y[WARPS_PER_BLOCK][32];
     __shared__ double sh_pos_z[WARPS_PER_BLOCK][32];
-    __shared__ p2p_real_t sh_mass[WARPS_PER_BLOCK][32];
-    const p2p_real_t softening_sq = softening < 0 ? -softening * softening : softening * softening;
+    __shared__ Compute sh_mass[WARPS_PER_BLOCK][32];
+    const Compute softening_sq = softening < 0 ? -softening * softening : softening * softening;
     const double cutoff = metadata->cutoff_radius;
     const double cutoff_sq = cutoff > 0.0 ? cutoff * cutoff : 0.0;
     const int target_particle_count = metadata->target_particle_count;
@@ -566,7 +567,7 @@ __device__ __forceinline__ void fmm_p2p_grouped_leaf_body(
             bool active = local_i < count;
             int orig_i = -1;
             double xi = 0.0, yi = 0.0, zi = 0.0;
-            p2p_real_t mi = 0;
+            Compute mi = 0;
             if (active) {
                 orig_i = target_order[begin + local_i];
                 active = orig_i < target_particle_count;
@@ -577,9 +578,9 @@ __device__ __forceinline__ void fmm_p2p_grouped_leaf_body(
                 xi = pos_x[orig_i];
                 yi = pos_y[orig_i];
                 zi = pos_z[orig_i];
-                mi = static_cast<p2p_real_t>(mass[orig_i]);
+                mi = static_cast<Compute>(mass[orig_i]);
             }
-            p2p_real_t ax = 0, ay = 0, az = 0;
+            Compute ax = 0, ay = 0, az = 0;
             if (metadata->active_tree == 2) {
                 grouped_p2p_leaf_routes<2, OUTER>(
                     leaf, actual_nodes, active, target_mask, sources.remote ? -1 : orig_i, xi, yi, zi, mi, ax, ay, az, arena,
@@ -602,7 +603,7 @@ __device__ __forceinline__ void fmm_p2p_grouped_leaf_body(
     }
 }
 
-template<bool OUTER>
+template<bool OUTER, class Compute = p2p_compute_t>
 __global__ void fmm_p2p_grouped_leaf_unified(
     const GroupedInteractionArena arena,
     const PersistentTreeMetadata* __restrict__ metadata,
@@ -612,7 +613,7 @@ __global__ void fmm_p2p_grouped_leaf_unified(
     const double* __restrict__ pos_z, const float* __restrict__ mass,
     double* __restrict__ out_x, double* __restrict__ out_y,
     double* __restrict__ out_z, const int* __restrict__ sorted_indices,
-    p2p_real_t G, p2p_real_t softening)
+    Compute G, Compute softening)
 {
     const GroupedParticleSources sources{nodes,children,pos_x,pos_y,pos_z,mass,sorted_indices,false};
     fmm_p2p_grouped_leaf_body<OUTER>(
@@ -629,11 +630,19 @@ void launch_p2p_grouped_leaves(
     double G, double softening, cudaStream_t stream)
 {
     constexpr int grid = 2048;
+    if (softening < 0) {
+    fmm_p2p_grouped_leaf_unified<OUTER, double><<<grid, 128, 0, stream>>>(
+        arena, metadata, dd.unified_nodes, dd.children_compact, node_capacity,
+        pos_x, pos_y, pos_z, mass, out_x, out_y, out_z,
+        dd.sorted_to_original, static_cast<double>(G),
+        static_cast<double>(softening));
+    } else {
     fmm_p2p_grouped_leaf_unified<OUTER><<<grid, 128, 0, stream>>>(
         arena, metadata, dd.unified_nodes, dd.children_compact, node_capacity,
         pos_x, pos_y, pos_z, mass, out_x, out_y, out_z,
         dd.sorted_to_original, static_cast<p2p_compute_t>(G),
         static_cast<p2p_compute_t>(softening));
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

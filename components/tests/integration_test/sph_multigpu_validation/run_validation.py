@@ -36,6 +36,11 @@ def ordered(data):
     return data
 
 
+def total_force(data):
+    # SPH checkpoints retain fast force and slow acceleration separately.
+    return data.force + data.mass[:, None] * data.gravity_acceleration
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--work-dir', type=Path, required=True)
@@ -204,12 +209,12 @@ def main():
         # One very short step, direct reference; evaluate total force because
         # ordinary SPH output deliberately omits FORCE.
         _, reference = run('gravity-direct', 0, source=gravity_input, gravity='direct', steps=1)
-        norm = float(np.linalg.norm(reference.force))
+        norm = float(np.linalg.norm(total_force(reference)))
         rms = norm / np.sqrt(reference.num_particles)
         for ranks in (0, 1, 2, 4):
             _, candidate = run(f'gravity-fmm-gpu{ranks}', ranks, source=gravity_input,
                                gravity='unified_fmm', steps=1)
-            delta = candidate.force-reference.force
+            delta = total_force(candidate)-total_force(reference)
             relative = float(np.linalg.norm(delta)/norm)
             maximum = float(np.max(np.linalg.norm(delta,axis=1))/rms)
             check = {'relative_rms': relative, 'max_error_over_reference_rms': maximum,
@@ -228,13 +233,13 @@ def main():
         far_data.positions *= 12.
         write_particle_binary(far_input, far_data, physics='sph', record_kind='input')
         _, far_reference = run('far-field-direct', 0, source=far_input, gravity='direct', steps=1)
-        far_norm = float(np.linalg.norm(far_reference.force))
+        far_norm = float(np.linalg.norm(total_force(far_reference)))
         far_rms = far_norm / np.sqrt(far_reference.num_particles)
         for ranks in (0, 1, 2, 4):
             _, far_candidate = run(f'far-field-fmm-gpu{ranks}', ranks, source=far_input,
                                    gravity='unified_fmm', steps=1)
-            residual = float(np.linalg.norm(far_candidate.force-far_reference.force)/far_norm)
-            maximum = float(np.max(np.linalg.norm(far_candidate.force-far_reference.force,axis=1))/far_rms)
+            residual = float(np.linalg.norm(total_force(far_candidate)-total_force(far_reference))/far_norm)
+            maximum = float(np.max(np.linalg.norm(total_force(far_candidate)-total_force(far_reference),axis=1))/far_rms)
             report['checks'][f'far-field-fmm-gpu{ranks}'] = {
                 'relative_rms':residual,'max_error_over_reference_rms':maximum,
                 'relative_rms_limit':.01,'max_error_limit':.05,
@@ -250,11 +255,11 @@ def main():
         close_data.positions[1] = np.array([1e-9, 0., 0.])
         write_particle_binary(close_input, close_data, physics='sph', record_kind='input')
         _, close_reference = run('near-pair-direct', 0, source=close_input, gravity='direct', steps=1)
-        close_norm = float(np.linalg.norm(close_reference.force))
+        close_norm = float(np.linalg.norm(close_total_force(reference)))
         for ranks in (0, 4):
             _, close_candidate = run(f'near-pair-fmm-gpu{ranks}', ranks, source=close_input,
                                      gravity='unified_fmm', steps=1)
-            residual = float(np.linalg.norm(close_candidate.force-close_reference.force)/close_norm)
+            residual = float(np.linalg.norm(close_total_force(candidate)-close_total_force(reference))/close_norm)
             report['checks'][f'near-pair-fmm-gpu{ranks}'] = {'relative_rms':residual,
                                                             'limit':.01,'pass':residual<=.01}
             save()

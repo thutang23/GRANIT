@@ -8,11 +8,6 @@ set(OPTIX_INCLUDE_DIR "" CACHE PATH "Directory containing local OptiX SDK header
 function(granit_target_optix target)
     get_filename_component(_granit_root "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/.." ABSOLUTE)
     target_sources(${target} PRIVATE "${_granit_root}/src/core/neighbor/rt/rt_backend.cu")
-    if(BUILD_CPU_MOCK)
-        set_source_files_properties("${_granit_root}/src/core/neighbor/rt/rt_backend.cu"
-            PROPERTIES LANGUAGE CXX)
-        return()
-    endif()
     if(NOT GRANIT_ENABLE_OPTIX)
         return()
     endif()

@@ -318,7 +318,7 @@ struct WallConfig {
     // Sphere wall specific
     float sphere_radius;
     float sphere_mass;
-    float sphere_cohesive_strength;
+
     char sphere_trajectory_path[MAX_PATH_LENGTH];
 
     __host__ __device__ WallConfig()
@@ -338,7 +338,6 @@ struct WallConfig {
         funnel_length = 0.0f;
         sphere_radius = 0.0f;
         sphere_mass = 0.0f;
-        sphere_cohesive_strength = 0.0f;
         sphere_trajectory_path[0] = '\0';
     }
 };
@@ -362,16 +361,12 @@ struct AccelFieldConfig {
     InterpolationMethod time_interp;
     InterpolationMethod space_interp;
 
-    bool verify_time;
-    bool verify_space;
-
     __host__ __device__ AccelFieldConfig()
         : id(-1), enabled(false), load_method(LoadMethod::SEQUENTIAL),
           time_interval(0.01f), batch_size(100),
           time_varying(true), space_varying(true),
           time_interp(InterpolationMethod::LINEAR),
-          space_interp(InterpolationMethod::LINEAR),
-          verify_time(true), verify_space(true) {
+          space_interp(InterpolationMethod::LINEAR) {
         name[0] = '\0';
         data_path[0] = '\0';
     }
@@ -473,7 +468,7 @@ struct AdaptiveDepthConfig {
     AdaptiveDepthMultiGPUConfig multigpu; // distributed host-controller policy
 
     __host__ __device__ AdaptiveDepthConfig()
-        : enabled(false), initial_depth_auto(false), tree_depth_was_omitted(false),
+        : enabled(true), initial_depth_auto(true), tree_depth_was_omitted(true),
           min_depth(6), max_depth(12),
           trial_interval_evaluations(32), trial_warmup_evaluations(1),
           trial_samples(4), min_improvement_fraction(0.02f),
@@ -494,39 +489,25 @@ struct UnifiedFMMConfig {
     int tree_depth;                     // fixed/explicit initial depth; 0 when initial depth is auto
     AdaptiveDepthConfig adaptive_depth; // optional timing-only neighboring-depth controller
 
-    // Memory allocation factors
+    // Memory allocation
     float particle_overallocate_factor; // particle buffer headroom (default: 1.2)
-    float node_overallocate_factor;     // node buffer headroom incl. virtual leaves (default: 9.6 = 8.0*1.2)
-    int p2p_queue_initial_factor;       // initial P2P pair capacity = np * factor (default: 16)
-    float p2p_queue_resize_factor;      // capacity growth on overflow (default: 2.0)
-    int min_nodes_estimate;             // absolute floor for node count estimate (default: 65536)
 
-    // M2L performance (reserved for future runtime control; currently compile-time M2L_NUM_WARPS)
-    int m2l_warps_per_block;            // warps per block in M2L warp-sync kernel (default: 4)
+    int min_nodes_estimate;             // absolute floor for node count estimate (default: 65536)
 
     // Global
     bool enable_global_projection;       // enforce Newton's 3rd law via global projection (default: true)
     bool verbose;                        // control BFFMM print output (default: false)
-    // === Phase 2: Direct kernel thresholds ===
+    // Direct kernel thresholds
     int   direct_threshold_leaf;          // P2P direct evaluation leaf threshold (default: 16)
     int   direct_threshold_internal;      // P2P direct evaluation internal threshold (default: 64)
-
-    // === Phase 2: P2P tiling ===
-    int   p2p_tile_t;                     // tile size for target loop (default: 32)
-    int   p2p_tile_s;                     // tile size for source loop (default: 64)
 
     __host__ __device__ UnifiedFMMConfig()
         : theta_far(0.8f), softening_factor(0.01f), gravitational_constant(6.67430e-11),
           tree_dimension(3), tree_depth(0),
-          particle_overallocate_factor(1.2f), node_overallocate_factor(9.6f),
-          p2p_queue_initial_factor(16), p2p_queue_resize_factor(2.0f),
-          min_nodes_estimate(65536),
-          m2l_warps_per_block(4),
+          particle_overallocate_factor(1.2f), min_nodes_estimate(65536),
           enable_global_projection(true), verbose(false),
-          direct_threshold_leaf(16), direct_threshold_internal(64),
-          p2p_tile_t(32), p2p_tile_s(64) {}
+          direct_threshold_leaf(16), direct_threshold_internal(64) {}
 };
-
 
 // -----------------------------------------------------------------------------
 // External Acceleration Configuration
@@ -583,11 +564,11 @@ struct AccelerationConfig {
 
     // Self-gravity
     bool enable_self_gravity;
-    SelfGravityMethod gravity_method;    // DIRECT (default) or BFFMM
-    int gravity_update_rate;       // RESPA inner steps per gravity macro-step (1 = disabled)
+    SelfGravityMethod gravity_method;    // BFFMM (default) or DIRECT
+    int gravity_update_rate;       // RESPA inner steps per gravity macro-step (default 2; 1 = disabled)
     double gravity_macro_dt;       // requested max macro-step seconds; 0 = use gravity_update_rate
-    int tree_rebuild_interval;// Max gravity evals between full rebuilds (1 = every time)
-    float displacement_threshold; // Fraction of leaf BBox that triggers rebuild
+
+    float displacement_threshold; // Sphere-wall gravity softening fraction (legacy name)
     DirectGravityConfig direct_gravity;
 
     // Static central monopole plus an optional analytic circular point
@@ -609,13 +590,13 @@ struct AccelerationConfig {
     float max_accel_magnitude;      // Maximum acceleration magnitude (m/s²)
 
     __host__ __device__ AccelerationConfig()
-        : enable_inertial(true), inertial_constant_omega(false),
+        : enable_inertial(false), inertial_constant_omega(false),
           inertial_load_method(LoadMethod::ONCE),
           inertial_time_interval(60.0f), inertial_interp(InterpolationMethod::LINEAR),
-          enable_tidal(true), tidal_load_method(LoadMethod::ONCE),
+          enable_tidal(false), tidal_load_method(LoadMethod::ONCE),
           tidal_time_interval(60.0f), tidal_interp(InterpolationMethod::LINEAR),
           perturber_mass(5.972e24),  // Earth mass
-          enable_self_gravity(false), gravity_method(SelfGravityMethod::DIRECT), gravity_update_rate(1), gravity_macro_dt(0.0), tree_rebuild_interval(50),
+          enable_self_gravity(false), gravity_method(SelfGravityMethod::BFFMM), gravity_update_rate(2), gravity_macro_dt(0.0),
           displacement_threshold(0.3f), num_accel_fields(0),
           enable_accel_limit(false), max_accel_magnitude(1.0e6f) {
         inertial_data_path[0] = '\0';
@@ -706,8 +687,7 @@ struct SPHConfig {
     double symmetry_normal[3] = {1.0, 0.0, 0.0};
     double symmetry_offset = 0.0; // n.x + offset = 0; real particles on positive side
 
-    // --- Input Format ---
-    char input_format[32];        // "sph_csv", "sph_bin", or "dem_bin"
+    // Resolved input path (set internally from io.input.particle_file).
     char input_path[MAX_PATH_LENGTH]; // Path to SPH particle input
 
     __host__ __device__ SPHConfig()
@@ -732,7 +712,6 @@ struct SPHConfig {
           hsml_min(1.0e-6f), hsml_max(1.0f),
           relaxation_disable_strength(false), relaxation_disable_damage(false)
     {
-        input_format[0] = '\0';
         input_path[0] = '\0';
     }
 };
@@ -757,19 +736,17 @@ struct NeighborConfig {
     NeighborBackend backend;     // Execution backend; RT supports single-GPU nonperiodic DEM/SPH LBVH
     float cell_size_factor;      // L_cell > max(2*R_max)*(1+ε)
     int32_t update_frequency;    // Steps between rebuild
-    bool use_hash_table;         // Use cuCollections hashmap
     bool verlet_buffer_enabled;  // Use Verlet list (skin depth)
-    float verlet_skin;           // Skin depth in meters (0.0 = auto from skin_factor)
-    float verlet_skin_factor;    // Fraction of min_radius for auto skin (e.g. 0.1 = 10%)
+    float verlet_skin;           // Skin depth in meters
+
     // LBVH topology caching
     float lbvh_skin_factor;        // threshold = max_radius * skin_factor / 2; default 0.3
     float lbvh_rebuild_threshold;  // absolute override in meters; 0.0 = use skin_factor
 
     __host__ __device__ NeighborConfig()
-        : method(NeighborMethod::CELL_LINKED_LIST), backend(NeighborBackend::AUTO),
-          cell_size_factor(1.1f), update_frequency(1), use_hash_table(false),
-          verlet_buffer_enabled(true), verlet_skin(0.01f), verlet_skin_factor(0.0f),
-          lbvh_skin_factor(0.3f), lbvh_rebuild_threshold(0.0f) {}
+        : method(NeighborMethod::LBVH), backend(NeighborBackend::AUTO),
+          cell_size_factor(1.1f), update_frequency(1),
+          verlet_buffer_enabled(true), verlet_skin(0.01f), lbvh_skin_factor(0.3f), lbvh_rebuild_threshold(0.0f) {}
 };
 
 // -----------------------------------------------------------------------------
@@ -781,7 +758,7 @@ struct DampingConfig {
     float coefficient;
 
     __host__ __device__ DampingConfig()
-        : enabled(true), type(DampingType::LOCAL), coefficient(0.7f) {}
+        : enabled(false), type(DampingType::LOCAL), coefficient(0.7f) {}
 };
 
 // -----------------------------------------------------------------------------
@@ -803,9 +780,8 @@ struct IOConfig {
     // Contact dump for validation
     bool dump_contacts;
 
-    // Optional output fields
-    bool output_damage;           // Include damage in binary output (for SPH)
-    bool output_flag;             // Include flag field (clump_id) in binary output
+    // Optional output sidecars
+
     bool output_gravity_force;    // Write per-particle gravity force sidecar (for LET single-vs-multi A/B)
     bool output_initial_state;    // Write output_step_0000000000.bin after force bootstrap
     int32_t scalar_interval;      // closed-step scalar receipt cadence; 0 disables
@@ -818,7 +794,6 @@ struct IOConfig {
     __host__ __device__ IOConfig()
         : validate_input_types(true), checkpoint_enabled(true), checkpoint_force_fresh(false),
           checkpoint_interval(1000), checkpoint_rebootstrap_forces(false), dump_contacts(false),
-          output_damage(false), output_flag(false),
           output_gravity_force(false), output_initial_state(false),
           scalar_interval(0), output_schedule_count(0), timing_warmup_steps(0), timing_measure_steps(0) {
         input_particle_path[0] = '\0';
@@ -836,12 +811,9 @@ struct IOConfig {
 struct GPUConfig {
     int32_t device_id;
     int32_t block_size;
-    bool use_double_buffer;      // Async prefetching
-    bool use_texture_memory;     // Texture cache for interpolation
 
     __host__ __device__ GPUConfig()
-        : device_id(0), block_size(256),
-          use_double_buffer(true), use_texture_memory(true) {}
+        : device_id(0), block_size(256) {}
 };
 
 // -----------------------------------------------------------------------------
@@ -852,7 +824,7 @@ struct MultiGPUConfig {
     int32_t max_gpus;                // Maximum number of GPUs to use
     int32_t partition_depth = 0;    // 0 resolves once to initial computation depth
     bool morton_ownership = true;   // Shared whole-leaf ownership for DEM and FMM
-    int32_t rebalance_frequency;     // Hard-cap fallback (steps); primary gate is timing
+
     float halo_width_factor;         // Multiplier for 2*R_max for halo region
     float buffer_capacity_factor;    // Capacity = local_particles * factor (>= 2.0)
 
@@ -879,8 +851,7 @@ struct MultiGPUConfig {
     int32_t rebalance_min_interval;  // min steps between rebalances (anti-thrash)
 
     __host__ __device__ MultiGPUConfig()
-        : enabled(false), max_gpus(8), rebalance_frequency(1000),
-          halo_width_factor(1.5f), buffer_capacity_factor(2.0f),
+        : enabled(false), max_gpus(8), halo_width_factor(1.5f), buffer_capacity_factor(2.0f),
           let_use_one_shot_push(true),
           shared_bucket_min_saved_bytes(65536), max_shared_buckets(8),
           rcb_cost_model(RCBCostModel::Adaptive),
@@ -955,16 +926,8 @@ struct RotatingFrameConfig {
     Vec3d omega;                     // rad/s, angular velocity vector
     float rotation_period_h;         // hours, alternative to omega (auto-converted)
 
-    // Settlement phase (stepped-Ω quasi-static spin-up)
-    bool settlement_enabled;
-    int32_t settlement_steps;        // number of Ω plateaus (fixed count)
-    float settlement_omega_start;    // fraction of target Ω (e.g., 0.1)
-    float settlement_step_duration;  // seconds per plateau
-
     __host__ __device__ RotatingFrameConfig()
-        : enabled(false), omega{0.0, 0.0, 0.0}, rotation_period_h(4.3f),
-          settlement_enabled(false), settlement_steps(10),
-          settlement_omega_start(0.1f), settlement_step_duration(5000.0f) {}
+        : enabled(false), omega{0.0, 0.0, 0.0}, rotation_period_h(4.3f) {}
 };
 
 // =============================================================================

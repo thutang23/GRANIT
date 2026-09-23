@@ -22,6 +22,7 @@ constexpr int32_t MAX_MULTI_GPUS = 8;
 struct DomainParamsGPU {
     int32_t num_gpus;
     int32_t morton_enabled;
+    bool restore_morton_partition;
     MortonGrid morton_grid;
     const uint64_t* morton_cuts;
     const MortonCoverCell* morton_cells;

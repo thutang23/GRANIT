@@ -555,7 +555,7 @@ void DomainManager::distribute_particles(
                           total_particles * sizeof(double), cudaMemcpyDeviceToHost));
 
     // Step 2: If auto_bounds, compute domain bounds from particles
-    if (config.domain.auto_bounds) {
+    if (config.domain.auto_bounds && !params.restore_morton_partition) {
         double gmin_x = 1e30, gmin_y = 1e30, gmin_z = 1e30;
         double gmax_x = -1e30, gmax_y = -1e30, gmax_z = -1e30;
         for (int32_t i = 0; i < total_particles; ++i) {
@@ -581,7 +581,7 @@ void DomainManager::distribute_particles(
                   << params.domain_min_z << ", " << params.domain_max_z << "]" << std::endl;
     }
 
-    if (params.morton_enabled) {
+    if (params.morton_enabled && !params.restore_morton_partition) {
         MortonGrid grid{0, 0, 0, 1, 3, 6, 0};
         grid.dimension = config.shear_box.enabled ? 2 : config.acceleration.unified_fmm.tree_dimension;
         grid.depth = std::max(2, config.acceleration.unified_fmm.tree_depth);
@@ -601,7 +601,7 @@ void DomainManager::distribute_particles(
         for (int i = 0; i < total_particles; ++i)
             weights.push_back({grid.leaf_begin(grid.key(h_pos_x[i], h_pos_y[i], h_pos_z[i])), 1.0});
         set_morton_partition(params, grid, weighted_morton_cuts(std::move(weights), grid, num_gpus));
-    } else
+    } else if (!params.morton_enabled)
     // Step 3: Compute initial N-way splits with the same RCB math used at runtime.
     // (Unit-weight here; t=0 scatter below is host-staged, a one-time cost.)
     {
@@ -697,6 +697,7 @@ void DomainManager::distribute_particles(
     std::vector<double> g_pos_x(total_particles), g_pos_y(total_particles), g_pos_z(total_particles);
     std::vector<double> g_vel_x(total_particles), g_vel_y(total_particles), g_vel_z(total_particles);
     std::vector<double> g_force_x(total_particles), g_force_y(total_particles), g_force_z(total_particles);
+    std::vector<double> g_grav_x(total_particles), g_grav_y(total_particles), g_grav_z(total_particles);
     std::vector<double> g_omega_x(total_particles), g_omega_y(total_particles), g_omega_z(total_particles);
     std::vector<double> g_torque_x(total_particles), g_torque_y(total_particles), g_torque_z(total_particles);
     std::vector<double> g_quat_w(total_particles), g_quat_x(total_particles), g_quat_y(total_particles), g_quat_z(total_particles);
@@ -737,6 +738,9 @@ void DomainManager::distribute_particles(
     CUDA_CHECK(cudaMemcpy(g_vel_y.data(), src.vel_y, total_particles * sizeof(double), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(g_vel_z.data(), src.vel_z, total_particles * sizeof(double), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(g_force_x.data(), src.force_x, total_particles * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(g_grav_x.data(), src.gravity_force_x, total_particles * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(g_grav_y.data(), src.gravity_force_y, total_particles * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(g_grav_z.data(), src.gravity_force_z, total_particles * sizeof(double), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(g_force_y.data(), src.force_y, total_particles * sizeof(double), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(g_force_z.data(), src.force_z, total_particles * sizeof(double), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(g_omega_x.data(), src.omega_x, total_particles * sizeof(double), cudaMemcpyDeviceToHost));
@@ -848,6 +852,7 @@ void DomainManager::distribute_particles(
         std::vector<double> t_x(n), t_y(n), t_z(n);
         std::vector<double> q_w(n), q_x(n), q_y(n), q_z(n);
         std::vector<float> r(n), m(n), mi(n), c(n), support_extent(n);
+        std::vector<double> grav_x(n), grav_y(n), grav_z(n);
         std::vector<double> density(n), rho_rate(n);
         std::vector<float> pressure(n), viscosity(n), c_sound(n);
         std::vector<float> drhodt(n), smoothing_length(n);
@@ -877,6 +882,9 @@ void DomainManager::distribute_particles(
             f_x[local_idx] = g_force_x[global_idx];
             f_y[local_idx] = g_force_y[global_idx];
             f_z[local_idx] = g_force_z[global_idx];
+            grav_x[local_idx] = g_grav_x[global_idx];
+            grav_y[local_idx] = g_grav_y[global_idx];
+            grav_z[local_idx] = g_grav_z[global_idx];
             w_x[local_idx] = g_omega_x[global_idx];
             w_y[local_idx] = g_omega_y[global_idx];
             w_z[local_idx] = g_omega_z[global_idx];
@@ -943,6 +951,9 @@ void DomainManager::distribute_particles(
         CUDA_CHECK(cudaMemcpy(dst.vel_y, v_y.data(), n * sizeof(double), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(dst.vel_z, v_z.data(), n * sizeof(double), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(dst.force_x, f_x.data(), n * sizeof(double), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dst.gravity_force_x, grav_x.data(), n * sizeof(double), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dst.gravity_force_y, grav_y.data(), n * sizeof(double), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dst.gravity_force_z, grav_z.data(), n * sizeof(double), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(dst.force_y, f_y.data(), n * sizeof(double), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(dst.force_z, f_z.data(), n * sizeof(double), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(dst.omega_x, w_x.data(), n * sizeof(double), cudaMemcpyHostToDevice));

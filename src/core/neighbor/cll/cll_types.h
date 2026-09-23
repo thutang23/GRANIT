@@ -56,10 +56,6 @@ struct CLLGPUState {
     bool async_readback_pending;
     int32_t steps_since_rebuild;
 
-    // cuCollections hash table (optional, for sparse grids)
-    bool use_hash_table;
-    void* hash_table;              // Opaque pointer to cuco hash map
-
     // Verlet neighbor cache
     VerletNeighborCache verlet_cache;
 
@@ -83,8 +79,7 @@ struct CLLGPUState {
           d_cell_counts(nullptr), d_cell_offsets(nullptr),
           d_cub_temp_storage(nullptr), cub_temp_storage_bytes(0),
           h_pinned_max_disp_sq(nullptr), disp_copy_done_event(nullptr),
-          cached_max_disp_sq(0.0f), async_readback_pending(false), steps_since_rebuild(0),
-          use_hash_table(false), hash_table(nullptr) {}
+          cached_max_disp_sq(0.0f), async_readback_pending(false), steps_since_rebuild(0) {}
 };
 
 } // namespace cll

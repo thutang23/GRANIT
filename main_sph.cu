@@ -1,3 +1,5 @@
+#include "src/core/constant/adaptive_fmm_depth_lifecycle.h"
+#include "src/core/sph/sph_respa_schedule.h"
 #include "src/core/sph/sph_boundary.h"
 #include "src/core/sph/sph_stage.h"
 #include "src/core/sph/sph_history.h"
@@ -568,6 +570,11 @@ private:
     // Timing
     cudaEvent_t start_event_, stop_event_, copy_done_event_;
     cudaStream_t compute_stream_;
+    AdaptiveFMMDepthLifecycle adaptive_depth_io_{config_, state_, compute_stream_};
+    int sph_inner_remaining_ = 0;
+    SphMacroStep sph_macro_{};
+    uint64_t cfl_evaluations_ = 0;
+    uint64_t gravity_evaluations_ = 0;
 
     // Energy buffer for termination check
     float* d_kinetic_energy_per_particle_;
@@ -582,6 +589,7 @@ private:
     int32_t num_total_particles_;
     int64_t last_scalar_step_;
     int64_t last_checkpoint_step_ = -1;
+    int64_t checkpoint_cadence_step_ = 0;
     int last_sph_stage_ = -2;
 
     // Status
@@ -705,6 +713,7 @@ public:
                         "io.checkpoint.force_fresh conflicts with io.checkpoint.resume_from");
                 state_ = load_checkpoint(config_.io.checkpoint_resume_from, config_);
                 resumed_ = true;
+                checkpoint_cadence_step_ = state_.current_step;
                 num_loaded = state_.particles.num_particles;
                 std::cout << "Loaded " << num_loaded
                           << " SPH particles from explicit checkpoint" << std::endl;
@@ -825,6 +834,11 @@ public:
             state_.current_step = 0;
         }
 
+        if (resumed_)
+            adaptive_depth_io_.restore_adaptive_fmm_depth_checkpoint_sidecar(config_.io.checkpoint_resume_from);
+        else
+            adaptive_depth_io_.reset_adaptive_fmm_depth_csv_for_fresh_start();
+
         if (!resumed_ || config_.io.checkpoint_rebootstrap_forces ||
             sph_stage_transition_at(config_, state_.current_time)) {
             bootstrap_sph_forces();
@@ -927,10 +941,40 @@ public:
         cudadem::evaluate_sph_porosity_rates(state_, config_, compute_stream_);
         update_sph_mirrors(state_, config_, compute_stream_);
         cudadem::compute_sph_forces(state_, config_, compute_stream_);
-        AccelerationManager::compute_all(
+        AccelerationManager::compute_all_without_gravity(
             state_, config_, state_.current_time, compute_stream_);
+        refresh_slow_gravity();
         cudadem::update_sph_history(state_, config_, 0.0f, compute_stream_);
         CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+    }
+
+    void refresh_slow_gravity() {
+        if (!config_.acceleration.enable_self_gravity) return;
+        AccelerationManager::compute_outer_gravity(state_, config_, state_.current_time, compute_stream_);
+        ++gravity_evaluations_;
+    }
+
+    void slow_half_kick(double span) {
+        if (!config_.acceleration.enable_self_gravity) return;
+        const int n = state_.particles.num_particles;
+        if (n > 0) apply_half_gravity_impulse_kernel<<<(n+255)/256,256,0,compute_stream_>>>(
+            state_.particles.vel_x, state_.particles.vel_y, state_.particles.vel_z,
+            state_.particles.gravity_force_x, state_.particles.gravity_force_y,
+            state_.particles.gravity_force_z, 0.5*span, n);
+        restore_sph_fixed(state_, config_, boundary_workspace_, compute_stream_);
+    }
+
+    void record_macro() {
+        if (config_.io.scalar_interval <= 0) return;
+        std::filesystem::create_directories(config_.io.output_directory);
+        const std::string path = std::string(config_.io.output_directory) + "/sph_macros.csv";
+        const bool header = !std::filesystem::exists(path) || std::filesystem::file_size(path) == 0;
+        std::ofstream out(path, std::ios::app);
+        if (header) out << "start_step,start_time,inner_count,inner_dt,end_time,cfl_dt,cfl_evaluations,gravity_evaluations\n";
+        out << std::setprecision(17) << state_.current_step << ',' << state_.current_time << ','
+            << sph_macro_.count << ',' << sph_macro_.dt << ',' << sph_macro_.end_time << ','
+            << last_sph_timestep_.dt << ',' << cfl_evaluations_ << ',' << gravity_evaluations_ << '\n';
+        if (!out) throw std::runtime_error("Cannot write SPH macro receipt");
     }
 
     void record_sph_scalar_receipt(bool force) {
@@ -969,6 +1013,15 @@ public:
             CUDA_CHECK(cudaMemcpy(host_double_fields[field], device_double_fields[field],
                                   static_cast<size_t>(n) * sizeof(double), cudaMemcpyDeviceToHost));
 
+        if (config_.acceleration.enable_self_gravity) {
+            std::vector<double> gravity(n);
+            const double* slow[] = {state_.particles.gravity_force_x, state_.particles.gravity_force_y, state_.particles.gravity_force_z};
+            double* total[] = {fx.data(), fy.data(), fz.data()};
+            for (int axis=0; axis<3; ++axis) {
+                CUDA_CHECK(cudaMemcpy(gravity.data(), slow[axis], n*sizeof(double), cudaMemcpyDeviceToHost));
+                for (int i=0; i<n; ++i) total[axis][i] += static_cast<double>(mass[i])*gravity[i];
+            }
+        }
         const MaterialDatabase materials = load_material_database(
             config_.material_database.path, config_.dem_damping_model);
         long double total_mass = 0.0L, com_x = 0.0L, com_y = 0.0L, com_z = 0.0L;
@@ -1091,7 +1144,7 @@ public:
         std::cout << "Running in PURE SPH mode" << std::endl;
 
         auto wall_start = std::chrono::high_resolution_clock::now();
-        double next_output_time = state_.current_time + config_.time.output_step;
+        double next_output_time = next_sph_output_time(state_.current_time, config_.time.start_time, config_.time.output_step);
         int64_t steps_since_output = 0;
 
         int32_t num_particles = state_.particles.num_particles;
@@ -1101,7 +1154,7 @@ public:
         // -------------------------------------------------------------------------
         // Main time stepping loop
         // -------------------------------------------------------------------------
-        while (!should_terminate()) {
+        while (sph_inner_remaining_ > 0 || !should_terminate()) {
             const int stage_index = sph_stage_index(config_.sph.stages, config_.sph.stage_count, state_.current_time);
             if (stage_index != last_sph_stage_) {
                 if (last_sph_stage_ != -2) bootstrap_sph_forces();
@@ -1121,17 +1174,21 @@ public:
                 // -----------------------------------------------------------------
                 // Step 0: Compute SPH CFL timestep
                 // -----------------------------------------------------------------
-                SPHTimestepResult ts_result;
-                cudadem::compute_sph_timestep(state_, config_, ts_result, compute_stream_);
-                last_sph_timestep_ = ts_result;
-                state_.dt = config_.sph.stage_count > 0
-                    ? sph_stage_step(state_.current_time, ts_result.dt,
-                        sph_current_stage(config_, state_.current_time).end_time)
-                    : ts_result.dt;
-                if (config_.termination == TerminationCondition::TIME)
-                    state_.dt = terminal_limited_step_dt(state_.current_time, state_.dt, config_.time.stop_time);
-                if (!(state_.dt > 0.0) || state_.current_time + state_.dt == state_.current_time)
-                    throw std::runtime_error("SPH timestep cannot advance the current stage");
+                if (sph_inner_remaining_ == 0) {
+                    cudadem::compute_sph_timestep(state_, config_, last_sph_timestep_, compute_stream_);
+                    ++cfl_evaluations_;
+                    double event = next_output_time;
+                    event = std::min(event, config_.time.stop_time);
+                    if (config_.sph.stage_count > 0)
+                        event = std::min(event, sph_current_stage(config_, state_.current_time).end_time);
+                    sph_macro_ = plan_sph_macro(state_.current_time, last_sph_timestep_.dt,
+                        config_.acceleration.gravity_update_rate, event,
+                        config_.acceleration.gravity_macro_dt);
+                    state_.dt = sph_macro_.dt;
+                    sph_inner_remaining_ = sph_macro_.count;
+                    record_macro();
+                    slow_half_kick(sph_macro_.span);
+                }
                 damp_sph_relaxation(state_, config_, 0.5*state_.dt, compute_stream_);
 
                 // -----------------------------------------------------------------
@@ -1303,7 +1360,7 @@ public:
                 // Step 5: External accelerations (gravity, etc.)
                 // -----------------------------------------------------------------
                 nvtxRangePushA("Acceleration");
-                AccelerationManager::compute_all(state_, config_, state_.current_time, compute_stream_);
+                AccelerationManager::compute_all_without_gravity(state_, config_, state_.current_time + state_.dt, compute_stream_);
                 nvtxRangePop();
 
                 // -----------------------------------------------------------------
@@ -1331,17 +1388,23 @@ public:
                 state_.current_time += state_.dt;
                 state_.current_step++;
                 steps_since_output++;
+                --sph_inner_remaining_;
+                if (sph_inner_remaining_ == 0) {
+                    state_.current_time = sph_macro_.end_time;
+                    refresh_slow_gravity();
+                    slow_half_kick(sph_macro_.span);
+                }
 
             // -----------------------------------------------------------------
             // Output and Visualization (common to both modes)
             // -----------------------------------------------------------------
-            if (state_.current_time >= next_output_time) {
+            if (sph_inner_remaining_ == 0 && state_.current_time >= next_output_time) {
                 nvtxRangePushA("Output Data");
                 save_output();
                 record_sph_scalar_receipt(/*force=*/true);
                 nvtxRangePop();
 
-                next_output_time += config_.time.output_step;
+                next_output_time = next_sph_output_time(state_.current_time, config_.time.start_time, config_.time.output_step);
 
                 // Show progress
                 auto now = std::chrono::high_resolution_clock::now();
@@ -1354,11 +1417,11 @@ public:
             // -----------------------------------------------------------------
             // Checkpoint (at configured intervals)
             // -----------------------------------------------------------------
-            if (config_.io.checkpoint_enabled &&
-                state_.current_step % config_.io.checkpoint_interval == 0) {
+            if (sph_inner_remaining_ == 0 && config_.io.checkpoint_enabled &&
+                state_.current_step - checkpoint_cadence_step_ >= config_.io.checkpoint_interval) {
                 save_checkpoint();
             }
-            record_sph_scalar_receipt(/*force=*/false);
+            if (sph_inner_remaining_ == 0) record_sph_scalar_receipt(/*force=*/false);
             #ifdef CUDADEM_ENABLE_PROFILING
             nvtxRangePop(); // SimulationStep
             #endif
@@ -1370,6 +1433,8 @@ public:
         if (config_.io.checkpoint_enabled && last_checkpoint_step_ != state_.current_step)
             save_checkpoint();
         record_sph_scalar_receipt(/*force=*/true);
+
+        adaptive_depth_io_.append_adaptive_fmm_depth_diagnostics();
 
         // Compute final specific KE for output
         double final_specific_ke = (total_mass_ > 0) ? state_.kinetic_energy / total_mass_ : 0.0;
@@ -1483,6 +1548,7 @@ public:
     }
 
     void save_output() {
+        adaptive_depth_io_.append_adaptive_fmm_depth_diagnostics();
         // Generate output file path with step number
         std::ostringstream oss;
         oss << config_.io.output_directory << "/output_step_"
@@ -1499,7 +1565,8 @@ public:
         const int32_t live_particles = state_.particles.num_particles;
         prepare_inactive_sph_tail_for_serialization();
         state_.particles.num_particles = num_total_particles_;
-        const bool wrote_output = write_unified_binary(filepath, state_.particles, state_, config_, false);
+        const bool wrote_output = write_unified_binary(filepath, state_.particles, state_, config_, false,
+            nullptr, 0, 0);
         state_.particles.num_particles = live_particles;
         if (!wrote_output) {
             std::cerr << "WARNING: Failed to write unified binary output: " << filepath << std::endl;
@@ -1509,13 +1576,18 @@ public:
     }
 
     void save_checkpoint() {
-        // Call the full implementation from load_or_resume.h
+        if (sph_inner_remaining_ != 0) throw std::logic_error("SPH checkpoint requires a closed macro");
+        adaptive_depth_io_.append_adaptive_fmm_depth_diagnostics();
+        const std::string path = generate_checkpoint_path(config_, state_.current_step);
+        std::filesystem::remove(adaptive_fmm_depth_checkpoint_sidecar_path(path));
         const int32_t live_particles = state_.particles.num_particles;
         prepare_inactive_sph_tail_for_serialization();
         state_.particles.num_particles = num_total_particles_;
         cudadem::save_checkpoint(state_, config_);
         state_.particles.num_particles = live_particles;
+        adaptive_depth_io_.save_adaptive_fmm_depth_checkpoint_sidecar(path);
         last_checkpoint_step_ = state_.current_step;
+        checkpoint_cadence_step_ = state_.current_step;
     }
 
     // =========================================================================

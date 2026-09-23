@@ -32,8 +32,8 @@ Dependencies are installed separately or fetched into the build directory;
 their source and binary distributions retain their own licenses.
 
 - [yaml-cpp](https://github.com/jbeder/yaml-cpp): MIT.
-- [cuCollections](https://github.com/NVIDIA/cuCollections): Apache-2.0;
-  used only by the applicable CUDA-toolkit build path.
+- Historical export dependency [cuCollections](https://github.com/NVIDIA/cuCollections): Apache-2.0;
+  its unused CLL hash-map path and build dependency have been removed.
 - [NVIDIA OptiX headers](https://github.com/NVIDIA/optix-dev): NVIDIA's
   accompanying license; this backend is optional and disabled by default.
 - CUDA Toolkit components and the NVIDIA driver are distributed under their

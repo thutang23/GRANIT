@@ -549,6 +549,9 @@ PersistentTreeMetadata snapshot_persistent_tree_metadata(
 // Place this marker on the FMM consumer stream after the last depth-dependent
 // force kernel.  It closes the globaltimer interval and advances the device
 // timing controller without a host synchronization.
+// SPH compact regularization imposes a physical depth ceiling in addition to memory.
+void limit_persistent_sph_depth(PersistentTreeRuntime& runtime, int ceiling, cudaStream_t stream);
+
 void record_persistent_depth_evaluation(PersistentTreeRuntime& runtime,
                                         cudaStream_t consumer_stream);
 

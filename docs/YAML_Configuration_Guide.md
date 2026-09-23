@@ -13,6 +13,21 @@ Copy the relevant simulation template and point it at a version 3 particle
 binary. Material and interface physics belong only in the external material
 database; see [Material database](material_database.md).
 
+The [defaults audit](Configuration_Defaults.md) records all configuration
+constructor defaults, runtime normalization, and removed controls. A DEM
+configuration can enable gravity with only:
+
+```yaml
+accelerations:
+  self_gravity: {enabled: true}
+```
+
+This selects unified FMM, θ=0.8, projection, adaptive depth (3D by default),
+and RESPA=2. Global damping is off. An explicit local-damping run must select
+`gravity_update_rate: 1`; a positive `gravity_macro_dt` replaces the omitted
+rate with 1. SPH also defaults to RESPA=2 and automatic depth; its compact
+P2P calculation selects FP64 inside the default binary. See [SPH RESPA](SPH_RESPA.md). Finite shear gravity does not use global projection.
+
 ## Required mode and inputs
 
 ```yaml
@@ -178,7 +193,7 @@ accelerations:
     method: unified_fmm
     gravity_update_rate: 2
     unified_fmm:
-      tree_dimension: 3       # required: 2 (X-Y quadtree) or 3 (octree)
+      tree_dimension: 3       # default; 2 selects the X-Y quadtree
       tree_depth: auto
       adaptive_depth:
         # enabled defaults to true when this block is present
@@ -222,17 +237,19 @@ depth before launching the adaptive pipeline.
 On the single-GPU runner, accepted transitions are appended to
 `adaptive_fmm_depth.csv` in the output directory. Adaptive checkpoints add an
 atomic `.adaptive_fmm_depth` sidecar
-containing version 2's tree dimension, one controller state, producer sequence,
+containing (single GPU, version 2) tree dimension, one controller state, producer sequence,
 and persisted CSV watermark. The sidecar is required when resuming an adaptive
 run; version-1 adaptive sidecars are rejected rather than converted. The CSV is
 rewound to the checkpoint watermark before new rows are appended. A diagnostic
 sequence gap is fatal: telemetry is lossless and never reports normal dropped
-records.
+records. Multi-GPU SPH uses backend version 3, preserving the common controller,
+ownership root/cuts, gravity epoch and load-balance calibration; rank count must
+match on resume.
 
-`unified_fmm.tree_dimension` is required and must be `2` or `3`. The legacy
-`force_tree_type: 2|3` spelling is accepted with a warning for one release;
-`0`, conflicting values, and omitted dimensions are errors. If `tree_depth` is
-omitted it enables adaptive depth and starts automatically on a fresh launch.
+`unified_fmm.tree_dimension` defaults to `3` and accepts `2` or `3`. The legacy
+`force_tree_type: 2|3` spelling is accepted with a warning;
+`0` and conflicting values are errors. In DEM and SPH, an omitted `tree_depth` enables
+adaptive depth and starts automatically on a fresh launch.
 Automatic checkpoint resume requires explicit `tree_depth: auto` or an integer.
 An explicit integer
 without an `adaptive_depth` block selects fixed depth; with an enabled block it
@@ -308,7 +325,7 @@ domain:
   box_max: [ 1.0,  1.0,  1.0]
 
 neighbor:
-  method: cll                  # cll, lbvh, or direct
+  method: lbvh                 # default; cll and direct are explicit alternatives
   backend: auto                # auto, cuda, or rt; RT requires method: lbvh
 
 gpu:
@@ -326,7 +343,7 @@ material database path is explicitly resolved relative to the simulation YAML.
 `neighbor.backend: auto` selects RT for supported single-GPU, non-periodic DEM
 and SPH LBVH runs when available and otherwise uses CUDA. `cuda` forces the CUDA
 backend; `rt` requires RT and rejects unsupported configurations. The method
-default remains `cll`. RT requires `multigpu.enabled: false`, no enabled
+default is `lbvh`. RT requires `multigpu.enabled: false`, no enabled
 periodic wall, and `shear_box.enabled: false`.
 
 The optimized single-GPU SPH LBVH path builds directed adjacency once and

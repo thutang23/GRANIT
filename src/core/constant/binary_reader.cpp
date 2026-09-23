@@ -25,6 +25,7 @@ bool field_layout(FieldID id, DType* dtype, uint8_t* count) {
         case FieldID::CLUMP_OFFSET: *dtype=DType::F32; *count=3; return true;
         case FieldID::WINDING_X: case FieldID::WINDING_Y: case FieldID::WINDING_Z:
             *dtype=DType::I64; *count=1; return true;
+        case FieldID::GRAVITY_ACCELERATION:
         case FieldID::OMEGA: *dtype=DType::F64; *count=3; return true;
         case FieldID::QUATERNION: *dtype=DType::F64; *count=4; return true;
         case FieldID::DENSITY: case FieldID::DRHODT:
@@ -168,7 +169,8 @@ bool read_unified_binary(
             desc.dtype == static_cast<uint8_t>(DType::F32);
         if (desc.reserved != 0 || !field_ids.insert(desc.field_id).second ||
             !field_layout(field_id, &expected_dtype, &expected_count) ||
-            (desc.dtype != static_cast<uint8_t>(expected_dtype) && !legacy_f32_density) ||
+            (desc.dtype != static_cast<uint8_t>(expected_dtype) && !legacy_f32_density && !(field_id == FieldID::FORCE &&
+                desc.dtype == static_cast<uint8_t>(DType::F64))) ||
             desc.count != expected_count) {
             std::cerr << "ERROR: Invalid, duplicate, or unsupported field descriptor" << std::endl;
             return false;
@@ -187,6 +189,12 @@ bool read_unified_binary(
         std::cerr << "ERROR: Overlapping Tier 2 descriptors" << std::endl; return false;
     }
     const bool is_sph = expected_physics == BinaryPhysics::SPH;
+    if (is_sph && config.acceleration.enable_self_gravity &&
+        header.record_kind == static_cast<uint8_t>(BinaryRecordKind::CHECKPOINT) &&
+        !has_field(descriptors, FieldID::GRAVITY_ACCELERATION)) {
+        std::cerr << "ERROR: SPH gravity checkpoint requires the cached slow acceleration field" << std::endl;
+        return false;
+    }
     const MaterialDatabase configured_materials = load_material_database(
         config.material_database.path, config.dem_damping_model);
     if (!has_field(descriptors, FieldID::MATERIAL_ID) ||
@@ -446,16 +454,25 @@ bool read_unified_binary(
                 cudaMemcpy(particles.moment_of_inertia, buf.data(), N * sizeof(float), cudaMemcpyHostToDevice);
                 break;
             }
+            case FieldID::GRAVITY_ACCELERATION:
             case FieldID::FORCE: {
-                std::vector<float> buf(N);
-                double* dst_ptrs[3] = { particles.force_x, particles.force_y, particles.force_z };
+                const bool gravity = static_cast<FieldID>(desc.field_id) == FieldID::GRAVITY_ACCELERATION;
+                double* dst[3] = {gravity ? particles.gravity_force_x : particles.force_x,
+                                  gravity ? particles.gravity_force_y : particles.force_y,
+                                  gravity ? particles.gravity_force_z : particles.force_z};
                 for (int c = 0; c < cnt; ++c) {
-                    file.read(reinterpret_cast<char*>(buf.data()), N * sizeof(float));
-                    for (float value : buf) if (!std::isfinite(value)) { std::cerr << "ERROR: force must be finite" << std::endl; return false; }
-                    // Convert f32→f64 for GPU storage
-                    std::vector<double> buf_d(N);
-                    for (int32_t i = 0; i < N; ++i) buf_d[i] = static_cast<double>(buf[i]);
-                    cudaMemcpy(dst_ptrs[c], buf_d.data(), N * sizeof(double), cudaMemcpyHostToDevice);
+                    std::vector<double> values(N);
+                    if (desc.dtype == static_cast<uint8_t>(DType::F64))
+                        file.read(reinterpret_cast<char*>(values.data()), N * sizeof(double));
+                    else {
+                        std::vector<float> legacy(N);
+                        file.read(reinterpret_cast<char*>(legacy.data()), N * sizeof(float));
+                        std::copy(legacy.begin(), legacy.end(), values.begin());
+                    }
+                    for (double value : values) if (!std::isfinite(value)) {
+                        std::cerr << "ERROR: force/acceleration must be finite" << std::endl; return false;
+                    }
+                    CUDA_CHECK(cudaMemcpy(dst[c], values.data(), N * sizeof(double), cudaMemcpyHostToDevice));
                 }
                 break;
             }

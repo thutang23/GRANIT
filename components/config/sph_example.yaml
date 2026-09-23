@@ -39,14 +39,6 @@ io:
 
 gpu: {device_id: 0, block_size: 256}
 
-# These reference examples use no gravity or prescribed frame/ephemeris forces.
-# Inactive FMM settings are explicit because configuration validation reads them.
-accelerations:
-  inertial: {enabled: false}
-  tidal: {enabled: false}
-  self_gravity:
-    enabled: false
-    method: direct
-    unified_fmm:
-      tree_dimension: 3
-      tree_depth: 10
+# Self-gravity and prescribed frame/ephemeris accelerations default to disabled.
+# SPH defaults to RESPA=2 and adaptive FMM depth. Compact-softening P2P
+# automatically uses FP64 in the default build; other P2P remains FP32.

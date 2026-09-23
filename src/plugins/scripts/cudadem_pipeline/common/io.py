@@ -63,6 +63,7 @@ FIELD_REGISTRY: Dict[int, Tuple[str, int, int]] = {
     0x0012: ("mass", 0, 1),
     0x0013: ("moment_of_inertia", 0, 1),
     0x0014: ("force", 0, 3),
+    0x001E: ("gravity_acceleration", 1, 3),
     0x0015: ("torque", 0, 3),
     0x0016: ("quaternion", 1, 4),
     0x0017: ("num_contacts", 2, 1),
@@ -122,6 +123,7 @@ class ParticleData:
     omega: Optional[np.ndarray] = None
     mass: Optional[np.ndarray] = None
     moment_of_inertia: Optional[np.ndarray] = None
+    gravity_acceleration: Optional[np.ndarray] = None
     force: Optional[np.ndarray] = None
     torque: Optional[np.ndarray] = None
     density: Optional[np.ndarray] = None
@@ -293,7 +295,7 @@ def read_particle_binary(filepath: str | Path) -> ParticleData:
         if reserved != 0 or field_id in seen or field_id not in FIELD_REGISTRY:
             _fail("duplicate, unknown, or reserved descriptor")
         expected_name, expected_dtype, expected_count = FIELD_REGISTRY[field_id]
-        flexible_runtime_dtype = field_id in SPH_RUNTIME_F64_FIELDS and dtype_value in (0, 1)
+        flexible_runtime_dtype = (field_id in SPH_RUNTIME_F64_FIELDS or field_id == 0x0014) and dtype_value in (0, 1)
         if (dtype_value != expected_dtype and not flexible_runtime_dtype) or count != expected_count:
             _fail(f"wrong dtype/count for {expected_name}")
         itemsize = DTYPE_MAP[dtype_value].itemsize
@@ -487,7 +489,7 @@ def write_particle_binary(filepath: str | Path, data: ParticleData, physics: str
                     [0x0004, 0x0005, 0x0020])
     else:
         optional = ([0x0010, 0x0012, 0x0013, 0x0014, 0x0015, 0x0016, 0x0017] if physics == "dem" else
-                    [0x0004, 0x0002, 0x0003, 0x0005, 0x0014, 0x0020, 0x0021,
+                    [0x0004, 0x0002, 0x0003, 0x0005, 0x0014, 0x001E, 0x0020, 0x0021,
                      FIELD_FLAWS_NTOT, FIELD_FLAWS_STRAIN_MIN,
                      FIELD_FLAWS_STRAIN_MAX, FIELD_FLAWS_M0,
                      0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0040, 0x0041, 0x0042])
@@ -495,6 +497,7 @@ def write_particle_binary(filepath: str | Path, data: ParticleData, physics: str
               "winding_x": data.winding_x, "winding_y": data.winding_y,
               "winding_z": data.winding_z,
               "radii": data.radii, "omega": data.omega, "mass": data.mass,
+              "gravity_acceleration": data.gravity_acceleration,
               "moment_of_inertia": data.moment_of_inertia, "force": data.force, "torque": data.torque,
               "quaternion": data.quaternion, "num_contacts": data.num_contacts, "density": data.density,
               "smoothing_length": data.smoothing_length, "pressure": data.pressure, "c_sound": data.c_sound,
@@ -521,12 +524,12 @@ def write_particle_binary(filepath: str | Path, data: ParticleData, physics: str
     for field_id in field_ids + optional + clump_fields + lifecycle_fields + winding_fields:
         name, input_dtype_value, count = FIELD_REGISTRY[field_id]
         dtype_value = (1 if physics == "sph" and record_kind != "input" and
-                       field_id in SPH_RUNTIME_F64_FIELDS else input_dtype_value)
+                       (field_id in SPH_RUNTIME_F64_FIELDS or (field_id == 0x0014 and record_kind == "checkpoint")) else input_dtype_value)
         attr = _NAME_REMAP.get(name, name)
         value = arrays[attr]
         if field_id in field_ids or value is not None:
             if (physics == "sph" and record_kind != "input" and
-                    field_id in SPH_RUNTIME_F64_FIELDS):
+                    (field_id in SPH_RUNTIME_F64_FIELDS or (field_id == 0x0014 and record_kind == "checkpoint"))):
                 runtime_value = np.asarray(value)
                 expected_shape = (n,) if count == 1 else (n, count)
                 if runtime_value.shape != expected_shape or runtime_value.dtype not in (

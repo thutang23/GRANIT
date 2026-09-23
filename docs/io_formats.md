@@ -82,7 +82,8 @@ data, and truncation.
 | 0x0011 | radius | f32 × 1 |
 | 0x0012 | mass | f32 × 1 |
 | 0x0013 | moment_of_inertia | f32 × 1 |
-| 0x0014 | force | f32 × 3 |
+| 0x0014 | force | f32 × 3; SPH checkpoints use f64 × 3 fast force |
+| 0x001E | gravity_acceleration | f64 × 3; SPH checkpoint slow acceleration |
 | 0x0015 | torque | f32 × 3 |
 | 0x0016 | quaternion | f64 × 4 |
 | 0x0017 | num_contacts | i32 × 1 |
@@ -146,3 +147,5 @@ and migration rules are defined in
 
 The optional SPH history descriptors are documented in [SPH physics stages](SPH_Physics_Stages.md). Input generation and legacy-format conversion tools are maintained separately from this source package.
 
+
+SPH macro checkpoints preserve the two force levels separately; see [SPH RESPA](SPH_RESPA.md) for synchronized sidecars and restart compatibility.

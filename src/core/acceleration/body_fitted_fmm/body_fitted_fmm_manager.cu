@@ -1,3 +1,4 @@
+#include "src/core/sph/sph_physics.h"
 #include "src/core/sph/sph_gravity_correction.h"
 #ifdef GRANIT_FMM_TEST_HOOKS
 #include <thread>
@@ -18,6 +19,7 @@
 #include "cuda_utils.h"
 #include "../shear_gravity_images.cuh"
 #include "shear_fmm_capacity.h"
+#include "g_table_binary.h"
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -651,6 +653,10 @@ static void preload_post_scheduler_kernels()
     PRELOAD_LET(fmm_halo_moment_reduce_kernel);
     PRELOAD_LET(fmm_p2p_remote_leaves_kernel<false>);
     PRELOAD_LET(fmm_p2p_remote_leaves_kernel<true>);
+    preload((const void*)body_fitted_fmm::fmm_p2p_remote_leaves_kernel<false,double>, "SPH remote force");
+    preload((const void*)body_fitted_fmm::fmm_p2p_remote_leaves_kernel<true,double>, "SPH remote acceleration");
+    preload((const void*)body_fitted_fmm::fmm_p2p_grouped_leaf_unified<false,double>, "SPH local force");
+    preload((const void*)body_fitted_fmm::fmm_p2p_grouped_leaf_unified<true,double>, "SPH local acceleration");
     PRELOAD_LET(fmm_halo_decode_kernel<2>);
     PRELOAD_LET(fmm_halo_decode_kernel<3>);
     PRELOAD_LET(fmm_halo_nodes_kernel<2>);
@@ -1589,6 +1595,29 @@ static bool persistent_depth_configuration_matches(
                configured_initial_tree_depth(fmm);
 }
 
+static int sph_physical_depth_ceiling(const SimulationState& state, const SimConfig& config,
+                                      int count, cudaStream_t stream) {
+    double extent = 0.0;
+    for (const double* axis : {state.particles.pos_x, state.particles.pos_y, state.particles.pos_z}) {
+        const auto begin = thrust::device_pointer_cast(axis);
+        const auto mm = thrust::minmax_element(thrust::cuda::par.on(stream), begin, begin + count);
+        double low, high;
+        CUDA_CHECK(cudaMemcpyAsync(&low, thrust::raw_pointer_cast(mm.first), sizeof(double), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(&high, thrust::raw_pointer_cast(mm.second), sizeof(double), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        extent = std::max(extent, high-low);
+    }
+    const double root = (extent < 1.e-30 ? 1.0 : extent)*1.02;
+    const double hmax = compute_sph_h_max(state, count, stream);
+    if (!(hmax > 0.0) || hmax > 128.0*config.sph.hsml_min)
+        throw std::runtime_error("SPH FMM requires h_max/hsml_min <= 128");
+    int ceiling = 20;
+    while (ceiling >= 2 && hmax > 32.0*std::ldexp(root, -ceiling)) --ceiling;
+    if (ceiling < config.acceleration.unified_fmm.adaptive_depth.min_depth)
+        throw std::runtime_error("SPH smoothing lengths require a shallower adaptive min_depth");
+    return ceiling;
+}
+
 static AdaptiveStartupProbeResult run_adaptive_startup_probe(
     const SimulationState& state, const UnifiedFMMConfig& fmm,
     int particle_count, int particle_capacity, cudaStream_t stream)
@@ -2064,170 +2093,32 @@ int UnifiedFMMDispatcher::current_gpu() {
     return dev;
 }
 // =============================================================================
-// Load full 48-orientation G-table (precomposed on host)
+// Load the versioned, precomposed table shipped beside the executable.
+// All modes share unrounded FP32 coefficients; TF32 pads and rounds on upload.
 // =============================================================================
-// Composes the full G-table on the host in double precision:
-//   G_full[sc][lane] = sum_k sum_tc A_R[v2][k][sc] * Gsrc[cid][k][tc]
-//                      * B_R[v2][lane][tc]
-// with v2 = OID_GEN_TO_V2[oid_gen], computed via two-matmul form for speed.
-// Existing modes store float at [sc*32+lane] in a 28x32 matrix.  TF32_TC uses
-// a separately compiled 32x32 layout, with rows/columns 28..31 zero-padded and
-// active entries rounded to TF32 precision before upload.
-// One cudaMalloc for the full table; one cudaMemcpy per gap segment
-// with per-segment RAII host staging (~12.3 MiB reference, ~14.1 MiB TF32_TC).
-//
-// d_canonG_gap_info[9] preserved at size 9 for TI encoding compat;
-// segment sizes count * 48 * G_STRIDE floats. Unused slots are zeroed out.
-//
-// d_canonG_gap_info entries (signed_gap+4 = gap_idx):
-//   gap_idx 4 (gap  0) → count 21   (G_GAP0,      off 0)
-//   gap_idx 5 (gap +1) → count 29   (25 historic + 4 planar append-only IDs)
-//   gap_idx 3 (gap -1) → count 25   (G_GAP1_REV, after gaps 0 and +1)
-//   gap_idx 0..2, 6..8 → count 0 (unused, zeroed)
-
 static void load_full_g_table(BodyFittedFMMDeviceData& bfd)
 {
-    constexpr int CANON_G_STRIDE = 28 * 32;
-    constexpr int G_TABLE_ROWS =
-        FMM_M2L_MODE == FMM_M2L_MODE_TF32_TC ? 32 : 28;
-    constexpr int G_STRIDE = G_TABLE_ROWS * 32;
-    constexpr int NUM_ORIENT = 48;
-    constexpr int NC = 28;
-
-    // OID_GEN_TO_V2 — orientation ID mapping between generator conventions
-    // (moved from the kernel; now used only at host init time)
-    constexpr uint8_t OID_GEN_TO_V2[48] = {
-        0,4,2,6,1,5,3,7, 8,12,9,13,10,14,11,15,
-        16,18,20,22,17,19,21,23, 32,34,33,35,36,38,37,39,
-        24,25,28,29,26,27,30,31, 40,41,42,43,44,45,46,47,
-    };
-
-    // Gaps supported in Phase 1
-    const int STORAGE_ORDER[3] = {0, 1, -1};
-    const int COUNTS[3] = {
-        G_GAP0_COUNT,        // gap 0
-        G_GAP1_FWD_COUNT + G_GAP1_PLANAR_COUNT,  // gap +1: IDs 0..28
-        G_GAP1_REV_COUNT,    // gap -1
-    };
-    const float* GSRC_PTRS[3] = {
-        &G_GAP0[0][0][0], &G_GAP1_FWD[0][0][0], &G_GAP1_REV[0][0][0],
-    };
-
-    // 1. Compute total table size (floats)
-    size_t total_floats = 0;
-    for (int i = 0; i < 3; ++i)
-        total_floats += (size_t)COUNTS[i] * NUM_ORIENT * G_STRIDE;
-    bfd.d_G_full_bytes = total_floats * sizeof(float);
-
-    std::cout << "Loading full 48-orientation G-table (precomposed on host)"
-              << std::endl;
-    std::cout << "  Full G-table: " << total_floats << " floats = "
-              << bfd.d_G_full_bytes / (1024ul * 1024ul) << " MiB ("
-              << (size_t)COUNTS[0] + (size_t)COUNTS[1] + (size_t)COUNTS[2]
-              << " canons × " << NUM_ORIENT << " orients)" << std::endl;
-
-    // 2. Allocate device buffer
+    static_assert(G_GAP0_COUNT == granit_g_table::counts[0] &&
+                  G_GAP1_FWD_COUNT + G_GAP1_PLANAR_COUNT == granit_g_table::counts[1] &&
+                  G_GAP1_REV_COUNT == granit_g_table::counts[2], "G-table canonical counts changed");
+    constexpr bool tf32 = FMM_M2L_MODE == FMM_M2L_MODE_TF32_TC;
+    const auto path = granit_g_table::installed_path();
+    const auto coefficients = granit_g_table::load(path);
+    bfd.d_G_full_bytes = size_t(75) * 48 * (tf32 ? 32 : 28) * 32 * sizeof(float);
+    std::cout << "Loading full 48-orientation G-table: " << path << std::endl;
     CUDA_CHECK(cudaMalloc(&bfd.d_G_full, bfd.d_G_full_bytes));
-
-    // 3. Compose and upload each gap segment
-    RotGGapInfo h_gap_info[9] = {};
-    size_t float_offset = 0;
-
+    RotGGapInfo gap_info[9] = {};
+    size_t offset = 0;
     for (int gi = 0; gi < 3; ++gi) {
-        int signed_gap = STORAGE_ORDER[gi];
-        int count      = COUNTS[gi];
-        int gap_idx    = signed_gap + 4;  // 0..8
-
-        const float* Gsrc = GSRC_PTRS[gi];
-        size_t segment_floats = (size_t)count * NUM_ORIENT * G_STRIDE;
-
-        h_gap_info[gap_idx].count        = count;
-        h_gap_info[gap_idx].float_offset = static_cast<int>(float_offset);
-
-        // Allocate host staging buffer for this segment
-        std::vector<float> host_segment(segment_floats, 0.0f);
-
-        for (int cid = 0; cid < count; ++cid) {
-            // The gap +1 planar operators are appended after the historic
-            // contiguous 25-entry source table.  Select them by canonical ID
-            // while preserving IDs 0..24 and the unchanged gap -1 segment.
-            const float* Gsrc_cid = (signed_gap == 1 && cid >= G_GAP1_PLANAR_BASE)
-                ? &G_GAP1_PLANAR[cid - G_GAP1_PLANAR_BASE][0][0]
-                : Gsrc + (size_t)cid * CANON_G_STRIDE;
-            for (int o_gen = 0; o_gen < NUM_ORIENT; ++o_gen) {
-                uint8_t v2 = OID_GEN_TO_V2[o_gen];
-
-                // Two-matmul COMPOSE (see Global Constraints):
-                //   C[k][lane] = sum_tc Gsrc[cid][k][tc] * B_R[v2][lane][tc]
-                //   G_full[sc][lane] = sum_k A_R[v2][k][sc] * C[k][lane]
-                // intermediate in double for precision
-                double C[NC][NC] = {};
-                for (int k = 0; k < NC; ++k) {
-                    for (int lane = 0; lane < NC; ++lane) {
-                        double sum = 0.0;
-                        for (int tc = 0; tc < NC; ++tc) {
-                            sum += (double)Gsrc_cid[(size_t)k * 32 + tc]
-                                 * (double)G_B_R[v2][lane][tc];
-                        }
-                        C[k][lane] = sum;
-                    }
-                }
-
-                size_t orient_base = (size_t)cid * NUM_ORIENT + (size_t)o_gen;
-                for (int sc = 0; sc < NC; ++sc) {
-                    for (int lane = 0; lane < NC; ++lane) {
-                        double sum = 0.0;
-                        for (int k = 0; k < NC; ++k) {
-                            sum += (double)G_A_R[v2][k][sc]
-                                 * C[k][lane];
-                        }
-                        float stored = static_cast<float>(sum);
-#if FMM_M2L_MODE == FMM_M2L_MODE_TF32_TC
-                        // TF32 has the FP32 exponent and ten explicit mantissa
-                        // bits.  Round-to-nearest-even on the host so WMMA's A
-                        // operand is already in the documented TF32 form.
-                        uint32_t bits = 0;
-                        std::memcpy(&bits, &stored, sizeof(bits));
-                        if ((bits & 0x7f800000u) != 0x7f800000u) {
-                            bits += 0x00000fffu + ((bits >> 13) & 1u);
-                            bits &= 0xffffe000u;
-                            std::memcpy(&stored, &bits, sizeof(stored));
-                        }
-#endif
-                        // Padded columns and (for TF32_TC) padded K rows remain
-                        // zero from vector initialization.
-                        host_segment[orient_base * G_STRIDE +
-                                     (size_t)sc * 32 + lane] = stored;
-                    }
-                }
-            }
-        }
-
-        CUDA_CHECK(cudaMemcpy(bfd.d_G_full + float_offset, host_segment.data(),
-                              segment_floats * sizeof(float), cudaMemcpyHostToDevice));
-        float_offset += segment_floats;
+        const auto segment = granit_g_table::segment(coefficients, gi, tf32);
+        const int slot = granit_g_table::gaps[gi] + 4;
+        gap_info[slot].count = granit_g_table::counts[gi];
+        gap_info[slot].float_offset = static_cast<int>(offset);
+        CUDA_CHECK(cudaMemcpy(bfd.d_G_full + offset, segment.data(),
+                              segment.size() * sizeof(float), cudaMemcpyHostToDevice));
+        offset += segment.size();
     }
-
-    if (float_offset != total_floats) {
-        std::cerr << "FATAL: full G-table size mismatch. Expected "
-                  << total_floats << " floats, computed " << float_offset
-                  << std::endl;
-        std::exit(1);
-    }
-
-    // 4. Zero out unused gap slots
-    for (int gi = 0; gi < 9; ++gi) {
-        bool used = (gi == 4 || gi == 5 || gi == 3);
-        if (!used) {
-            h_gap_info[gi].count        = 0;
-            h_gap_info[gi].float_offset = 0;
-        }
-    }
-
-    // 5. Upload gap info to __constant__ memory
-    CUDA_CHECK(cudaMemcpyToSymbol(d_canonG_gap_info, h_gap_info, sizeof(h_gap_info)));
-    std::cout << "  Uploaded gap info table (3 gaps active, 9 slots) to __constant__ memory"
-              << std::endl;
+    CUDA_CHECK(cudaMemcpyToSymbol(d_canonG_gap_info, gap_info, sizeof(gap_info)));
 }
 
 // =============================================================================
@@ -2848,7 +2739,9 @@ static void run_p2p_outer(int gpu_id, ::cudadem::SimulationState& state,
     fmm::FMMDeviceData& dd = device_data_[gpu_id];
 
     double G = config.acceleration.unified_fmm.gravitational_constant;
-    double softening = config.particle.radius_min * config.acceleration.unified_fmm.softening_factor;
+    double softening = config.physics == SimulationPhysics::SPH
+        ? -sph_compact_baseline_length(config, stream) :
+        config.particle.radius_min * config.acceleration.unified_fmm.softening_factor;
 
     const auto& distributed = distributed_fmm_[gpu_id];
     body_fitted_fmm::launch_p2p_grouped_leaves<true>(
@@ -3012,6 +2905,11 @@ void UnifiedFMMDispatcher::compute(
             initialize_adaptive(config, state, N, stream);
         else
             initialize(config, N);
+    }
+
+    if (config.physics == SimulationPhysics::SPH && config.acceleration.unified_fmm.adaptive_depth.enabled) {
+        limit_persistent_sph_depth(persistent_tree_runtime_[gpu_id],
+            sph_physical_depth_ceiling(state, config, requested_particle_count, stream), stream);
     }
 
     fmm::FMMHostData& hd = host_data_[gpu_id];
@@ -3198,6 +3096,8 @@ void UnifiedFMMDispatcher::compute(
     body_fitted_fmm::record_persistent_depth_evaluation(
         persistent_tree_runtime_[gpu_id], stream);
 
+    add_sph_gravity_softening_correction(state, config, stream, false);
+
     // --- Phase 9: Global Projection ---
     if (fmm_config.enable_global_projection) {
         if (getenv("BF_FMM_VALIDATE_PHASE_SYNC"))
@@ -3353,6 +3253,11 @@ void UnifiedFMMDispatcher::compute_outer(
             initialize(config, N);
     }
 
+    if (config.physics == SimulationPhysics::SPH && config.acceleration.unified_fmm.adaptive_depth.enabled) {
+        limit_persistent_sph_depth(persistent_tree_runtime_[gpu_id],
+            sph_physical_depth_ceiling(state, config, requested_particle_count, stream), stream);
+    }
+
     fmm::FMMHostData& hd = host_data_[gpu_id];
     fmm::FMMDeviceData& dd = device_data_[gpu_id];
     BodyFittedFMMDeviceData& bfd = bf_device_data_[gpu_id];
@@ -3456,6 +3361,8 @@ void UnifiedFMMDispatcher::compute_outer(
 
     body_fitted_fmm::record_persistent_depth_evaluation(
         persistent_tree_runtime_[gpu_id], stream);
+
+    add_sph_gravity_softening_correction(state, config, stream, true);
 
     // Phase 9: Global Projection
     if (fmm_config.enable_global_projection) {
@@ -3780,6 +3687,10 @@ bool UnifiedFMMDispatcher::get_adaptive_fmm_depth_checkpoint(
     (void)stream;
     if (!checkpoint) return false;
     const int gpu_id = current_gpu();
+    if (!initialized_[gpu_id] && has_pending_adaptive_depth_checkpoint_[gpu_id]) {
+        *checkpoint = pending_adaptive_depth_checkpoint_[gpu_id];
+        return true;
+    }
     if (!initialized_[gpu_id] ||
         !persistent_tree_runtime_[gpu_id].adaptive_options.enabled)
         return false;

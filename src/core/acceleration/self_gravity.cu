@@ -62,7 +62,7 @@
 namespace cudadem {
 
 __global__ void sph_gravity_softening_correction_kernel(
-    ParticleSoA p, NeighborData neighbors, double G, double epsilon, int count) {
+    ParticleSoA p, NeighborData neighbors, double G, double epsilon, int count, bool outer) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     // h may have evolved since the hydro adjacency was built. The point BVH
@@ -85,14 +85,18 @@ __global__ void sph_gravity_softening_correction_kernel(
             const double inverse = 1.0 / sqrt(fmax(r2, epsilon*epsilon));
             const double baseline = inverse * inverse * inverse;
             const double difference = gravity_softening_force_factor_double(r, h) - baseline;
-            const double force = G * static_cast<double>(p.mass[i]) * p.mass[j] * difference;
+            const double force = G * (outer ? 1.0 : static_cast<double>(p.mass[i])) * p.mass[j] * difference;
             fx += force*dx; fy += force*dy; fz += force*dz;
         });
-    p.force_x[i] += fx; p.force_y[i] += fy; p.force_z[i] += fz;
+    if (outer) {
+        p.gravity_force_x[i] += fx; p.gravity_force_y[i] += fy; p.gravity_force_z[i] += fz;
+    } else {
+        p.force_x[i] += fx; p.force_y[i] += fy; p.force_z[i] += fz;
+    }
 }
 
 void add_sph_gravity_softening_correction(
-    SimulationState& state, const SimConfig& config, cudaStream_t stream) {
+    SimulationState& state, const SimConfig& config, cudaStream_t stream, bool outer) {
     if (config.physics != SimulationPhysics::SPH) return;
     const int n = state.particles.num_local;
     if (!n) return;
@@ -106,7 +110,7 @@ void add_sph_gravity_softening_correction(
                                  "use physical h bounds and a shallower FMM depth");
     sph_gravity_softening_correction_kernel<<<(n+255)/256,256,0,stream>>>(
         state.particles, state.neighbor,
-        config.acceleration.unified_fmm.gravitational_constant, epsilon, n);
+        config.acceleration.unified_fmm.gravitational_constant, epsilon, n, outer);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1709,7 +1713,6 @@ void AccelerationManager::compute_self_gravity(
             body_fitted_fmm::UnifiedFMMDispatcher::compute(
                 state, config, state.neighbor, pbc, evaluation_time, stream,
                 /*synchronize_at_end=*/false);
-            add_sph_gravity_softening_correction(state, config, stream);
             return;
         }
         case SelfGravityMethod::DIRECT:
@@ -1808,7 +1811,6 @@ void AccelerationManager::compute_self_gravity_multigpu(
             body_fitted_fmm::UnifiedFMMDispatcher::compute_multigpu(
                 state, config, state.neighbor, pbc, *let_comm,
                 gravity_evaluation_epoch, evaluation_time, stream);
-            add_sph_gravity_softening_correction(state, config, stream);
             return;
         }
         case SelfGravityMethod::DIRECT:

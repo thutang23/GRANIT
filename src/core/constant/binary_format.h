@@ -90,6 +90,7 @@ enum class FieldID : uint16_t {
     MASS             = 0x0012,  // f32, 1
     MOMENT_OF_INERTIA = 0x0013, // f32, 1
     FORCE            = 0x0014,  // f32, 3
+    GRAVITY_ACCELERATION = 0x001E, // f64, 3 (SPH checkpoint slow acceleration)
     TORQUE           = 0x0015,  // f32, 3
     QUATERNION       = 0x0016,  // f64, 4 (checkpoint only)
     NUM_CONTACTS     = 0x0017,  // i32, 1 (checkpoint only)
@@ -328,7 +329,8 @@ inline bool write_unified_binary(
             descriptors.emplace_back(FieldID::C_SOUND,           DType::F32, 1, 0);
             descriptors.emplace_back(FieldID::ENERGY,            DType::F64, 1, 0);
             descriptors.emplace_back(FieldID::DAMAGE,            DType::F32, 1, 0);
-            descriptors.emplace_back(FieldID::FORCE,             DType::F32, 3, 0);
+            descriptors.emplace_back(FieldID::FORCE,             DType::F64, 3, 0);
+            descriptors.emplace_back(FieldID::GRAVITY_ACCELERATION, DType::F64, 3, 0);
             descriptors.emplace_back(FieldID::CRACK_STRAIN,  DType::F32, 1, 0);
             descriptors.emplace_back(FieldID::FLAWS_NTOT,    DType::I32, 1, 0);
             descriptors.emplace_back(FieldID::FLAWS_STRAIN_MIN, DType::F32, 1, 0);
@@ -446,10 +448,21 @@ inline bool write_unified_binary(
             case FieldID::MOMENT_OF_INERTIA:
                 write_float_array(file, particles.moment_of_inertia, N);
                 break;
+            case FieldID::GRAVITY_ACCELERATION:
+                write_double_array(file, particles.gravity_force_x, N);
+                write_double_array(file, particles.gravity_force_y, N);
+                write_double_array(file, particles.gravity_force_z, N);
+                break;
             case FieldID::FORCE:
-                write_double_as_float(file, output_force_x ? output_force_x : particles.force_x, N);
-                write_double_as_float(file, output_force_y ? output_force_y : particles.force_y, N);
-                write_double_as_float(file, output_force_z ? output_force_z : particles.force_z, N);
+                if (is_checkpoint && is_sph) {
+                    write_double_array(file, particles.force_x, N);
+                    write_double_array(file, particles.force_y, N);
+                    write_double_array(file, particles.force_z, N);
+                } else {
+                    write_double_as_float(file, output_force_x ? output_force_x : particles.force_x, N);
+                    write_double_as_float(file, output_force_y ? output_force_y : particles.force_y, N);
+                    write_double_as_float(file, output_force_z ? output_force_z : particles.force_z, N);
+                }
                 break;
             case FieldID::TORQUE:
                 write_double_as_float(file, particles.torque_x, N);

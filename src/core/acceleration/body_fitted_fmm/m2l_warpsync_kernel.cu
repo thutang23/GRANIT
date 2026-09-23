@@ -4,7 +4,7 @@
 // Replaces the old 3-stage folded contraction with a single-stage grouped
 // kernel against a precomputed full 48-orientation G-table (d_G_full).
 //
-// The full G-table is composed on the host once at init from the canonical G
+// The shipped full G-table is composed offline from the canonical G
 // tables and the A_R/B_R rotation matrices:
 //   G_full[sc][lane] = sum_k sum_tc A_R[v2][k][sc] * G_canon[k][tc]
 //                      * B_R[v2][lane][tc]
@@ -46,7 +46,7 @@
 namespace body_fitted_fmm {
 #include "m2l_group_diagnostics.cuh"
 #ifndef FMM_M2L_MODE
-#define FMM_M2L_MODE 0
+#define FMM_M2L_MODE 3
 #endif
 #define FMM_M2L_MODE_FP64 0
 #define FMM_M2L_MODE_FP32_SIMT_LINEAR 1

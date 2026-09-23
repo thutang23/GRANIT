@@ -1,3 +1,5 @@
+#include "src/core/constant/adaptive_fmm_depth_lifecycle.h"
+#include "src/core/sph/sph_respa_schedule.h"
 #include "src/core/sph/sph_stage.h"
 #include "src/core/sph/sph_history.h"
 // =============================================================================
@@ -385,6 +387,94 @@ private:
         Count
     };
 
+    // Backend 3 stores the common host controller and the ownership geometry.
+    // Device pointers are reconstructed from values on restart.
+    struct CommonDepthCheckpoint {
+        uint32_t ranks = 0;
+        int32_t launch_depth = 0;
+        int32_t global_particles = 0;
+        uint64_t gravity_epoch = 0, completed_epoch = 0;
+        int64_t last_balance_step = 0, calibration_cursor = -1;
+        MortonGrid grid{};
+        uint64_t cuts[MAX_MULTI_GPUS+1]{};
+        int64_t stable_counts[MAX_MULTI_GPUS]{};
+        double bounds[6]{};
+        bool partition_pending = false;
+        uint64_t payload_checksum = 0;
+    };
+    static uint64_t depth_payload_checksum(const std::string& payload) {
+        uint64_t hash = UINT64_C(1469598103934665603);
+        for (unsigned char byte : payload) { hash ^= byte; hash *= UINT64_C(1099511628211); }
+        return hash;
+    }
+    void save_common_depth_checkpoint(const std::string& path, const SimulationState& state) {
+        if (!adaptive_fmm_depth_checkpoint_requested(config_)) return;
+        if (!domain_params_.morton_enabled) throw std::runtime_error("Adaptive SPH checkpoint requires Morton ownership");
+        if (num_gpus_ > MAX_MULTI_GPUS) throw std::runtime_error("SPH checkpoints support at most 8 GPUs");
+        CommonDepthCheckpoint checkpoint{};
+        checkpoint.ranks = num_gpus_; checkpoint.launch_depth = common_launch_depth_;
+        checkpoint.global_particles = common_global_particles_;
+        checkpoint.gravity_epoch = gravity_evaluation_epoch_; checkpoint.completed_epoch = common_completed_epoch_;
+        checkpoint.last_balance_step = common_last_balance_step_;
+        checkpoint.calibration_cursor = common_calibration_cursor_;
+        checkpoint.grid = domain_params_.morton_grid; checkpoint.partition_pending = common_partition_pending_;
+        for (int g=0; g<=num_gpus_; ++g) checkpoint.cuts[g] = domain_params_.morton_cuts[g];
+        for (int g=0; g<num_gpus_; ++g) checkpoint.stable_counts[g] = common_stable_owned_counts_.size()>size_t(g) ? common_stable_owned_counts_[g] : 0;
+        checkpoint.bounds[0]=domain_params_.domain_min_x; checkpoint.bounds[1]=domain_params_.domain_min_y;
+        checkpoint.bounds[2]=domain_params_.domain_min_z; checkpoint.bounds[3]=domain_params_.domain_max_x;
+        checkpoint.bounds[4]=domain_params_.domain_max_y; checkpoint.bounds[5]=domain_params_.domain_max_z;
+        std::ostringstream payload(std::ios::binary);
+        common_fmm_depth_.save_checkpoint(payload);
+        rcb_calibrator_.save_checkpoint(payload);
+        const std::string bytes=payload.str(); checkpoint.payload_checksum=depth_payload_checksum(bytes);
+        AdaptiveFMMDepthCheckpointSidecarHeader header{{'A','F','M','M','D','P','T','H'},3,
+            static_cast<uint32_t>(sizeof(checkpoint)+bytes.size()),state.current_step,state.current_time,
+            AdaptiveFMMDepthLifecycle::adaptive_fmm_depth_config_fingerprint(config_)};
+        const std::string target=adaptive_fmm_depth_checkpoint_sidecar_path(path), temporary=target+".tmp";
+        std::ofstream out(temporary,std::ios::binary|std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(&header),sizeof(header));
+        out.write(reinterpret_cast<const char*>(&checkpoint),sizeof(checkpoint));
+        out.write(bytes.data(),bytes.size()); out.close();
+        if (!out) throw std::runtime_error("Cannot write common FMM checkpoint");
+        std::filesystem::rename(temporary,target);
+    }
+    void restore_common_depth_checkpoint(const std::string& path, const SimulationState& state) {
+        AdaptiveFMMDepthCheckpointSidecarHeader header{}; CommonDepthCheckpoint checkpoint{};
+        std::ifstream in(adaptive_fmm_depth_checkpoint_sidecar_path(path),std::ios::binary);
+        in.read(reinterpret_cast<char*>(&header),sizeof(header));
+        in.read(reinterpret_cast<char*>(&checkpoint),sizeof(checkpoint));
+        if (!in || header.version!=3 || header.step!=state.current_step || header.time!=state.current_time ||
+            header.payload_size<sizeof(checkpoint) || header.payload_size>131072 ||
+            header.config_hash!=AdaptiveFMMDepthLifecycle::adaptive_fmm_depth_config_fingerprint(config_) ||
+            checkpoint.ranks!=uint32_t(num_gpus_) || checkpoint.ranks>MAX_MULTI_GPUS || !domain_params_.morton_enabled ||
+            checkpoint.launch_depth<config_.acceleration.unified_fmm.adaptive_depth.min_depth ||
+            checkpoint.launch_depth>config_.acceleration.unified_fmm.adaptive_depth.max_depth ||
+            !std::isfinite(checkpoint.grid.size) || !(checkpoint.grid.size>0) ||
+            checkpoint.grid.dimension!=config_.acceleration.unified_fmm.tree_dimension ||
+            checkpoint.grid.depth<2 || checkpoint.grid.depth>20)
+            throw std::runtime_error("Invalid/mismatched common FMM checkpoint (backend/rank/configuration)");
+        std::string bytes(header.payload_size-sizeof(checkpoint),'\0');
+        in.read(bytes.data(),bytes.size());
+        if (!in || in.peek()!=std::char_traits<char>::eof() || depth_payload_checksum(bytes)!=checkpoint.payload_checksum)
+            throw std::runtime_error("Corrupt common FMM checkpoint payload");
+        std::istringstream payload(bytes,std::ios::binary);
+        common_fmm_depth_.restore_checkpoint(payload,config_.acceleration.unified_fmm.adaptive_depth);
+        rcb_calibrator_.restore_checkpoint(payload);
+        if (common_fmm_depth_.gpu_count()!=1 || payload.peek()!=std::char_traits<char>::eof())
+            throw std::runtime_error("Invalid common FMM controller payload");
+        common_fmm_command_=common_fmm_depth_.command_for_gpu(0); common_launch_depth_=checkpoint.launch_depth;
+        common_global_particles_=checkpoint.global_particles;
+        gravity_evaluation_epoch_=checkpoint.gravity_epoch; common_completed_epoch_=checkpoint.completed_epoch;
+        common_last_balance_step_=checkpoint.last_balance_step; common_calibration_cursor_=checkpoint.calibration_cursor; common_partition_pending_=checkpoint.partition_pending;
+        common_stable_owned_counts_.assign(checkpoint.stable_counts,checkpoint.stable_counts+num_gpus_);
+        domain_params_.domain_min_x=checkpoint.bounds[0]; domain_params_.domain_min_y=checkpoint.bounds[1];
+        domain_params_.domain_min_z=checkpoint.bounds[2]; domain_params_.domain_max_x=checkpoint.bounds[3];
+        domain_params_.domain_max_y=checkpoint.bounds[4]; domain_params_.domain_max_z=checkpoint.bounds[5];
+        DomainManager::set_morton_partition(domain_params_,checkpoint.grid,
+            std::vector<uint64_t>(checkpoint.cuts,checkpoint.cuts+num_gpus_+1));
+        domain_params_.restore_morton_partition=true;
+    }
+
     SimConfig config_;
     DomainParamsGPU domain_params_;
     MortonRootService morton_root_;
@@ -446,10 +536,12 @@ private:
     bool sph_mode_;
     bool resumed_ = false;
     int64_t last_checkpoint_step_ = -1;
+    int64_t checkpoint_cadence_step_ = 0;
     double dt_;
     uint64_t gravity_evaluation_epoch_ = 0;
     int respa_shared_inner_count_ = 0;
     double respa_shared_macro_span_ = 0.0;
+    double sph_shared_macro_end_ = 0.0;
     float sph_global_h_max_;
     bool adaptive_yorp_fatal_ = false;
     int64_t last_output_step_ = -1;
@@ -805,10 +897,9 @@ public:
 
         resumed_ = config_.io.checkpoint_resume_from[0] != '\0';
         if (resumed_ || (sph_mode_ && config_.io.checkpoint_enabled)) {
-            if (!sph_mode_ || config_.shear_box.enabled ||
-                config_.acceleration.unified_fmm.adaptive_depth.enabled) {
+            if (!sph_mode_ || config_.shear_box.enabled) {
                 throw std::invalid_argument(
-                    "Multi-GPU checkpoints require isolated SPH with fixed FMM depth");
+                    "Multi-GPU checkpoints require isolated SPH");
             }
         }
         if (resumed_ && config_.io.checkpoint_force_fresh)
@@ -894,6 +985,7 @@ public:
         }
         dt_ = global_state.dt;
         global_state.dt = dt_;
+        if (resumed_) checkpoint_cadence_step_ = global_state.current_step;
         const int32_t global_particle_count = global_state.particles.num_particles;
 
         if (sph_mode_) {
@@ -923,6 +1015,8 @@ public:
         }
 
         // Distribute particles across GPUs
+        if (resumed_ && adaptive_fmm_depth_checkpoint_requested(config_))
+            restore_common_depth_checkpoint(config_.io.checkpoint_resume_from, global_state);
         DomainManager::distribute_particles(global_state, gpu_states_, domain_params_, config_);
         // The initial scatter preserves clump_id.  In SPH it is the exact
         // SPHSOL Part ID; in DEM it retains the existing clump semantics.
@@ -964,7 +1058,7 @@ public:
             return false;
         }
 
-        if(domain_params_.morton_enabled){
+        if(domain_params_.morton_enabled && (!resumed_ || !adaptive_fmm_depth_checkpoint_requested(config_))){
             for(const auto& state:gpu_states_)common_global_particles_+=state.subdomain.num_local_particles;
             common_fmm_command_.launch_depth=config_.acceleration.unified_fmm.adaptive_depth.enabled ? config_.acceleration.unified_fmm.adaptive_depth.min_depth : std::max(2,config_.acceleration.unified_fmm.tree_depth);
             common_launch_depth_=common_fmm_command_.launch_depth;
@@ -1095,7 +1189,7 @@ public:
 
         // Convert after the final globally selected dt (including the SPH
         // branch) and then refresh every device's constant config.
-        if (config_.acceleration.gravity_macro_dt > 0.0) {
+        if (!sph_mode_ && config_.acceleration.gravity_macro_dt > 0.0) {
             const double ratio = config_.acceleration.gravity_macro_dt / dt_;
             const int64_t effective = std::max<int64_t>(
                 1, static_cast<int64_t>(std::floor(ratio + 1.0e-12)));
@@ -1226,8 +1320,8 @@ public:
         const float dem_halo_width = config_.particle.radius_max * 2.0f *
                                      config_.multigpu.halo_width_factor;
         const int respa_k = config_.acceleration.gravity_update_rate;
-        const bool respa_enabled = config_.acceleration.enable_self_gravity &&
-            respa_k > 1;
+        const bool respa_enabled = sph_mode_ || (config_.acceleration.enable_self_gravity &&
+            respa_k > 1);
         std::vector<SPHTimestepResult> sph_dt_candidates(
             static_cast<size_t>(num_gpus_));
         SPHTimestepResult global_sph_timestep_diagnostic;
@@ -1250,9 +1344,11 @@ public:
 
             int block_size = config_.gpu.block_size;
             double dt = dt_;
+            double sph_next_output = next_sph_output_time(my_state.local_state.current_time, config_.time.start_time, config_.time.output_step);
             int respa_inner_remaining = 0;
             int respa_macro_inner_count = 0;
             double respa_macro_span = 0.0;
+            double sph_macro_end = 0.0;
             bool respa_macro_closing = false;
             uint64_t local_gravity_epoch = 0;
             bool force_bootstrap_pending = !resumed_ ||
@@ -1569,7 +1665,7 @@ public:
 
             auto apply_respa_half_kick = [&](double half_span) {
                 const int32_t owned = my_state.subdomain.num_local_particles;
-                if (owned <= 0 || !(half_span > 0.0)) return;
+                if (!config_.acceleration.enable_self_gravity || owned <= 0 || !(half_span > 0.0)) return;
                 const int blocks = (owned + block_size - 1) / block_size;
                 LAUNCH_KERNEL(apply_half_gravity_impulse_kernel, blocks, block_size,
                               0, stream,
@@ -1582,9 +1678,34 @@ public:
                               half_span, owned);
             };
 
+            auto prepare_sph_gravity_depth = [&]() {
+                if (!sph_mode_ || !domain_params_.morton_enabled ||
+                    !config_.acceleration.unified_fmm.adaptive_depth.enabled) return;
+                // Every rank checks the same current endpoint h/root before
+                // entering a barrier, so an infeasible input fails collectively.
+                int ceiling = config_.acceleration.unified_fmm.adaptive_depth.max_depth;
+                while (ceiling >= 2 && sph_global_h_max_ >
+                       32.0*std::ldexp(domain_params_.morton_grid.size, -ceiling)) --ceiling;
+                if (sph_global_h_max_ > 128.0*config_.sph.hsml_min ||
+                    ceiling < config_.acceleration.unified_fmm.adaptive_depth.min_depth)
+                    throw std::runtime_error("SPH smoothing lengths exceed the common FMM depth bounds");
+                const int memory_ceiling = *std::min_element(common_depth_ceilings_.begin(), common_depth_ceilings_.end());
+                if (memory_ceiling > 0) ceiling = std::min(ceiling, memory_ceiling);
+                #pragma omp barrier
+                #pragma omp single
+                {
+                    if (ceiling != common_fmm_depth_.state_for_gpu(0).effective_max_depth)
+                        common_fmm_depth_.set_effective_max_depth(0, ceiling, gravity_evaluation_epoch_);
+                    common_fmm_command_ = common_fmm_depth_.command_for_gpu(0);
+                    common_launch_depth_ = common_fmm_command_.launch_depth;
+                }
+                #pragma omp barrier
+                body_fitted_fmm::UnifiedFMMDispatcher::set_distributed_compute_depth(common_launch_depth_);
+            };
+
             // Main simulation loop
-            while (my_state.local_state.current_time < config_.time.stop_time &&
-                   !local_adaptive_yorp_stop) {
+            while (force_bootstrap_pending || (my_state.local_state.current_time < config_.time.stop_time &&
+                   !local_adaptive_yorp_stop)) {
                 #ifdef CUDADEM_ENABLE_PROFILING
                 nvtxRangePushA("SimulationStep");
                 #endif
@@ -1623,66 +1744,12 @@ public:
                     }
                 }
 
-                // Plan only at a closed macro boundary.  Output, termination,
-                // and adaptive-YORP observation boundaries are never crossed
-                // by an open slow kick pair.  The final inner dt remains the
-                // sole fractional timestep; both kicks use the summed span.
-                if (respa_enabled && !force_bootstrap_step &&
-                    respa_inner_remaining == 0) {
-                    // The single planner prevents a round-off or stale local
-                    // cadence from making one worker enter a different LET
-                    // epoch.  All workers consume this exact plan below.
-                    #pragma omp barrier
-                    #pragma omp single
-                    {
-                        int planned = std::min(
-                            respa_k,
-                            std::max(1, static_cast<int>(std::ceil(
-                                (config_.time.stop_time -
-                                 my_state.local_state.current_time) / dt - 1e-12))));
-                        if (config_.time.output_step > 0.0) {
-                            const double q = std::floor(
-                                my_state.local_state.current_time /
-                                config_.time.output_step + 1.0e-12);
-                            const double boundary = (q + 1.0) * config_.time.output_step;
-                            planned = std::min(planned, std::max(1, static_cast<int>(
-                                std::ceil((boundary - my_state.local_state.current_time) /
-                                          dt - 1e-12))));
-                        }
-                        if (config_.acceleration.yorp.adaptive) {
-                            planned = std::min(planned, std::max(1, static_cast<int>(
-                                std::ceil((next_yorp_check -
-                                           my_state.local_state.current_time) / dt -
-                                          1e-12))));
-                        }
-                        respa_shared_inner_count_ = planned;
-                        respa_shared_macro_span_ = terminal_limited_respa_span(
-                            my_state.local_state.current_time, dt, planned,
-                            config_.time.stop_time);
-                    }
-                    #pragma omp barrier
-                    respa_inner_remaining = respa_shared_inner_count_;
-                    respa_macro_inner_count = respa_shared_inner_count_;
-                    respa_macro_span = respa_shared_macro_span_;
-                    apply_respa_half_kick(0.5 * respa_macro_span);
-                }
-                respa_macro_closing = !force_bootstrap_step && respa_enabled &&
-                    respa_inner_remaining == 1;
-                dt = terminal_limited_step_dt(my_state.local_state.current_time,
-                                              dt_, config_.time.stop_time);
-                my_state.local_state.dt = dt;
-
-                int32_t num_local = my_state.subdomain.num_local_particles;
-                int32_t num_total = num_local + my_state.subdomain.num_ghost_particles;
-                int num_blocks_local = (num_local + block_size - 1) / block_size;
-                int num_blocks_total = (num_total + block_size - 1) / block_size;
-
-                if (sph_mode_) {
+                if (sph_mode_ && !force_bootstrap_step && respa_inner_remaining == 0) {
                     // Each device contributes the CFL minimum over its owned
                     // particles.  All workers then use one globally clamped dt.
                     const int32_t saved_count =
                         my_state.local_state.particles.num_particles;
-                    my_state.local_state.particles.num_particles = num_local;
+                    my_state.local_state.particles.num_particles = my_state.subdomain.num_local_particles;
                     SPHTimestepResult timestep_result;
                     compute_sph_timestep(my_state.local_state, config_,
                                          timestep_result, stream);
@@ -1712,14 +1779,88 @@ public:
                                        std::min(config_.sph.dt_max, global_dt));
                     }
                     #pragma omp barrier
-                    const double stage_limited_dt = config_.sph.stage_count > 0
-                        ? sph_stage_step(my_state.local_state.current_time, dt_,
-                            sph_current_stage(config_, my_state.local_state.current_time).end_time)
-                        : dt_;
-                    dt = terminal_limited_step_dt(my_state.local_state.current_time,
-                                                  stage_limited_dt, config_.time.stop_time);
-                    my_state.local_state.dt = dt;
                 }
+
+                // Plan only at a closed macro boundary.  Output, termination,
+                // and adaptive-YORP observation boundaries are never crossed
+                // by an open slow kick pair.  The final inner dt remains the
+                // sole fractional timestep; both kicks use the summed span.
+                if (respa_enabled && !force_bootstrap_step &&
+                    respa_inner_remaining == 0) {
+                    // The single planner prevents a round-off or stale local
+                    // cadence from making one worker enter a different LET
+                    // epoch.  All workers consume this exact plan below.
+                    #pragma omp barrier
+                    #pragma omp single
+                    {
+                        if (sph_mode_) {
+                            double event = std::min(config_.time.stop_time,
+                                sph_next_output);
+                            if (config_.sph.stage_count > 0)
+                                event = std::min(event, sph_current_stage(config_, my_state.local_state.current_time).end_time);
+                            const auto plan = plan_sph_macro(my_state.local_state.current_time, dt_,
+                                respa_k, event, config_.acceleration.gravity_macro_dt);
+                            respa_shared_inner_count_ = plan.count;
+                            respa_shared_macro_span_ = plan.span;
+                            sph_shared_macro_end_ = plan.end_time;
+                            if (config_.io.scalar_interval > 0) {
+                            std::filesystem::create_directories(config_.io.output_directory);
+                            const std::string path = std::string(config_.io.output_directory) + "/sph_macros.csv";
+                            const bool header = !std::filesystem::exists(path) || std::filesystem::file_size(path) == 0;
+                            std::ofstream out(path, std::ios::app);
+                            if (header) out << "start_step,start_time,inner_count,inner_dt,end_time,cfl_dt,gravity_evaluations\n";
+                            out << std::setprecision(17) << my_state.local_state.current_step << ','
+                                << my_state.local_state.current_time << ',' << plan.count << ',' << plan.dt << ','
+                                << plan.end_time << ',' << dt_ << ',' << gravity_evaluation_epoch_ << '\n';
+                            if (!out) throw std::runtime_error("Cannot write SPH macro receipt");
+                            }
+                        } else {
+                        int planned = std::min(
+                            respa_k,
+                            std::max(1, static_cast<int>(std::ceil(
+                                (config_.time.stop_time -
+                                 my_state.local_state.current_time) / dt - 1e-12))));
+                        if (config_.time.output_step > 0.0) {
+                            const double q = std::floor(
+                                my_state.local_state.current_time /
+                                config_.time.output_step + 1.0e-12);
+                            const double boundary = (q + 1.0) * config_.time.output_step;
+                            planned = std::min(planned, std::max(1, static_cast<int>(
+                                std::ceil((boundary - my_state.local_state.current_time) /
+                                          dt - 1e-12))));
+                        }
+                        if (config_.acceleration.yorp.adaptive) {
+                            planned = std::min(planned, std::max(1, static_cast<int>(
+                                std::ceil((next_yorp_check -
+                                           my_state.local_state.current_time) / dt -
+                                          1e-12))));
+                        }
+                        respa_shared_inner_count_ = planned;
+                        respa_shared_macro_span_ = terminal_limited_respa_span(
+                            my_state.local_state.current_time, dt, planned,
+                            config_.time.stop_time);
+                        }
+                    }
+                    #pragma omp barrier
+                    respa_inner_remaining = respa_shared_inner_count_;
+                    respa_macro_inner_count = respa_shared_inner_count_;
+                    respa_macro_span = respa_shared_macro_span_;
+                    if (sph_mode_) {
+                        dt = respa_macro_span / respa_macro_inner_count;
+                        sph_macro_end = sph_shared_macro_end_;
+                    }
+                    apply_respa_half_kick(0.5 * respa_macro_span);
+                }
+                respa_macro_closing = !force_bootstrap_step && respa_enabled &&
+                    respa_inner_remaining == 1;
+                if (!sph_mode_) dt = terminal_limited_step_dt(my_state.local_state.current_time,
+                                              dt_, config_.time.stop_time);
+                my_state.local_state.dt = dt;
+
+                int32_t num_local = my_state.subdomain.num_local_particles;
+                int32_t num_total = num_local + my_state.subdomain.num_ghost_particles;
+                int num_blocks_local = (num_local + block_size - 1) / block_size;
+                int num_blocks_total = (num_total + block_size - 1) / block_size;
 
                 const double force_evaluation_time = force_bootstrap_step
                     ? my_state.local_state.current_time
@@ -1879,7 +2020,10 @@ public:
                             const int ceiling=*std::min_element(common_depth_ceilings_.begin(),common_depth_ceilings_.end());
                             if(ceiling<config_.acceleration.unified_fmm.adaptive_depth.min_depth)
                                 throw std::runtime_error("common FMM memory preflight cannot fit the minimum depth on every device");
-                            if(ceiling!=common_fmm_depth_.state_for_gpu(0).effective_max_depth)
+                            // SPH applies the combined memory/physical ceiling at
+                            // each gravity endpoint. Raising it here would cancel
+                            // a live trial before that physical limit is reapplied.
+                            if(!sph_mode_ && ceiling!=common_fmm_depth_.state_for_gpu(0).effective_max_depth)
                                 common_fmm_depth_.set_effective_max_depth(0,ceiling,common_completed_epoch_);
                             common_fmm_command_=common_fmm_depth_.command_for_gpu(0);
                         }
@@ -2389,7 +2533,7 @@ public:
                         my_state.local_state, config_,
                         force_evaluation_time, stream,
                         /*include_incremental_effects=*/!config_.acceleration.yorp.adaptive);
-                    if (force_bootstrap_step) {
+                    if (force_bootstrap_step && config_.acceleration.enable_self_gravity) {
                         // q0 ordering: distributed fast/contact/wall force
                         // first, then one collective slow acceleration epoch.
                         #pragma omp barrier
@@ -2397,6 +2541,7 @@ public:
                         { ++gravity_evaluation_epoch_; }
                         #pragma omp barrier
                         local_gravity_epoch = gravity_evaluation_epoch_;
+                        prepare_sph_gravity_depth();
                         body_fitted_fmm::UnifiedFMMDispatcher::compute_outer_multigpu(
                             my_state.local_state, config_,
                             my_state.local_state.neighbor,
@@ -2526,7 +2671,8 @@ public:
 
                 if (respa_enabled && !force_bootstrap_step) {
                     --respa_inner_remaining;
-                    if (respa_macro_closing) {
+                    if (respa_macro_closing && sph_mode_) my_state.local_state.current_time = sph_macro_end;
+                    if (respa_macro_closing && config_.acceleration.enable_self_gravity) {
                         // Endpoint gravity precedes the closing kick.  Advance
                         // one shared, monotonic collective epoch even when an
                         // owner is empty, rather than recycling current_step.
@@ -2535,6 +2681,7 @@ public:
                         { ++gravity_evaluation_epoch_; }
                         #pragma omp barrier
                         local_gravity_epoch = gravity_evaluation_epoch_;
+                        prepare_sph_gravity_depth();
                         body_fitted_fmm::UnifiedFMMDispatcher::compute_outer_multigpu(
                             my_state.local_state, config_,
                             my_state.local_state.neighbor,
@@ -2624,10 +2771,11 @@ public:
                 if ((initial_bootstrap_step && config_.io.output_initial_state) ||
                     (!force_bootstrap_step && (!respa_enabled || respa_macro_closing) &&
                     config_.time.output_step > 0.0 &&
+                    (sph_mode_ ? my_state.local_state.current_time >= sph_next_output :
                     static_cast<int64_t>(my_state.local_state.current_time /
                     config_.time.output_step) >
                     static_cast<int64_t>((my_state.local_state.current_time - dt) /
-                    config_.time.output_step))) {
+                    config_.time.output_step)))) {
 
                     // The gather below runs in one host thread and switches
                     // across devices.  Complete each device's step before any
@@ -2652,16 +2800,9 @@ public:
                     #pragma omp barrier
                     // Restore device context after save_output may have changed it
                     CUDA_CHECK(cudaSetDevice(gpu_id));
-                }
-
-                if (sph_mode_ && !force_bootstrap_step && config_.io.checkpoint_enabled &&
-                    my_state.local_state.current_step % config_.io.checkpoint_interval == 0) {
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
-                    #pragma omp barrier
-                    #pragma omp single
-                    { save_output(true); }
-                    #pragma omp barrier
-                    CUDA_CHECK(cudaSetDevice(gpu_id));
+                    if (sph_mode_ && !initial_bootstrap_step)
+                        sph_next_output = next_sph_output_time(my_state.local_state.current_time,
+                            config_.time.start_time, config_.time.output_step);
                 }
 
                 // =============================================================
@@ -3042,6 +3183,23 @@ public:
                     }
                     nvtxRangePop();
                 }
+                if (sph_mode_ && !force_bootstrap_step && config_.io.checkpoint_enabled && (!respa_enabled || respa_macro_closing) &&
+                    my_state.local_state.current_step - checkpoint_cadence_step_ >= config_.io.checkpoint_interval) {
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    harvest_timing_samples();
+                    #pragma omp barrier
+                    #pragma omp single
+                    {
+                        int64_t epoch; std::vector<RCBActiveSample> samples;
+                        while (rcb_sample_mailbox_.try_collect_next(common_calibration_cursor_,epoch,samples)) {
+                            common_calibration_cursor_=epoch; rcb_calibrator_.observe_global_epoch(epoch,samples); samples.clear();
+                        }
+                        save_output(true);
+                    }
+                    #pragma omp barrier
+                    CUDA_CHECK(cudaSetDevice(gpu_id));
+                }
+
                 ++particle_exchange_epoch;
                 #ifdef CUDADEM_ENABLE_PROFILING
                 nvtxRangePop(); // SimulationStep
@@ -3188,6 +3346,7 @@ public:
         std::vector<int32_t> h_global_id(particle_count), h_material_id(particle_count), h_clump_id(particle_count);
         std::vector<int64_t> h_winding_x(particle_count), h_winding_y(particle_count), h_winding_z(particle_count);
 
+        std::vector<double> h_checkpoint_gx(checkpoint ? particle_count : 0), h_checkpoint_gy(checkpoint ? particle_count : 0), h_checkpoint_gz(checkpoint ? particle_count : 0);
         std::vector<double> h_checkpoint_rho_rate(checkpoint ? particle_count : 0);
         std::vector<double> h_checkpoint_dedt(checkpoint ? particle_count : 0);
         std::vector<float> h_checkpoint_S_xx(checkpoint ? particle_count : 0);
@@ -3259,6 +3418,9 @@ public:
         gather_field(h_winding_z, &ParticleSoA::winding_z);
 
         if (checkpoint) {
+            gather_field(h_checkpoint_gx, &ParticleSoA::gravity_force_x);
+            gather_field(h_checkpoint_gy, &ParticleSoA::gravity_force_y);
+            gather_field(h_checkpoint_gz, &ParticleSoA::gravity_force_z);
             gather_field(h_checkpoint_rho_rate, &ParticleSoA::rho_rate);
             gather_field(h_checkpoint_dedt, &ParticleSoA::dedt);
             gather_field(h_checkpoint_S_xx, &ParticleSoA::S_xx);
@@ -3276,8 +3438,8 @@ public:
         }
 
         const bool respa_output = config_.acceleration.enable_self_gravity &&
-            config_.acceleration.gravity_update_rate > 1;
-        if (respa_output) {
+            (sph_mode_ || config_.acceleration.gravity_update_rate > 1);
+        if (respa_output && !checkpoint) {
             // Retained outer data is acceleration; compose a transient host
             // output view instead of mutating the fast contact-force arrays.
             std::vector<double> gx(live_particle_count), gy(live_particle_count),
@@ -3366,6 +3528,7 @@ public:
         reorder(h_winding_x); reorder(h_winding_y); reorder(h_winding_z);
 
         if (checkpoint) {
+            reorder(h_checkpoint_gx); reorder(h_checkpoint_gy); reorder(h_checkpoint_gz);
             reorder(h_checkpoint_rho_rate);
             reorder(h_checkpoint_dedt);
             reorder(h_checkpoint_S_xx);
@@ -3454,6 +3617,9 @@ public:
         upload_field(&ParticleSoA::winding_z, h_winding_z);
 
         if (checkpoint) {
+            upload_field(&ParticleSoA::gravity_force_x, h_checkpoint_gx);
+            upload_field(&ParticleSoA::gravity_force_y, h_checkpoint_gy);
+            upload_field(&ParticleSoA::gravity_force_z, h_checkpoint_gz);
             upload_field(&ParticleSoA::rho_rate, h_checkpoint_rho_rate);
             upload_field(&ParticleSoA::dedt, h_checkpoint_dedt);
             upload_field(&ParticleSoA::S_xx, h_checkpoint_S_xx);
@@ -3470,15 +3636,22 @@ public:
             upload_field(&ParticleSoA::flaws_m0, h_checkpoint_flaws_m0);
         }
 
+        if (checkpoint && adaptive_fmm_depth_checkpoint_requested(config_))
+            std::filesystem::remove(adaptive_fmm_depth_checkpoint_sidecar_path(filepath));
         if (!write_unified_binary(filepath, output_state.particles,
                                   output_state, config_, checkpoint)) {
             free_particle_soa(output_state.particles);
             throw std::runtime_error("Failed writing multi-GPU snapshot: " + filepath);
         }
-        if (checkpoint) write_sph_stage_checkpoint(filepath, output_state, config_);
+        if (checkpoint) {
+            write_sph_stage_checkpoint(filepath, output_state, config_);
+            write_respa_checkpoint_sidecar(filepath, output_state, config_);
+            save_common_depth_checkpoint(filepath, output_state);
+        }
         free_particle_soa(output_state.particles);
         if (checkpoint) {
             last_checkpoint_step_ = gpu_states_[0].local_state.current_step;
+            checkpoint_cadence_step_ = last_checkpoint_step_;
             std::cout << "Checkpoint saved: " << filepath << std::endl;
             return;
         }

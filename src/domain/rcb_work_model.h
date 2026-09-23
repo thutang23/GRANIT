@@ -5,6 +5,7 @@
 // deliberately represents active work only: phase-coordinator stalls are a
 // trigger/telemetry concern and must never become a spatial work coefficient.
 #include <array>
+#include <iosfwd>
 #include <atomic>
 #include <cstdint>
 #include <limits>
@@ -78,6 +79,8 @@ public:
     // class from declaring the active configuration calibrated.
     void set_enabled_keys(const std::vector<RCBWorkKey>& keys);
     void reset();
+    void save_checkpoint(std::ostream& out) const;
+    void restore_checkpoint(std::istream& in);
 
     // All entries must have the supplied epoch.  The caller is responsible for
     // collecting the per-GPU samples without introducing a new synchronization

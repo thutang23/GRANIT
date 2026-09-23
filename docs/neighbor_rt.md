@@ -25,8 +25,8 @@ neighbor:
 | `cuda` | Use the existing CUDA backend explicitly. |
 | `rt` | Require RT. An unsupported workload or unavailable RT implementation produces an error. |
 
-The backend option does not change `neighbor.method`. Its default remains
-`cll`; select `method: lbvh` to use the RT implementation. `auto` and `cuda`
+The backend option does not change `neighbor.method`. Its default is
+`lbvh`; select `method: lbvh` to use the RT implementation. `auto` and `cuda`
 also remain valid with `cll` and `direct`.
 
 An explicit `rt` request requires LBVH, `multigpu.enabled: false`,

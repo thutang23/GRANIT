@@ -1,6 +1,6 @@
 # SPH single and multi-GPU integration
 
-This integrates the earlier distributed SPH capabilities into production export `beb3d5150e177e2c387e85f02a8a6bcf7067f37c`. The updated EOS, stage controls, irreversible P-alpha law, continuous activation option, and six history fields remain in use.
+This records the earlier distributed SPH integration into production export `beb3d5150e177e2c387e85f02a8a6bcf7067f37c`. The updated EOS, stage controls, irreversible P-alpha law, continuous activation option, and six history fields remain in use. Current SPH additionally supports [RESPA and adaptive depth](SPH_RESPA.md); its separate [release validation](Release_Defaults_Validation.md) does not replace the historical results below.
 
 ## Corrections
 
@@ -12,7 +12,9 @@ Wide Weibull coefficients use double storage and logarithmic interval constructi
 
 ## Build and supported scope
 
-Use CUDA 12.1 explicitly:
+The original integration validation used the following explicit CUDA 12.1/FP64
+build. The current production defaults use TF32 M2L and select FP64 compact SPH
+P2P automatically within the default FP32-P2P build.
 
 ```bash
 cmake -S . -B build-sph \
@@ -24,7 +26,14 @@ cmake -S . -B build-sph \
 cmake --build build-sph --target granit_sph granit_multigpu -j12
 ```
 
-Distributed SPH gravity requires isolated geometry, fixed FMM depth, CUDA neighbors, ordinary gravity cadence, `multigpu.morton_ownership: true`, cutoff at least two, and halo factor at least one. Smoothing bounds must be finite and ordered; imported lengths must meet the configured lower bound. The runtime rejects a compact correction scale with `h_max/epsilon > 128`. Single-GPU fixed and symmetry boundaries remain single-GPU features. Periodic SPH and adaptive FMM depth are outside this distributed SPH configuration.
+Distributed SPH gravity requires isolated geometry, CUDA neighbors,
+`multigpu.morton_ownership: true`, kernel cutoff at least two, and halo factor
+at least one. Fixed and adaptive FMM depths are supported, with RESPA=2 and
+adaptive depth selected by default. Smoothing bounds must be finite and ordered;
+imported lengths must meet the configured lower bound. The runtime rejects a
+compact correction scale with `h_max/epsilon > 128`; adaptive depth enforces a
+physical ceiling. Fixed and symmetry boundaries remain single-GPU features.
+Periodic SPH remains outside this distributed configuration.
 
 ## Verification
 

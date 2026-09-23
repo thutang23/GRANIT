@@ -3,8 +3,38 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <istream>
+#include <ostream>
+#include <stdexcept>
 
 namespace cudadem {
+
+void RCBWorkCalibrator::save_checkpoint(std::ostream& out) const {
+    const uint32_t count=kKeyCount;
+    out.write(reinterpret_cast<const char*>(&count),sizeof(count));
+    out.write(reinterpret_cast<const char*>(&ema_alpha_),sizeof(ema_alpha_));
+    for (size_t i=0; i<kKeyCount; ++i) {
+        const uint8_t flags[2]={uint8_t(coefficients_[i].initialized),uint8_t(enabled_keys_[i])};
+        out.write(reinterpret_cast<const char*>(&coefficients_[i].value),sizeof(double));
+        out.write(reinterpret_cast<const char*>(flags),sizeof(flags));
+    }
+    if (!out) throw std::runtime_error("Cannot save load-balance calibration");
+}
+void RCBWorkCalibrator::restore_checkpoint(std::istream& in) {
+    uint32_t count=0; in.read(reinterpret_cast<char*>(&count),sizeof(count));
+    in.read(reinterpret_cast<char*>(&ema_alpha_),sizeof(ema_alpha_));
+    if (!in || count!=kKeyCount || !std::isfinite(ema_alpha_) || !(ema_alpha_>0) || ema_alpha_>1)
+        throw std::runtime_error("Invalid load-balance calibration checkpoint");
+    for (size_t i=0; i<kKeyCount; ++i) {
+        uint8_t flags[2]{};
+        in.read(reinterpret_cast<char*>(&coefficients_[i].value),sizeof(double));
+        in.read(reinterpret_cast<char*>(flags),sizeof(flags));
+        if (!in || flags[0]>1 || flags[1]>1 || !std::isfinite(coefficients_[i].value) ||
+            (flags[0] && !(coefficients_[i].value>0)))
+            throw std::runtime_error("Invalid load-balance coefficient");
+        coefficients_[i].initialized=flags[0]; enabled_keys_[i]=flags[1];
+    }
+}
 
 const char* to_string(RCBCostModel value) {
     return value == RCBCostModel::Legacy ? "legacy" : "adaptive";

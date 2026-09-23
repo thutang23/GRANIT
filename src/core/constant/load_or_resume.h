@@ -248,10 +248,19 @@ inline void write_sph_stage_checkpoint(const std::string& path, const Simulation
     std::filesystem::rename(temporary, sidecar);
 }
 
+inline std::string sph_respa_signature(const SimConfig& config) {
+    std::ostringstream out;
+    out << std::setprecision(17) << "SPH_EQUAL_MACRO_V1 " << config.acceleration.gravity_update_rate
+        << ' ' << config.acceleration.gravity_macro_dt << ' ' << config.acceleration.enable_self_gravity
+        << ' ' << static_cast<int>(config.acceleration.gravity_method)
+        << ' ' << config.sph.cfl_number << ' ' << config.sph.dt_min << ' ' << config.sph.dt_max;
+    return out.str();
+}
+
 inline bool respa_checkpoint_requested(const SimConfig& config) {
-    return config.acceleration.enable_self_gravity &&
+    return config.physics == SimulationPhysics::SPH || (config.acceleration.enable_self_gravity &&
         (config.acceleration.gravity_update_rate > 1 ||
-         config.acceleration.gravity_macro_dt > 0.0);
+         config.acceleration.gravity_macro_dt > 0.0));
 }
 
 inline std::string respa_checkpoint_sidecar_path(const std::string& checkpoint_path) {
@@ -263,25 +272,31 @@ inline void write_respa_checkpoint_sidecar(
     const SimConfig& config) {
     if (!respa_checkpoint_requested(config)) return;
     const RespaSynchronizedCheckpointHeader header{
-        {'R','S','P','A','S','Y','N','C'}, 1, state.current_step, state.current_time};
+        {'R','S','P','A','S','Y','N','C'}, config.physics == SimulationPhysics::SPH ? 2u : 1u, state.current_step, state.current_time};
     const std::string path = respa_checkpoint_sidecar_path(checkpoint_path);
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     if (!file) throw std::runtime_error("Cannot write RESPA synchronization sidecar: " + path);
     file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    if (config.physics == SimulationPhysics::SPH) file << sph_respa_signature(config) << '\n';
     if (!file) throw std::runtime_error("Failed writing RESPA synchronization sidecar: " + path);
 }
 
 inline bool valid_respa_checkpoint_sidecar(
     const std::string& checkpoint_path, int64_t expected_step,
-    double expected_time) {
+    double expected_time, const SimConfig& config) {
     RespaSynchronizedCheckpointHeader header{};
     const std::string path = respa_checkpoint_sidecar_path(checkpoint_path);
     std::ifstream file(path, std::ios::binary);
     file.read(reinterpret_cast<char*>(&header), sizeof(header));
     const char magic[8] = {'R','S','P','A','S','Y','N','C'};
-    return file && std::memcmp(header.magic, magic, sizeof(magic)) == 0 &&
-        header.version == 1 && header.step == expected_step &&
-        header.time == expected_time;
+    bool valid = file && std::memcmp(header.magic, magic, sizeof(magic)) == 0 &&
+        header.version == (config.physics == SimulationPhysics::SPH ? 2u : 1u) &&
+        header.step == expected_step && header.time == expected_time;
+    if (valid && config.physics == SimulationPhysics::SPH) {
+        std::string signature;
+        valid = bool(std::getline(file, signature)) && signature == sph_respa_signature(config);
+    }
+    return valid && file.peek() == std::char_traits<char>::eof();
 }
 
 // A shear checkpoint is resumable only at a closed kick--exact-Hill--kick
@@ -336,7 +351,7 @@ inline bool has_adaptive_fmm_depth_checkpoint_sidecar(
     const char expected_magic[8] = {'A','F','M','M','D','P','T','H'};
     return file.read(reinterpret_cast<char*>(&header), sizeof(header)) &&
         std::memcmp(header.magic, expected_magic, sizeof(expected_magic)) == 0 &&
-        header.version == 2 && header.payload_size > 0;
+        (header.version == 2 || header.version == 3) && header.payload_size > 0;
 }
 
 inline uint32_t adaptive_fmm_depth_checkpoint_sidecar_version(
@@ -452,7 +467,7 @@ inline std::string get_latest_checkpoint_path(const SimConfig& config) {
                     checkpoint.read(reinterpret_cast<char*>(&header), sizeof(header));
                     if (!checkpoint || !valid_respa_checkpoint_sidecar(
                             entry.path().string(), header.current_step,
-                            header.current_time)) {
+                            header.current_time, config)) {
                         found_unsynchronized_respa_checkpoint = true;
                         continue;
                     }
@@ -606,7 +621,7 @@ inline SimulationState load_checkpoint(const std::string& filepath,
         UnifiedHeader header{};
         checkpoint.read(reinterpret_cast<char*>(&header), sizeof(header));
         if (!checkpoint || !valid_respa_checkpoint_sidecar(
-                filepath, header.current_step, header.current_time)) {
+                filepath, header.current_step, header.current_time, config)) {
             throw std::runtime_error(
                 "Legacy or incomplete RESPA checkpoint is not synchronized; restart from "
                 "an ordinary particle output or a checkpoint written by the corrected integrator");

@@ -12,5 +12,5 @@ struct SimConfig;
 // tree's leaf width, not a static input box or requested adaptive depth.
 double sph_gravity_regularization_length(const SimConfig& config, cudaStream_t stream);
 void add_sph_gravity_softening_correction(
-    SimulationState& state, const SimConfig& config, cudaStream_t stream);
+    SimulationState& state, const SimConfig& config, cudaStream_t stream, bool outer = false);
 }

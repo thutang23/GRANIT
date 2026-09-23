@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <mutex>
+#include <iosfwd>
 #include <string>
 #include <vector>
 
@@ -97,6 +98,9 @@ public:
     static constexpr int32_t kMaxGpus = 8;
     static constexpr int32_t kMailboxSlots = 32;
     static constexpr size_t kDiagnosticCapacity = 256;
+
+    void save_checkpoint(std::ostream& output) const;
+    void restore_checkpoint(std::istream& input, const AdaptiveDepthConfig& config);
 
     bool initialize(const AdaptiveDepthConfig& config, int32_t gpu_count,
                     const std::vector<int32_t>& initial_depths);

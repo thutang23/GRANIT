@@ -2,6 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <istream>
+#include <ostream>
+#include <stdexcept>
+#include <type_traits>
 
 namespace cudadem {
 namespace {
@@ -548,4 +552,106 @@ int32_t DistributedFMMDepthController::candidate_for_locked(int32_t gpu) const {
     return std::max(config_.min_depth, std::min(raw, state.effective_max_depth));
 }
 
+
+namespace {
+template<class T> void depth_write(std::ostream& out, const T& value) {
+    static_assert(std::is_trivially_copyable<T>::value);
+    out.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    if (!out) throw std::runtime_error("Cannot write distributed depth checkpoint");
+}
+template<class T> void depth_read(std::istream& in, T& value) {
+    static_assert(std::is_trivially_copyable<T>::value);
+    in.read(reinterpret_cast<char*>(&value), sizeof(value));
+    if (!in) throw std::runtime_error("Truncated distributed depth checkpoint");
+}
+}
+void DistributedFMMDepthController::save_checkpoint(std::ostream& out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_ || frozen_) throw std::runtime_error("Cannot checkpoint an inactive/frozen depth controller");
+    depth_write(out, gpu_count_);
+    depth_write(out, initialized_);
+    depth_write(out, frozen_);
+    depth_write(out, last_processed_epoch_);
+    depth_write(out, discarded_before_epoch_);
+    depth_write(out, next_trial_id_);
+    depth_write(out, active_trial_id_);
+    depth_write(out, active_owner_);
+    depth_write(out, next_owner_);
+    depth_write(out, phase_);
+    depth_write(out, warmups_remaining_);
+    depth_write(out, phase_samples_);
+    depth_write(out, samples_a_);
+    depth_write(out, samples_b_);
+    depth_write(out, total_a_);
+    depth_write(out, total_b_);
+    depth_write(out, next_sequence_);
+    depth_write(out, dropped_diagnostics_);
+
+    for (int g=0; g<gpu_count_; ++g) {
+        depth_write(out, gpu_states_[g]);
+        depth_write(out, uint8_t(initial_depth_ready_[g]));
+        depth_write(out, uint8_t(stable_count_valid_[g]));
+    }
+    for (const auto& slot : mailbox_) {
+        depth_write(out, slot.epoch);
+        for (int g=0; g<gpu_count_; ++g) {
+            depth_write(out, slot.timings[g]); depth_write(out, uint8_t(slot.present[g]));
+        }
+    }
+    depth_write(out, uint32_t(diagnostics_.size()));
+    for (const auto& diagnostic : diagnostics_) depth_write(out, diagnostic);
+}
+void DistributedFMMDepthController::restore_checkpoint(std::istream& in, const AdaptiveDepthConfig& config) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    config_ = config;
+    depth_read(in, gpu_count_);
+    depth_read(in, initialized_);
+    depth_read(in, frozen_);
+    depth_read(in, last_processed_epoch_);
+    depth_read(in, discarded_before_epoch_);
+    depth_read(in, next_trial_id_);
+    depth_read(in, active_trial_id_);
+    depth_read(in, active_owner_);
+    depth_read(in, next_owner_);
+    depth_read(in, phase_);
+    depth_read(in, warmups_remaining_);
+    depth_read(in, phase_samples_);
+    depth_read(in, samples_a_);
+    depth_read(in, samples_b_);
+    depth_read(in, total_a_);
+    depth_read(in, total_b_);
+    depth_read(in, next_sequence_);
+    depth_read(in, dropped_diagnostics_);
+
+    if (!config.enabled || !initialized_ || frozen_ || gpu_count_<1 || gpu_count_>kMaxGpus ||
+        active_owner_ < -1 || active_owner_ >= gpu_count_ || next_owner_<0 || next_owner_>=gpu_count_ ||
+        static_cast<unsigned>(phase_)>3 || warmups_remaining_<0 || !next_sequence_)
+        throw std::runtime_error("Invalid distributed depth controller checkpoint");
+    gpu_states_.resize(gpu_count_); initial_depth_ready_.resize(gpu_count_); stable_count_valid_.resize(gpu_count_);
+    for (int g=0; g<gpu_count_; ++g) {
+        depth_read(in, gpu_states_[g]); uint8_t ready, valid;
+        depth_read(in, ready); depth_read(in, valid);
+        initial_depth_ready_[g]=ready; stable_count_valid_[g]=valid;
+        const auto& state = gpu_states_[g];
+        if (ready>1 || valid>1 || state.selected_depth<config.min_depth ||
+            state.selected_depth>config.max_depth || state.effective_max_depth<config.min_depth ||
+            state.effective_max_depth>config.max_depth || state.candidate_depth<config.min_depth ||
+            state.candidate_depth>config.max_depth)
+            throw std::runtime_error("Invalid checkpoint depth range");
+    }
+    mailbox_.resize(kMailboxSlots);
+    for (auto& slot : mailbox_) {
+        depth_read(in, slot.epoch); slot.timings.resize(gpu_count_); slot.present.resize(gpu_count_);
+        for (int g=0; g<gpu_count_; ++g) {
+            depth_read(in, slot.timings[g]); uint8_t present; depth_read(in, present);
+            if (present>1) throw std::runtime_error("Invalid checkpoint mailbox");
+            slot.present[g]=present;
+        }
+    }
+    uint32_t count; depth_read(in, count);
+    if (count>kDiagnosticCapacity) throw std::runtime_error("Invalid checkpoint diagnostic count");
+    diagnostics_.resize(count);
+    for (auto& diagnostic : diagnostics_) depth_read(in, diagnostic);
+    failure_reason_.clear();
+}
 }  // namespace cudadem
