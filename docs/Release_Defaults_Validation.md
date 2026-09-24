@@ -168,3 +168,68 @@ expired during cold driver compilation; repeating with `--timeout 900`
 completed. Accuracy gates were unchanged. This checks PTX execution on the
 available Ada hardware; it does not validate Blackwell or other physical GPU
 families.
+
+## CUDA 12.1 / 13.2 compatibility, 2026-09-24
+
+The shared source now builds with both CUDA 12.1.105 and CUDA 13.2.86.
+Compatibility changes replace the removed CUB min/max functors with the same
+comparison operations, replace the CUB counting iterator with Thrust's iterator,
+and remove two redundant legacy texture-header includes. The texture-object
+implementation, solver algorithms and precision defaults remain intact.
+
+All three solvers were built in Release for SM80, with MPI, pinned OptiX 8.0
+headers and `BUILD_TESTING=ON`. The host was Ubuntu 24.04 with four NVIDIA A100
+SM80 GPUs and driver 595.91.07. CUDA 13.2 used GCC 13.3; the isolated CUDA 12.1
+compiler used GCC 12.4 as its CUDA host compiler. CMake 3.31.10 drove the builds.
+CUDA 12.1 components were extracted under `/tmp` from NVIDIA's redistribution
+archives after checking their published SHA-256 values; the system toolkit was
+not replaced.
+
+| Check | CUDA 12.1 | CUDA 13.2 |
+| --- | --- | --- |
+| DEM, SPH and multi-GPU executables, including OptiX PTX | Pass | Pass |
+| Existing CTest regressions | 3/3 pass | 3/3 pass |
+| Full SPH RESPA / gravity / restart matrix | 72 checks, 50 invocations pass | 72 checks, 50 invocations pass |
+| Cached SPH LBVH versus direct, both density modes | Pass | Pass |
+| Overlapping DEM contacts: direct, LBVH and CLL | Pass | Pass |
+| DEM single-GPU smoke and force gates | Pass | Pass |
+| DEM two-GPU force gate | Existing failure reproduced | Same failure reproduced |
+
+The contact fixture used 12 particles with three separated overlapping pairs,
+empty owners between pairs, and four steps. LBVH and CLL matched direct-neighbor
+velocities; all six isolated particles remained stationary. This exercises the
+owner-offset suffix scan that the non-contacting release smoke does not cover.
+The cached SPH replay used the existing `replay_sph_backends.py --skip-rt` checks.
+
+Both toolkits produced the same two-GPU DEM relative L2 error,
+`0.0022199877461741265` (0.2219988%), above the unchanged 0.2% gate. All net-force
+and net-torque gates passed. The smoke command therefore exits 1 on both builds;
+this compatibility change does not resolve or hide the previously recorded
+accuracy failure.
+
+Fresh CMake configurations and reconfiguration verified these defaults:
+
+- CUDA 12.1: `70;75;80;86;87;89;90`; OptiX PTX uses `compute_70`.
+- CUDA 13.2: `75;80;86;87;89;90`; OptiX PTX uses `compute_75`.
+- Explicit `CMAKE_CUDA_ARCHITECTURES=80` wins over `CUDAARCHS=75`, and an
+  environment-only `CUDAARCHS=75` is preserved, under both toolkits.
+- A CUDA 13.2 toolchain-file selection of `86` is preserved. Explicit `70`
+  fails with the compiler's unsupported-architecture error rather than being
+  silently removed.
+- The final CUDA 13.2 defaults also configure with the declared minimum CMake
+  3.18.4. Final reconfiguration of both SM80 builds reports no work remaining.
+
+These checks compiled the full solvers for SM80; the wider portable lists were
+configuration checks, not full multi-architecture solver builds. Volta, Turing,
+Ada, Hopper and Blackwell hardware execution was not tested in this audit.
+The OptiX-enabled executables correctly selected CUDA fallback on A100 because
+it has no RT cores. OptiX RT execution and its runtime PTX compilation still need
+an RT-capable GPU. Other CUDA 12.x minor releases were not tested here.
+
+Local, uncommitted receipts are under `/tmp/granit-build-{12.1,13.2}`,
+`/tmp/granit-smoke-{12.1,13.2}/validation.json`,
+`/tmp/granit-sph-respa-{12.1,13.2}/report.json`,
+`/tmp/granit-sph-cache-{12.1,13.2}/result.json`, and
+`/tmp/granit-contacts-{12.1,13.2}/report.json`.
+The configuration matrix is `/tmp/granit-architecture-validation.json`;
+build/configure logs and the isolated build environment are also under `/tmp`.
