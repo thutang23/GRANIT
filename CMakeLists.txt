@@ -1,9 +1,25 @@
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
-# Set architectures before project() initializes CUDA's compiler default.
+# Load toolchain-file settings before deciding whether GPU targets were supplied.
+project(GRANIT VERSION 1.0.0 LANGUAGES CXX)
+set(_granit_default_cuda_architectures OFF)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
-    set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;87;89;90" CACHE STRING "CUDA architectures")
+    set(_granit_default_cuda_architectures ON)
 endif()
-project(GRANIT VERSION 1.0.0 LANGUAGES CXX CUDA)
+# Let CUDA initialize with its supported compiler default, then choose our
+# portable targets once the compiler version is known.
+enable_language(CUDA)
+
+if(_granit_default_cuda_architectures)
+    set(_granit_cuda_architectures "75;80;86;87;89;90")
+    # CUDA 13 removed Volta code generation; keep it in CUDA 12 builds.
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS "13.0")
+        list(PREPEND _granit_cuda_architectures 70)
+    endif()
+    set(CMAKE_CUDA_ARCHITECTURES "${_granit_cuda_architectures}" CACHE STRING
+        "CUDA architectures" FORCE)
+    unset(_granit_cuda_architectures)
+endif()
+unset(_granit_default_cuda_architectures)
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)

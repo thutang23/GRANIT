@@ -41,6 +41,13 @@
 namespace cudadem {
 namespace lbvh {
 
+// Preserve the former cub::Max comparison, including ties and NaNs.
+struct DisplacementMaximum {
+    __host__ __device__ float operator()(float a, float b) const {
+        return b > a ? b : a;
+    }
+};
+
 // =============================================================================
 // Morton Code Utilities (for LBVH)
 // =============================================================================
@@ -123,7 +130,7 @@ __global__ void lbvh_verlet_displacement_kernel(
     }
     typedef cub::BlockReduce<float, 256> BlockReduceT;
     __shared__ typename BlockReduceT::TempStorage temp_storage;
-    float block_max = BlockReduceT(temp_storage).Reduce(my_disp_sq, cub::Max());
+    float block_max = BlockReduceT(temp_storage).Reduce(my_disp_sq, DisplacementMaximum{});
     if (threadIdx.x == 0) {
         int32_t int_val = __float_as_int(block_max);
         atomicMax(max_disp_sq_scaled, int_val);
@@ -172,7 +179,7 @@ __global__ void lbvh_current_cache_displacement_kernel(
     }
     using Reduce = cub::BlockReduce<float, 256>;
     __shared__ typename Reduce::TempStorage storage;
-    const float block_max = Reduce(storage).Reduce(displacement_sq, cub::Max());
+    const float block_max = Reduce(storage).Reduce(displacement_sq, DisplacementMaximum{});
     if (threadIdx.x == 0) atomicMax(max_disp_bits, __float_as_int(block_max));
 }
 

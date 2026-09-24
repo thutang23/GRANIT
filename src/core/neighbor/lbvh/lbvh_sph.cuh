@@ -100,7 +100,7 @@ __global__ void sph_cache_motion_kernel(
   }
   using Reduce = cub::BlockReduce<float, 256>;
   __shared__ typename Reduce::TempStorage storage;
-  const float block_max = Reduce(storage).Reduce(bound_sq, cub::Max());
+  const float block_max = Reduce(storage).Reduce(bound_sq, DisplacementMaximum{});
   if (threadIdx.x == 0) atomicMax(max_motion_bits, __float_as_int(block_max));
 }
 

@@ -2,7 +2,6 @@
 #define CUDADEM_LINEAR_INTERPOLATION_CUH
 
 #include <cuda_runtime.h>
-#include <cuda_texture_types.h>
 #include <cstdint>
 #include <stdexcept>
 #include <iostream>

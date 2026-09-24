@@ -56,11 +56,15 @@ function(granit_target_optix target)
         file(GLOB _rt_headers CONFIGURE_DEPENDS
             "${_granit_root}/src/core/neighbor/rt/*.h"
             "${_granit_root}/src/core/neighbor/rt/*.cuh")
+        set(_optix_compute_arch 70)
+        if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0")
+            set(_optix_compute_arch 75)
+        endif()
         add_custom_command(
             OUTPUT "${_ptx_header}"
             BYPRODUCTS "${_ptx}"
             COMMAND "${CMAKE_CUDA_COMPILER}" --ptx --std=c++17
-                --gpu-architecture=compute_70 --fmad=true
+                --gpu-architecture=compute_${_optix_compute_arch} --fmad=true
                 "$<$<CONFIG:Release>:--use_fast_math>"
                 --expt-relaxed-constexpr --extended-lambda
                 ${_host_compiler_args} ${_dependency_args}

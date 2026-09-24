@@ -697,7 +697,7 @@ __global__ void karras_particle_leaf_map_kernel(PersistentTreeContext* ctx) {
 size_t karras_unique_selection_scratch_bytes(int particle_capacity) {
     size_t bytes = 0;
     CUDA_CHECK(cub::DeviceSelect::If(
-        nullptr, bytes, cub::CountingInputIterator<int>(0),
+        nullptr, bytes, thrust::counting_iterator<int>(0),
         static_cast<int*>(nullptr), static_cast<int*>(nullptr),
         particle_capacity, KarrasUniqueRunStart{nullptr}));
     return bytes;
@@ -866,7 +866,7 @@ void capture_karras_tree_stages(PersistentTreeRuntime& runtime,
     karras_phase_marker_kernel<<<1, 1, 0, stream>>>(ctx, 9);
     CUDA_CHECK(cub::DeviceSelect::If(
         runtime.edge_scan_temp, runtime.edge_scan_temp_bytes,
-        cub::CountingInputIterator<int>(0), hc.workspace.unique_offsets,
+        thrust::counting_iterator<int>(0), hc.workspace.unique_offsets,
         &ctx->metadata.num_unique_cells, hc.particle_capacity,
         KarrasUniqueRunStart{ctx}, stream));
     karras_compact_unique_cells_kernel<<<particle_blocks, KARRAS_BLOCK, 0, stream>>>(ctx);

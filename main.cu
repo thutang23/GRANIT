@@ -70,6 +70,13 @@
 
 namespace cudadem {
 
+// Keep the integer suffix-min scan compatible with both CUB 2 and CUB 3.
+struct OwnerOffsetMinimum {
+    __host__ __device__ int32_t operator()(int32_t a, int32_t b) const {
+        return b < a ? b : a;
+    }
+};
+
 __device__ __forceinline__ void respa_rotate_vector(
     double qw, double qx, double qy, double qz,
     double vx, double vy, double vz,
@@ -314,7 +321,7 @@ static int32_t sort_contacts_by_owner(
     CUDA_CHECK(cub::DeviceScan::InclusiveScan(
         d_cub_temp_storage, cub_temp_storage_bytes,
         d_reversed_owner_offsets, d_reversed_owner_offsets,
-        cub::Min(), offset_count, stream));
+        OwnerOffsetMinimum{}, offset_count, stream));
     LAUNCH_KERNEL(reverse_copy_offsets_kernel, num_blocks_reverse, block_size, 0, stream,
         d_reversed_owner_offsets, d_owner_offsets, offset_count);
 #else
@@ -1062,7 +1069,7 @@ public:
         CUDA_CHECK(cub::DeviceScan::InclusiveScan(
             nullptr, owner_scan_temp_bytes,
             static_cast<int32_t*>(nullptr), static_cast<int32_t*>(nullptr),
-            cub::Min(), state_.particles.num_particles + 1, compute_stream_));
+            OwnerOffsetMinimum{}, state_.particles.num_particles + 1, compute_stream_));
         contact_sort_temp_bytes_ = std::max(radix_sort_temp_bytes, owner_scan_temp_bytes);
         CUDA_CHECK(cudaMalloc(&d_contact_sort_temp_, contact_sort_temp_bytes_));
 #endif
@@ -1762,7 +1769,7 @@ public:
             CUDA_CHECK(cub::DeviceScan::InclusiveScan(
                 nullptr, owner_scan_temp_bytes,
                 static_cast<int32_t*>(nullptr), static_cast<int32_t*>(nullptr),
-                cub::Min(), state_.particles.num_particles + 1, compute_stream_));
+                OwnerOffsetMinimum{}, state_.particles.num_particles + 1, compute_stream_));
             contact_sort_temp_bytes_ = std::max(radix_sort_temp_bytes, owner_scan_temp_bytes);
             CUDA_CHECK(cudaMalloc(&d_contact_sort_temp_, contact_sort_temp_bytes_));
 #else
