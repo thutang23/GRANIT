@@ -193,62 +193,7 @@ __global__ void lbvh_capture_cache_particles_kernel(
         float(pos_x[i]), float(pos_y[i]), float(pos_z[i])};
 }
 
-// 1. Compute leaf AABBs from spheres
-__global__ void lbvh_compute_aabbs_kernel(const double *__restrict__ pos_x,
-                                          const double *__restrict__ pos_y,
-                                          const double *__restrict__ pos_z,
-                                          const float *__restrict__ radius,
-                                          LBVHAABB *__restrict__ aabbs,
-                                          int32_t num_particles,
-                                          int32_t internal_offset) {
-  int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= num_particles)
-    return;
-
-  float px = static_cast<float>(pos_x[idx]);
-  float py = static_cast<float>(pos_y[idx]);
-  float pz = static_cast<float>(pos_z[idx]);
-  float r = radius[idx];
-
-  LBVHAABB box;
-  box.lower = make_float4(px - r, py - r, pz - r, 0.0f);
-  box.upper = make_float4(px + r, py + r, pz + r, 0.0f);
-
-  // Leaves are stored at indices [internal_offset, 2N-2]
-  aabbs[internal_offset + idx] = box;
-}
-
-// Fast-path: refresh leaf AABBs with skin inflation
-// NOTE: Leaf AABBs are stored in Morton-sorted order, so we must use sorted_indices
-// to look up the correct particle position for each leaf.
-__global__ void lbvh_refresh_leaf_aabbs_kernel(
-    const double* __restrict__ pos_x,
-    const double* __restrict__ pos_y,
-    const double* __restrict__ pos_z,
-    const float*  __restrict__ radius,
-    const uint32_t* __restrict__ sorted_indices,
-    LBVHAABB*     __restrict__ aabbs,
-    int32_t num_particles,
-    int32_t internal_offset,
-    float   skin_half)
-{
-    int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_particles) return;
-
-    // idx is the sorted position; sorted_indices[idx] gives the original particle index
-    uint32_t orig_idx = sorted_indices[idx];
-    
-    float px = static_cast<float>(pos_x[orig_idx]);
-    float py = static_cast<float>(pos_y[orig_idx]);
-    float pz = static_cast<float>(pos_z[orig_idx]);
-    float r  = radius[orig_idx] + skin_half;
-
-    LBVHAABB box;
-    box.lower = make_float4(px - r, py - r, pz - r, 0.0f);
-    box.upper = make_float4(px + r, py + r, pz + r, 0.0f);
-
-    aabbs[internal_offset + idx] = box;
-}
+#include "lbvh_leaf_bounds.cuh"
 
 // Write per-particle squared displacement from float snapshot into scratch
 __global__ void lbvh_displacement_check_kernel(
@@ -1669,11 +1614,13 @@ void LBVHSearchImpl::rebuild(SimulationState &state, const SimConfig &config,
 
   // 1. Compute leaf AABBs
   // DEM support_extent includes the material-row maximum cohesive cutoff;
-  // SPH already stores its kernel extent there.
+  // SPH stores full K*h for halo exchange, but each tree leaf needs only
+  // half of that extent: the pair support is K*(hi+hj)/2.
   const float* aabb_extent = state.particles.support_extent;
+  const float extent_scale = config.physics == SimulationPhysics::SPH ? 0.5f : 1.0f;
   lbvh_compute_aabbs_kernel<<<blocks_N, threads, 0, stream>>>(
       state.particles.pos_x, state.particles.pos_y, state.particles.pos_z,
-      aabb_extent, gpu_state.aabbs, N, num_internal);
+      aabb_extent, gpu_state.aabbs, N, num_internal, extent_scale);
 
   // 2. Reduce bounds entirely on the device. Morton generation consumes this
   // result on the same stream, so no host readback/allocation barrier is needed.
@@ -1708,7 +1655,8 @@ void LBVHSearchImpl::rebuild(SimulationState &state, const SimConfig &config,
   // arrays. Reading the old leaf array here would require permutation scratch.
   lbvh_refresh_leaf_aabbs_kernel<<<blocks_N, threads, 0, stream>>>(
       state.particles.pos_x, state.particles.pos_y, state.particles.pos_z,
-      aabb_extent, gpu_state.sorted_indices, gpu_state.aabbs, N, num_internal, 0.0f);
+      aabb_extent, gpu_state.sorted_indices, gpu_state.aabbs, N, num_internal,
+      0.0f, extent_scale);
 
   // 4. Construct leaf nodes
   lbvh_construct_leaves_kernel<<<blocks_N, threads, 0, stream>>>(
@@ -1994,7 +1942,8 @@ void LBVHSearchImpl::find_contacts(SimulationState &state,
     lbvh_refresh_leaf_aabbs_kernel<<<blocks_N, threads, 0, stream>>>(
         state.particles.pos_x, state.particles.pos_y, state.particles.pos_z,
         aabb_extent, gpu_state.sorted_indices, gpu_state.aabbs,
-        N, num_internal, skin_half);
+        N, num_internal, skin_half,
+        config.physics == SimulationPhysics::SPH ? 0.5f : 1.0f);
 
     // Reset atomic flags before re-propagation
     CUDA_CHECK(cudaMemsetAsync(gpu_state.atomic_flags, 0,

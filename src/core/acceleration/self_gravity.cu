@@ -42,6 +42,7 @@
 #include "../sph/sph_gravity_correction.h"
 #include "../sph/sph_physics.h"
 #include "../sph/sph_neighbor_query.cuh"
+#include "../neighbor/lbvh/lbvh_manager.h"
 #include "../particle_model/clump.h"
 #include "body_fitted_fmm/clump_p3_gravity.cuh"
 #include "body_fitted_fmm/clump_gravity_body_view.cuh"
@@ -102,6 +103,11 @@ void add_sph_gravity_softening_correction(
     if (!n) return;
     if (compute_sph_h_min(state, n, stream) < config.sph.hsml_min)
         throw std::runtime_error("SPH FMM requires imported smoothing lengths >= hsml_min");
+    // The single-GPU hydro tree predates this stage's smoothing-length update.
+    // Multi-GPU already rebuilds after its post-force halo refresh.
+    if (!config.multigpu.enabled &&
+        state.neighbor.active_method == NeighborMethod::LBVH)
+        lbvh::LBVHSearchImpl::refresh_sph_bounds(state, stream);
     const double epsilon = sph_gravity_regularization_length(config, stream);
     // Subtracting large baseline forces can erase the softened force even in
     // FP64. Reject a poorly scaled baseline instead of silently losing it.
