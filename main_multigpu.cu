@@ -574,6 +574,11 @@ private:
     // Phase 4: Per-GPU pinned memory + events for async contact count readback
     std::vector<int32_t*> h_pinned_num_contacts_;   // One pinned int32 per GPU
     std::vector<uint64_t*> h_pinned_sph_owned_degrees_; // One pinned scalar per GPU/timing slot
+    // The hydro CSR is invalid after the gravity halo/tree refresh.  Keep its
+    // owned-row prefix for the work balancer without retaining neighbor indices.
+    std::vector<uint64_t*> d_sph_hydro_owned_offsets_;
+    std::vector<size_t> sph_hydro_offset_capacities_;
+    std::vector<int> sph_hydro_offsets_valid_;
     std::vector<cudaEvent_t> contact_count_events_;  // One event per GPU
     std::vector<bool> contact_count_ready_;           // Whether async copy completed
 
@@ -951,6 +956,9 @@ public:
         morton_root_.initialize(num_gpus_);
         morton_balance_.initialize(num_gpus_);
         morton_work_collectors_.resize(num_gpus_);
+        d_sph_hydro_owned_offsets_.resize(num_gpus_, nullptr);
+        sph_hydro_offset_capacities_.resize(num_gpus_, 0);
+        sph_hydro_offsets_valid_.resize(num_gpus_, 0);
         common_metrics_.resize(num_gpus_);
         common_depth_ceilings_.resize(num_gpus_);
         common_work_totals_.resize(num_gpus_);
@@ -1094,6 +1102,11 @@ public:
 
             if (sph_mode_) {
                 initialize_sph_timestep(state.subdomain.capacity);
+                CUDA_CHECK(cudaMalloc(&d_sph_hydro_owned_offsets_[gpu_id],
+                                      (static_cast<size_t>(state.subdomain.capacity) + 1) *
+                                          sizeof(uint64_t)));
+                sph_hydro_offset_capacities_[gpu_id] =
+                    static_cast<size_t>(state.subdomain.capacity) + 1;
                 CUDA_CHECK(cudaMalloc(&sph_damage_workspaces_[gpu_id].qdot,
                                       static_cast<size_t>(state.subdomain.capacity) * sizeof(float)));
                 CUDA_CHECK(cudaMalloc(&sph_damage_workspaces_[gpu_id].qcap,
@@ -2265,6 +2278,7 @@ public:
                 nvtxRangePushA("Neighbor Search");
                 calibration_event(true, timing_slot,
                                   CalibrationSegment::NeighborSearch, stream);
+                sph_hydro_offsets_valid_[gpu_id] = 0;
                 if (num_total > 0) {
                     if (sph_mode_) {
                         // Halo membership changes every step, so rebuild the
@@ -2272,6 +2286,24 @@ public:
                         my_state.local_state.neighbor.num_particles = num_total;
                         NeighborSearch::find_sph_neighbors(
                             my_state.local_state, config_, stream);
+                        // Owner indices are stable through the later halo
+                        // refresh, while ghost membership and CSR indices are not.
+                        // Save only the degree prefix used by the balancer.
+                        if (my_state.local_state.neighbor.sph_adjacency_valid) {
+                            const size_t needed = static_cast<size_t>(num_local) + 1;
+                            if (needed > sph_hydro_offset_capacities_[gpu_id]) {
+                                CUDA_CHECK(cudaFree(d_sph_hydro_owned_offsets_[gpu_id]));
+                                sph_hydro_offset_capacities_[gpu_id] =
+                                    static_cast<size_t>(my_state.subdomain.capacity) + 1;
+                                CUDA_CHECK(cudaMalloc(&d_sph_hydro_owned_offsets_[gpu_id],
+                                    sph_hydro_offset_capacities_[gpu_id] * sizeof(uint64_t)));
+                            }
+                            CUDA_CHECK(cudaMemcpyAsync(d_sph_hydro_owned_offsets_[gpu_id],
+                                my_state.local_state.neighbor.sph_offsets,
+                                needed * sizeof(uint64_t),
+                                cudaMemcpyDeviceToDevice, stream));
+                            sph_hydro_offsets_valid_[gpu_id] = 1;
+                        }
                         if (timing_slot >= 0 && calibration_slot_sampled[timing_slot] &&
                             my_state.local_state.neighbor.sph_adjacency_valid) {
                             const size_t index = static_cast<size_t>(gpu_id) *
@@ -2451,7 +2483,10 @@ public:
                         num_total = num_local + my_state.subdomain.num_ghost_particles;
                         if (rebuild_support && num_total > 0) {
                             local.neighbor.num_particles = num_total;
-                            NeighborSearch::find_sph_neighbors(local, config_, stream);
+                            // Gravity's SPH correction traverses the current
+                            // tree directly.  Rebuild it for changed h and
+                            // ghosts without enumerating an unused second CSR.
+                            NeighborSearch::rebuild(local, config_, stream);
                         }
                         local.particles.num_particles = num_local;
                     };
@@ -2928,8 +2963,8 @@ public:
                         const auto* fmm_work=body_fitted_fmm::UnifiedFMMDispatcher::distributed_particle_work_device(work_count,units.data(),stream);
                         const auto* rows=morton_work_collectors_[gpu_id].collect_device(my_state,domain_params_,contacts_[gpu_id].pairs,
                             latest_contact_counts_[gpu_id],
-                            my_state.local_state.neighbor.sph_adjacency_valid
-                                ? my_state.local_state.neighbor.sph_offsets : nullptr,
+                            sph_hydro_offsets_valid_[gpu_id]
+                                ? d_sph_hydro_owned_offsets_[gpu_id] : nullptr,
                             sph_mode_,communicators_[gpu_id].halo_destination_mask(),stream);
                         if(work_count!=my_state.local_state.particles.num_local)throw std::runtime_error("stale common FMM work snapshot at repartition");
                         common_work_totals_[gpu_id]=units;
@@ -3088,10 +3123,8 @@ public:
                                     input.contact_pairs = contacts_[g].pairs;
                                     input.contact_pair_count = latest_contact_counts_[g];
                                     input.sph_mode = sph_mode_;
-                                    input.sph_offsets = sph_mode_ &&
-                                        gpu_states_[g].local_state.neighbor.sph_adjacency_valid
-                                            ? gpu_states_[g].local_state.neighbor.sph_offsets
-                                            : nullptr;
+                                    input.sph_offsets = sph_mode_ && sph_hydro_offsets_valid_[g]
+                                        ? d_sph_hydro_owned_offsets_[g] : nullptr;
                                     input.halo_destination_mask =
                                         reinterpret_cast<const uint32_t*>(
                                             communicators_[g].halo_destination_mask());
@@ -3796,6 +3829,10 @@ public:
             let_comms_[g].shutdown();
             NeighborSearch::free_contact_buffer(contacts_[g]);
             NeighborSearch::shutdown(gpu_states_[g].local_state);
+            if (g < static_cast<int>(d_sph_hydro_owned_offsets_.size())) {
+                cudaFree(d_sph_hydro_owned_offsets_[g]);
+                d_sph_hydro_owned_offsets_[g] = nullptr;
+            }
             if (sph_mode_) {
                 shutdown_sph_timestep();
                 shutdown_sph_strength_workspace();
@@ -3829,6 +3866,9 @@ public:
             if (pinned) cudaFreeHost(pinned);
         }
         h_pinned_sph_owned_degrees_.clear();
+        d_sph_hydro_owned_offsets_.clear();
+        sph_hydro_offset_capacities_.clear();
+        sph_hydro_offsets_valid_.clear();
         contact_count_events_.clear();
         contact_count_ready_.clear();
 

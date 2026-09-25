@@ -1617,6 +1617,8 @@ void LBVHSearchImpl::rebuild(SimulationState &state, const SimConfig &config,
   }
   // N <= 1: No tree to build (single particle = single leaf, no internal nodes)
   if (N <= 1) {
+    state.neighbor.num_particles = N;
+    state.neighbor.num_internal_nodes = 0;
     gpu_state.tracked_num_particles = N;
     gpu_state.tracked_num_local = num_local;
     return;

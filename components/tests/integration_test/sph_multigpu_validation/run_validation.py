@@ -247,6 +247,33 @@ def main():
                 raise AssertionError(f'gravity-fmm-gpu{ranks}: {check}')
             print(f'PASS gravity-fmm-gpu{ranks}: {relative:.6g}', flush=True)
 
+        # With evolving, unequal h across rank boundaries, gravity must use
+        # the newly rebuilt tree after the hydro CSR has been invalidated.
+        # Multiple steps exercise repeated halo membership refreshes.
+        _, changing_h_reference = run('gravity-variable-h-direct', 0,
+                                      source=edge_input, gravity='direct', steps=4)
+        _, changing_h_candidate = run('gravity-variable-h-four-gpu', 4,
+                                      source=edge_input, gravity='unified_fmm', steps=4)
+        initial_h = ordered(copy.deepcopy(edge)).smoothing_length
+        h_change = float(np.max(np.abs(
+            changing_h_candidate.smoothing_length.astype(np.float64) - initial_h)))
+        reference_gravity = changing_h_reference.gravity_acceleration
+        candidate_gravity = changing_h_candidate.gravity_acceleration
+        reference_norm = float(np.linalg.norm(reference_gravity))
+        reference_rms = reference_norm / np.sqrt(changing_h_reference.num_particles)
+        gravity_difference = candidate_gravity - reference_gravity
+        relative = float(np.linalg.norm(gravity_difference) / reference_norm)
+        maximum = float(np.max(np.linalg.norm(gravity_difference, axis=1)) / reference_rms)
+        check = {'relative_rms': relative, 'max_error_over_reference_rms': maximum,
+                 'max_smoothing_length_change': h_change,
+                 'relative_rms_limit': .01, 'max_error_limit': .05,
+                 'pass': h_change > 0 and relative <= .01 and maximum <= .05}
+        report['checks']['gravity-variable-h-four-gpu'] = check
+        save()
+        if not check['pass']:
+            raise AssertionError(f'gravity-variable-h-four-gpu: {check}')
+        print(f'PASS gravity-variable-h-four-gpu: {relative:.6g}', flush=True)
+
         # Spread particles across enough common-grid leaves to require far
         # routes; the compact fixture mainly exercises remote near-field pairs.
         far_input = work / 'far-field-input.bin'
