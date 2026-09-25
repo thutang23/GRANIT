@@ -138,9 +138,8 @@ void LBVHSearchImpl::find_sph_neighbors(SimulationState& state, const SimConfig&
   if (n < 0 || state.particles.num_local < 0 || state.particles.num_local > n)
     throw std::runtime_error("SPH LBVH invalid particle ownership layout");
   select_backend(gpu, state, config);
-  // Retain the existing distributed/image traversal paths outside phase one.
-  if (config.multigpu.enabled || state.particles.num_local != n ||
-      extract_pbc_config(config).is_enabled() || config.shear_box.enabled) {
+  // Periodic/image adjacency still needs a separate implementation.
+  if (extract_pbc_config(config).is_enabled() || config.shear_box.enabled) {
     rebuild(state, config, stream);
     return;
   }
@@ -162,11 +161,15 @@ void LBVHSearchImpl::find_sph_neighbors(SimulationState& state, const SimConfig&
     gpu.backend_timing_enabled = timing;
   }
   allocate_sph_storage(gpu);
-  const bool layout_changed = gpu.tracked_num_particles != n || gpu.tracked_num_local != n;
+  const bool distributed = config.multigpu.enabled || state.particles.num_local != n;
+  if (distributed) gpu.sph_cache_valid = false;
+  const bool layout_changed = gpu.tracked_num_particles != n ||
+                              gpu.tracked_num_local != state.particles.num_local;
   if (n <= 1) {
     CUDA_CHECK(cudaMemsetAsync(gpu.sph_offsets, 0, (size_t(n)+1)*sizeof(uint64_t), stream));
     gpu.sph_ready = gpu.sph_cache_valid = false;
-    gpu.tracked_num_particles = gpu.tracked_num_local = n;
+    gpu.tracked_num_particles = n;
+    gpu.tracked_num_local = state.particles.num_local;
     gpu.stats.num_contacts_found = 0;
     publish_sph_adjacency(gpu, state);
     return;
@@ -179,7 +182,9 @@ void LBVHSearchImpl::find_sph_neighbors(SimulationState& state, const SimConfig&
   if (!(skin >= 0.0f) || !std::isfinite(skin))
     throw std::runtime_error("SPH Verlet skin must be finite and nonnegative");
   const auto start = std::chrono::steady_clock::now();
-  bool full = !gpu.sph_ready || layout_changed || frequency == 1 ||
+  // Ghost membership and order can change without changing either count.
+  // Rebuild every distributed call; CSR remains valid between stage refreshes.
+  bool full = distributed || !gpu.sph_ready || layout_changed || frequency == 1 ||
               ++gpu.steps_since_rebuild >= frequency;
   // Topology quality may use a current displacement measurement. Bounds are
   // always refreshed before querying, so this threshold never certifies a list.
@@ -195,7 +200,7 @@ void LBVHSearchImpl::find_sph_neighbors(SimulationState& state, const SimConfig&
     CUDA_CHECK(cudaStreamSynchronize(stream));
     full = !std::isfinite(*gpu.h_max_disp_sq) || *gpu.h_max_disp_sq > gpu.rebuild_threshold_sq;
   }
-  bool reuse = !full && gpu.sph_cache_valid && skin > 0.0f &&
+  bool reuse = !distributed && !full && gpu.sph_cache_valid && skin > 0.0f &&
       gpu.sph_cached_skin == skin && gpu.sph_cached_cutoff == config.sph.kernel_cutoff_factor;
   if (reuse) {
     CUDA_CHECK(cudaMemsetAsync(gpu.d_verlet_disp_scaled, 0, sizeof(int32_t), stream));
@@ -298,7 +303,7 @@ void LBVHSearchImpl::find_sph_neighbors(SimulationState& state, const SimConfig&
       (size_t(n)+1)*sizeof(uint64_t), cudaMemcpyDeviceToDevice, stream));
   if (pairs) sph_fill_rows_kernel<<<pair_blocks, threads, 0, stream>>>(
       gpu.sph_pairs.pairs, pairs, gpu.sph_cursors, gpu.sph_neighbors);
-  if (skin > 0.0f) {
+  if (!distributed && skin > 0.0f) {
     lbvh_capture_cache_particles_kernel<<<blocks, threads, 0, stream>>>(
         state.particles.pos_x, state.particles.pos_y, state.particles.pos_z,
         state.particles.global_id, state.particles.clump_id, state.particles.smoothing_length,

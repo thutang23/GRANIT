@@ -382,6 +382,9 @@ private:
         HaloUnpack,
         NeighborSearch,
         ContactForce,
+        SphDensity,
+        SphConstitutive,
+        SphForceHistory,
         WallForce,
         Verlet2,
         Count
@@ -570,6 +573,7 @@ private:
 
     // Phase 4: Per-GPU pinned memory + events for async contact count readback
     std::vector<int32_t*> h_pinned_num_contacts_;   // One pinned int32 per GPU
+    std::vector<uint64_t*> h_pinned_sph_owned_degrees_; // One pinned scalar per GPU/timing slot
     std::vector<cudaEvent_t> contact_count_events_;  // One event per GPU
     std::vector<bool> contact_count_ready_;           // Whether async copy completed
 
@@ -771,7 +775,10 @@ private:
         const RCBWorkKey integration{RCBWorkPhase::Integration,
                                      RCBFmmMode::NotApplicable,
                                      RCBLinkClass::PCIe};
-        return rcb_calibrator_.ready() && rcb_calibrator_.has_coefficient(integration);
+        const RCBWorkKey physics{RCBWorkPhase::ContactPair,
+                                 RCBFmmMode::NotApplicable, RCBLinkClass::PCIe};
+        return rcb_calibrator_.ready() && rcb_calibrator_.has_coefficient(integration) &&
+               (!sph_mode_ || rcb_calibrator_.has_coefficient(physics));
     }
 
     void ensure_contact_list_capacity(int32_t gpu_id, int32_t particle_capacity,
@@ -1239,10 +1246,11 @@ public:
                                  config_.multigpu.rebalance_min_interval);
         rebalance_mailbox_.initialize(num_gpus_);
         rcb_calibrator_.set_half_life(config_.multigpu.rcb_calibration_half_life);
-        rcb_calibrator_.set_enabled_keys({
-            {RCBWorkPhase::Integration, RCBFmmMode::NotApplicable,
-             RCBLinkClass::PCIe}
-        });
+        std::vector<RCBWorkKey> required_calibration{{RCBWorkPhase::Integration,
+            RCBFmmMode::NotApplicable, RCBLinkClass::PCIe}};
+        if (sph_mode_) required_calibration.push_back({RCBWorkPhase::ContactPair,
+            RCBFmmMode::NotApplicable, RCBLinkClass::PCIe});
+        rcb_calibrator_.set_enabled_keys(required_calibration);
         rcb_sample_mailbox_.initialize(num_gpus_);
         latest_contact_counts_.assign(num_gpus_, 0);
         fmm_timing_diagnostics_.assign(num_gpus_, {});
@@ -1284,12 +1292,18 @@ public:
 
         // Phase 4: Allocate pinned memory + events for async contact count readback
         h_pinned_num_contacts_.resize(num_gpus_);
+        h_pinned_sph_owned_degrees_.resize(static_cast<size_t>(num_gpus_) * kTimingEventSlots);
         contact_count_events_.resize(num_gpus_);
         contact_count_ready_.resize(num_gpus_, false);
         for (int g = 0; g < num_gpus_; ++g) {
             CUDA_CHECK(cudaSetDevice(g));
             CUDA_CHECK(cudaMallocHost(&h_pinned_num_contacts_[g], sizeof(int32_t)));
             *h_pinned_num_contacts_[g] = 0;
+            for (int slot = 0; slot < kTimingEventSlots; ++slot) {
+                const size_t index = static_cast<size_t>(g) * kTimingEventSlots + slot;
+                CUDA_CHECK(cudaMallocHost(&h_pinned_sph_owned_degrees_[index], sizeof(uint64_t)));
+                *h_pinned_sph_owned_degrees_[index] = 0;
+            }
             CUDA_CHECK(cudaEventCreateWithFlags(&contact_count_events_[g],
                                                  cudaEventDisableTiming));
         }
@@ -1366,7 +1380,8 @@ public:
             calibration_slot_epochs.fill(-1);
             std::array<bool, kTimingEventSlots> calibration_slot_sampled{};
             std::array<int32_t, kTimingEventSlots> calibration_owned_units{};
-            std::array<int32_t, kTimingEventSlots> calibration_contact_units{};
+            std::array<uint64_t, kTimingEventSlots> calibration_contact_units{};
+            std::array<bool, kTimingEventSlots> sph_degree_readback{};
             std::array<double, kTimingEventSlots> calibration_halo_units{};
             std::array<double, kTimingEventSlots> calibration_halo_bytes{};
             std::array<RCBLinkClass, kTimingEventSlots> calibration_halo_links{};
@@ -1499,12 +1514,20 @@ public:
                                       calibration_elapsed_seconds(
                                           slot, CalibrationSegment::NeighborSearch),
                                       calibration_owned_units[slot]);
+                        const double physics_seconds = sph_mode_
+                            ? calibration_elapsed_seconds(slot, CalibrationSegment::SphDensity)
+                            + calibration_elapsed_seconds(slot, CalibrationSegment::SphConstitutive)
+                            + calibration_elapsed_seconds(slot, CalibrationSegment::SphForceHistory)
+                            : calibration_elapsed_seconds(slot, CalibrationSegment::ContactForce);
+                        const uint64_t physics_units = sph_mode_ && sph_degree_readback[slot]
+                            ? calibration_contact_units[slot] +
+                              *h_pinned_sph_owned_degrees_[
+                                  static_cast<size_t>(gpu_id) * kTimingEventSlots + slot]
+                            : calibration_contact_units[slot];
                         append_sample(samples, calibration_epoch,
                                       RCBWorkPhase::ContactPair,
                                       RCBFmmMode::NotApplicable, RCBLinkClass::PCIe,
-                                      calibration_elapsed_seconds(
-                                          slot, CalibrationSegment::ContactForce),
-                                      calibration_contact_units[slot]);
+                                      physics_seconds, static_cast<double>(physics_units));
                         const double halo_lifecycle_seconds =
                             calibration_elapsed_seconds(slot, CalibrationSegment::HaloPack)
                           + calibration_elapsed_seconds(slot, CalibrationSegment::HaloUnpack);
@@ -1528,6 +1551,7 @@ public:
                     timing_slot_excluded_from_rcb[slot] = false;
                     calibration_slot_epochs[slot] = -1;
                     calibration_slot_sampled[slot] = false;
+                    sph_degree_readback[slot] = false;
                 }
             };
 
@@ -1909,6 +1933,7 @@ public:
                         fmm_depth_command.exclude_from_rcb;
                     calibration_owned_units[timing_slot] = num_local;
                     calibration_contact_units[timing_slot] = 0;
+                    sph_degree_readback[timing_slot] = false;
                     calibration_halo_units[timing_slot] = 0.0;
                     calibration_halo_bytes[timing_slot] = 0.0;
                     calibration_halo_links[timing_slot] = RCBLinkClass::PCIe;
@@ -2247,6 +2272,15 @@ public:
                         my_state.local_state.neighbor.num_particles = num_total;
                         NeighborSearch::find_sph_neighbors(
                             my_state.local_state, config_, stream);
+                        if (timing_slot >= 0 && calibration_slot_sampled[timing_slot] &&
+                            my_state.local_state.neighbor.sph_adjacency_valid) {
+                            const size_t index = static_cast<size_t>(gpu_id) *
+                                kTimingEventSlots + timing_slot;
+                            CUDA_CHECK(cudaMemcpyAsync(h_pinned_sph_owned_degrees_[index],
+                                my_state.local_state.neighbor.sph_offsets + num_local,
+                                sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
+                            sph_degree_readback[timing_slot] = true;
+                        }
                         contact_count_ready_[gpu_id] = false;
                         *h_pinned_num_contacts_[gpu_id] = 0;
                     } else {
@@ -2423,13 +2457,19 @@ public:
                     };
 
                     local.particles.num_particles = num_local;
+                    calibration_event(true, timing_slot,
+                                      CalibrationSegment::SphDensity, stream);
                     if (num_local > 0) {
                         compute_sph_density(local, config_, stream);
                         if (force_bootstrap_step) compute_sph_pressure(local, config_, stream);
                     }
+                    calibration_event(false, timing_slot,
+                                      CalibrationSegment::SphDensity, stream);
                     // Density summation and bootstrap EOS changed owner values.
                     // All ranks participate, including empty owners.
                     refresh_sph_halos(false);
+                    calibration_event(true, timing_slot,
+                                      CalibrationSegment::SphConstitutive, stream);
                     if (num_local > 0) {
                         evaluate_sph_damage(local, config_, sph_damage_workspaces_[gpu_id], stream);
                         update_sph_kernel_correction(local, config_, stream);
@@ -2449,9 +2489,13 @@ public:
                             evaluate_sph_porosity_rates(local, config_, stream);
                         }
                     }
+                    calibration_event(false, timing_slot,
+                                      CalibrationSegment::SphConstitutive, stream);
                     // Force pairs must consume the same closed pressure/stress
                     // on both endpoints, including current stage overrides.
                     refresh_sph_halos(false);
+                    calibration_event(true, timing_slot,
+                                      CalibrationSegment::SphForceHistory, stream);
                     if (num_local > 0) {
                         compute_sph_forces(local, config_, stream);
                         if (!force_bootstrap_step) {
@@ -2467,6 +2511,8 @@ public:
                     } else {
                         sph_h_max_candidates[static_cast<size_t>(gpu_id)] = 0.0f;
                     }
+                    calibration_event(false, timing_slot,
+                                      CalibrationSegment::SphForceHistory, stream);
                     #pragma omp barrier
                     #pragma omp single
                     {
@@ -2481,9 +2527,11 @@ public:
                 }
                 latest_contact_counts_[gpu_id] = h_num_contacts;
                 if (timing_slot >= 0) {
-                    // Both force passes launch one thread per pair.  The
-                    // projector assigns this cost to the owned endpoint(s).
-                    calibration_contact_units[timing_slot] = 2 * h_num_contacts;
+                    // SPH uses one base unit per current owner plus its CSR
+                    // degree; DEM has two force passes per contact pair.
+                    calibration_contact_units[timing_slot] = sph_mode_
+                        ? static_cast<uint64_t>(num_local)
+                        : 2ULL * static_cast<uint64_t>(h_num_contacts);
                 }
                 calibration_event(false, timing_slot,
                                   CalibrationSegment::ContactForce, stream);
@@ -2879,7 +2927,10 @@ public:
                         int work_count=0;std::array<double,4> units{};
                         const auto* fmm_work=body_fitted_fmm::UnifiedFMMDispatcher::distributed_particle_work_device(work_count,units.data(),stream);
                         const auto* rows=morton_work_collectors_[gpu_id].collect_device(my_state,domain_params_,contacts_[gpu_id].pairs,
-                            latest_contact_counts_[gpu_id],communicators_[gpu_id].halo_destination_mask(),stream);
+                            latest_contact_counts_[gpu_id],
+                            my_state.local_state.neighbor.sph_adjacency_valid
+                                ? my_state.local_state.neighbor.sph_offsets : nullptr,
+                            sph_mode_,communicators_[gpu_id].halo_destination_mask(),stream);
                         if(work_count!=my_state.local_state.particles.num_local)throw std::runtime_error("stale common FMM work snapshot at repartition");
                         common_work_totals_[gpu_id]=units;
                         #pragma omp barrier
@@ -3036,6 +3087,11 @@ public:
                                         gpu_states_[g].subdomain.num_local_particles;
                                     input.contact_pairs = contacts_[g].pairs;
                                     input.contact_pair_count = latest_contact_counts_[g];
+                                    input.sph_mode = sph_mode_;
+                                    input.sph_offsets = sph_mode_ &&
+                                        gpu_states_[g].local_state.neighbor.sph_adjacency_valid
+                                            ? gpu_states_[g].local_state.neighbor.sph_offsets
+                                            : nullptr;
                                     input.halo_destination_mask =
                                         reinterpret_cast<const uint32_t*>(
                                             communicators_[g].halo_destination_mask());
@@ -3769,6 +3825,10 @@ public:
             }
         }
         h_pinned_num_contacts_.clear();
+        for (auto* pinned : h_pinned_sph_owned_degrees_) {
+            if (pinned) cudaFreeHost(pinned);
+        }
+        h_pinned_sph_owned_degrees_.clear();
         contact_count_events_.clear();
         contact_count_ready_.clear();
 

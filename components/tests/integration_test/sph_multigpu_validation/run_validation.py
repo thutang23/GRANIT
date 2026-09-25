@@ -60,10 +60,10 @@ def main():
     def save():
         (work / 'report.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
 
-    def config(name, ranks, *, mode=1, steps=8, gravity=None, resume=None, source=input_path, correction=True, rebootstrap=False, card=material, overrides=None):
+    def config(name, ranks, *, mode=1, steps=8, gravity=None, resume=None, source=input_path, correction=True, rebootstrap=False, card=material, overrides=None, backend='cuda'):
         directory = work / name
         directory.mkdir()
-        c = replay.config(directory, source, card, 'cuda', mode, steps, 1, True)
+        c = replay.config(directory, source, card, backend, mode, steps, 1, True)
         c['neighbor'].update(verlet_buffer_enabled=False, update_frequency=1)
         c['sph_parameters']['use_kernel_correction'] = correction
         c['multigpu'] = {'enabled': ranks > 0, 'max_gpus': max(1, ranks),
@@ -143,6 +143,27 @@ def main():
         print(f'PASS {name}', flush=True)
 
     try:
+        # Compare the distributed owned/ghost CSR consumer with the direct
+        # pair rule while h changes and a shuffled input crosses rank cuts.
+        edge_input = work / 'variable-h-halo-input.bin'
+        edge = read_particle_binary(input_path)
+        rng = np.random.default_rng(20260925)
+        order = rng.permutation(edge.num_particles)
+        for field in dataclasses.fields(edge):
+            value = getattr(edge, field.name)
+            if isinstance(value, np.ndarray) and len(value) == edge.num_particles:
+                setattr(edge, field.name, value[order])
+        edge.smoothing_length = np.where(
+            np.arange(edge.num_particles) % 3 == 0, 0.018, 0.007
+        ).astype(np.float32)
+        edge.lifecycle_state = None
+        write_particle_binary(edge_input, edge, physics='sph', record_kind='input')
+        _, direct_edge = run('variable-h-halo-direct', 0, source=edge_input,
+                             backend='direct', steps=4)
+        _, distributed_edge = run('variable-h-halo-four-gpu', 4,
+                                  source=edge_input, steps=4)
+        parity('variable-h-halo-direct-vs-four-gpu', direct_edge, distributed_edge)
+
         # Both continuity and density summation exercise changed neighbor state.
         for mode in (0, 1):
             _, single = run(f'hydro-mode{mode}-single', 0, mode=mode)
@@ -255,11 +276,11 @@ def main():
         close_data.positions[1] = np.array([1e-9, 0., 0.])
         write_particle_binary(close_input, close_data, physics='sph', record_kind='input')
         _, close_reference = run('near-pair-direct', 0, source=close_input, gravity='direct', steps=1)
-        close_norm = float(np.linalg.norm(close_total_force(reference)))
+        close_norm = float(np.linalg.norm(total_force(close_reference)))
         for ranks in (0, 4):
             _, close_candidate = run(f'near-pair-fmm-gpu{ranks}', ranks, source=close_input,
                                      gravity='unified_fmm', steps=1)
-            residual = float(np.linalg.norm(close_total_force(candidate)-close_total_force(reference))/close_norm)
+            residual = float(np.linalg.norm(total_force(close_candidate)-total_force(close_reference))/close_norm)
             report['checks'][f'near-pair-fmm-gpu{ranks}'] = {'relative_rms':residual,
                                                             'limit':.01,'pass':residual<=.01}
             save()
@@ -388,11 +409,15 @@ def main():
         # Continuation contracts must fail closed if history or stage metadata is lost.
         original = work/'stages-gpu4/checkpoints/checkpoint_step_0000000004.bin'
         broken = work/'missing-stage.bin'; broken.write_bytes(original.read_bytes())
+        broken.with_suffix('.bin.respa_sync').write_bytes(
+            original.with_suffix('.bin.respa_sync').read_bytes())
         reject('missing-stage-rejected-single',0,'stage',source=history_input,overrides=staged,resume=broken)
         reject('missing-stage-rejected-four',4,'stage',source=history_input,overrides=staged,resume=broken)
         missing = read_particle_binary(original); missing.energy_cold = None
         broken_history = work/'missing-history.bin'
         write_particle_binary(broken_history,missing,physics='sph',record_kind='checkpoint')
+        broken_history.with_suffix('.bin.respa_sync').write_bytes(
+            original.with_suffix('.bin.respa_sync').read_bytes())
         broken_history.with_suffix('.bin.sph_stage').write_bytes(original.with_suffix('.bin.sph_stage').read_bytes())
         reject('missing-history-rejected-single',0,'history',source=history_input,overrides=staged,resume=broken_history)
         reject('missing-history-rejected-four',4,'history',source=history_input,overrides=staged,resume=broken_history)

@@ -90,6 +90,12 @@ __global__ void adaptive_contacts_kernel(const ContactPair* pairs, int count, in
     if (owned_i) atomicAdd(weights + p.i, endpoint_cost);
     if (owned_j) atomicAdd(weights + p.j, endpoint_cost);
 }
+__global__ void adaptive_sph_neighbors_kernel(const uint64_t* offsets, int owned,
+                                              float cost, float* weights) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < owned) weights[i] += cost *
+        (1.0f + static_cast<float>(offsets ? offsets[i+1] - offsets[i] : 0));
+}
 template <class Task> __global__ void adaptive_tasks_kernel(const Task* tasks, int count,
     const body_fitted_fmm::UnifiedNode* nodes, int num_nodes, int owned,
     float cost, float* difference, int32_t* status) {
@@ -215,7 +221,9 @@ void build_adaptive_rcb_weights(const AdaptiveRCBInput& input, float* weights, f
     adaptive_base_kernel<<<(input.owned_count + 1 + bs - 1) / bs, bs, 0, stream>>>(weights, difference, input.owned_count,
         input.coefficients.base + input.coefficients.let_receiver * input.receiver_uniform_units,
         input.halo_destination_mask, peer_cost, status);
-    if (input.contact_pairs && input.contact_pair_count > 0) adaptive_contacts_kernel<<<(input.contact_pair_count + bs - 1)/bs,bs,0,stream>>>(input.contact_pairs,input.contact_pair_count,input.owned_count,input.coefficients.contact_pair,weights);
+    if (input.sph_mode) adaptive_sph_neighbors_kernel<<<nblocks,bs,0,stream>>>(
+        input.sph_offsets,input.owned_count,input.coefficients.contact_pair,weights);
+    else if (input.contact_pairs && input.contact_pair_count > 0) adaptive_contacts_kernel<<<(input.contact_pair_count + bs - 1)/bs,bs,0,stream>>>(input.contact_pairs,input.contact_pair_count,input.owned_count,input.coefficients.contact_pair,weights);
     if (input.fmm.nodes) {
         if (input.fmm.grouped_targets && input.fmm.metadata &&
             input.fmm.children_compact && input.fmm.node_capacity > 0)
