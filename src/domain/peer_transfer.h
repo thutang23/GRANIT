@@ -1,6 +1,16 @@
 #pragma once
+#include "peer_transport_policy.h"
 #include <cuda_runtime.h>
 #include <cstdlib>
+#if defined(__linux__)
+#include <cerrno>
+#include <fstream>
+#include <sys/stat.h>
+#endif
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -10,6 +20,97 @@ namespace cudadem {
 inline void peer_transfer_check(cudaError_t status, const char* operation) {
     if (status != cudaSuccess)
         throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+}
+
+namespace peer_transport_detail {
+
+struct State {
+    std::mutex mutex;
+    std::map<int, std::string> pci_ids;
+    std::map<std::string, IommuMode> iommu_modes;
+    std::map<std::pair<std::string, std::string>, LinkClass> fabrics;
+    std::set<std::pair<int, int>> logged_routes;
+};
+
+inline State& state() {
+    static State instance;
+    return instance;
+}
+
+inline std::string pci_id_locked(State& state, int device) {
+    auto found = state.pci_ids.find(device);
+    if (found != state.pci_ids.end()) return found->second;
+    char id[32] = {};
+    const cudaError_t status = cudaDeviceGetPCIBusId(id, sizeof(id), device);
+    return state.pci_ids.emplace(device,
+        status == cudaSuccess ? normalize_pci_bus_id(id) : std::string()).first->second;
+}
+
+inline IommuMode iommu_mode_locked(State& state, const std::string& id) {
+#if !defined(__linux__)
+    (void)state;
+    (void)id;
+    return IommuMode::Absent;
+#else
+    if (id.empty()) return IommuMode::Unknown;
+    const auto found = state.iommu_modes.find(id);
+    if (found != state.iommu_modes.end()) return found->second;
+
+    const std::string device_path = "/sys/bus/pci/devices/" + id;
+    struct stat info {};
+    IommuMode mode = IommuMode::Unknown;
+    if (stat(device_path.c_str(), &info) == 0) {
+        const std::string group_path = device_path + "/iommu_group";
+        if (stat(group_path.c_str(), &info) == 0) {
+            std::ifstream type_file(group_path + "/type");
+            std::string type;
+            if (std::getline(type_file, type)) mode = parse_iommu_type(type);
+        } else if (errno == ENOENT) {
+            mode = IommuMode::Absent;
+        }
+    }
+    state.iommu_modes.emplace(id, mode);
+    return mode;
+#endif
+}
+
+inline bool stage_for_route(int destination, int source) {
+    const char* force = std::getenv("GRANIT_FORCE_HOST_STAGING");
+    const bool forced = force && std::string(force) == "1";
+    State& data = state();
+    std::lock_guard<std::mutex> guard(data.mutex);
+    const std::string dst_id = pci_id_locked(data, destination);
+    const std::string src_id = pci_id_locked(data, source);
+    const auto fabric = data.fabrics.find({dst_id, src_id});
+    const LinkClass link = fabric == data.fabrics.end()
+        ? LinkClass::GenericPcieP2P : fabric->second;
+    const IommuMode dst_mode = iommu_mode_locked(data, dst_id);
+    const IommuMode src_mode = iommu_mode_locked(data, src_id);
+    const bool staged = should_stage_peer_copy(forced, link, dst_mode, src_mode);
+    if (data.logged_routes.emplace(destination, source).second) {
+        std::clog << "[peer-transfer] GPU " << source << " -> " << destination
+                  << " (" << src_id << " -> " << dst_id << ") "
+                  << (staged ? "host staging" : "direct P2P")
+                  << (forced ? " [forced]" : is_nvlink_fabric(link) ? " [NVLink/NVSwitch]"
+                     : staged ? " [IOMMU translated or unknown]" : " [IOMMU absent or identity]")
+                  << '\n';
+    }
+    return staged;
+}
+
+} // namespace peer_transport_detail
+
+// Only NVML-proven fabric routes are registered. CUDA indices are resolved to
+// PCI identities at copy time, so device visibility/remapping cannot mix routes.
+inline void register_peer_link_class(const std::string& destination_pci,
+                                     const std::string& source_pci, LinkClass link) {
+    if (!is_nvlink_fabric(link)) return;
+    const std::string destination = normalize_pci_bus_id(destination_pci);
+    const std::string source = normalize_pci_bus_id(source_pci);
+    if (destination.empty() || source.empty()) return;
+    auto& data = peer_transport_detail::state();
+    std::lock_guard<std::mutex> guard(data.mutex);
+    data.fabrics[{destination, source}] = link;
 }
 
 // One instance per destination worker; staging is never shared between workers.
@@ -57,8 +158,8 @@ public:
         int accessible = 0;
         peer_transfer_check(cudaDeviceCanAccessPeer(&accessible, destination_device,
                                                     source_device), "query peer access");
-        const char* force_staging = std::getenv("GRANIT_FORCE_HOST_STAGING");
-        if (accessible && !(force_staging && std::string(force_staging) == "1")) {
+        if (accessible && !peer_transport_detail::stage_for_route(destination_device,
+                                                                   source_device)) {
             if (peer_mapping_.size() <= static_cast<size_t>(destination_device))
                 peer_mapping_.resize(static_cast<size_t>(destination_device)+1);
             auto& mappings=peer_mapping_[destination_device];

@@ -53,15 +53,25 @@ struct NvmlLinkEvidence {
     bool shared_switch_with_peer = false;
 };
 
+struct NvmlRemoteEndpoint {
+    std::string pci_id;
+    bool is_switch = false;
+};
+
 // NVML reports active physical NVLink ports.  A remote PCI endpoint that is a
-// peer GPU proves a direct link; a common endpoint that is not any GPU proves
-// that both GPUs attach to the same NVSwitch.  All failed/ambiguous probes are
-// intentionally left unclassified.
+// peer GPU proves a direct link; a common endpoint typed by NVML as SWITCH
+// proves that both GPUs attach to the same NVSwitch. All failed/ambiguous
+// probes are intentionally left unclassified.
 std::vector<std::vector<NvmlLinkEvidence>> query_nvml_link_evidence(
     const std::vector<std::string>& cuda_pci_bus_ids) {
     const size_t count = cuda_pci_bus_ids.size();
     std::vector<std::vector<NvmlLinkEvidence>> evidence(
         count, std::vector<NvmlLinkEvidence>(count));
+    std::vector<std::string> normalized_gpu_ids(count);
+    for (size_t i = 0; i < count; ++i) {
+        normalized_gpu_ids[i] = normalize_pci_bus_id(cuda_pci_bus_ids[i]);
+        if (normalized_gpu_ids[i].empty()) return evidence;
+    }
     if (nvmlInit_v2() != NVML_SUCCESS) return evidence;
 
     std::vector<nvmlDevice_t> devices(count, nullptr);
@@ -72,7 +82,7 @@ std::vector<std::vector<NvmlLinkEvidence>> query_nvml_link_evidence(
         }
     }
 
-    std::vector<std::vector<std::string>> active_remote_endpoints(count);
+    std::vector<std::vector<NvmlRemoteEndpoint>> active_remote_endpoints(count);
     for (size_t i = 0; i < count; ++i) {
         for (unsigned int link = 0; link < NVML_NVLINK_MAX_LINKS; ++link) {
             nvmlEnableState_t state = NVML_FEATURE_DISABLED;
@@ -81,31 +91,38 @@ std::vector<std::vector<NvmlLinkEvidence>> query_nvml_link_evidence(
             nvmlPciInfo_t remote_pci{};
             if (nvmlDeviceGetNvLinkRemotePciInfo_v2(devices[i], link, &remote_pci) != NVML_SUCCESS ||
                 remote_pci.busId[0] == '\0') continue;
-            active_remote_endpoints[i].emplace_back(remote_pci.busId);
+            const std::string endpoint = normalize_pci_bus_id(remote_pci.busId);
+            if (endpoint.empty()) continue;
+            nvmlIntNvLinkDeviceType_t remote_type = NVML_NVLINK_DEVICE_TYPE_UNKNOWN;
+            const bool is_switch =
+                nvmlDeviceGetNvLinkRemoteDeviceType(devices[i], link, &remote_type) == NVML_SUCCESS &&
+                remote_type == NVML_NVLINK_DEVICE_TYPE_SWITCH;
+            active_remote_endpoints[i].push_back({endpoint, is_switch});
         }
     }
 
     for (size_t i = 0; i < count; ++i) {
         for (size_t j = 0; j < count; ++j) {
             if (i == j) continue;
-            for (const std::string& endpoint : active_remote_endpoints[i]) {
-                if (endpoint == cuda_pci_bus_ids[j]) {
+            for (const NvmlRemoteEndpoint& endpoint : active_remote_endpoints[i]) {
+                if (endpoint.pci_id == normalized_gpu_ids[j]) {
                     evidence[i][j].direct_to_peer = true;
                     break;
                 }
             }
             if (evidence[i][j].direct_to_peer) continue;
-            for (const std::string& endpoint : active_remote_endpoints[i]) {
+            for (const NvmlRemoteEndpoint& endpoint : active_remote_endpoints[i]) {
+                if (!endpoint.is_switch) continue;
                 // A GPU PCI endpoint would have established direct evidence
                 // above (or be an unproven route); it is not treated as a
                 // switch endpoint.
                 bool is_gpu_endpoint = false;
-                for (const std::string& gpu_pci : cuda_pci_bus_ids) {
-                    if (endpoint == gpu_pci) { is_gpu_endpoint = true; break; }
+                for (const std::string& gpu_pci : normalized_gpu_ids) {
+                    if (endpoint.pci_id == gpu_pci) { is_gpu_endpoint = true; break; }
                 }
                 if (is_gpu_endpoint) continue;
-                for (const std::string& peer_endpoint : active_remote_endpoints[j]) {
-                    if (endpoint == peer_endpoint) {
+                for (const NvmlRemoteEndpoint& peer_endpoint : active_remote_endpoints[j]) {
+                    if (peer_endpoint.is_switch && endpoint.pci_id == peer_endpoint.pci_id) {
                         evidence[i][j].shared_switch_with_peer = true;
                         break;
                     }
@@ -343,6 +360,7 @@ void Communicator::query_topology() {
                                                      direct_nvlink_proven,
                                                      nvswitch_path_proven);
             topology_.link_class[i][j] = link;
+            register_peer_link_class(cuda_pci_bus_ids[i], cuda_pci_bus_ids[j], link);
             topology_.is_nvlink[i][j] = is_nvlink_fabric(link);
             topology_.nvlink_available = topology_.nvlink_available || is_nvlink_fabric(link);
         }
