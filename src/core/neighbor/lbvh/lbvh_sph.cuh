@@ -232,7 +232,7 @@ void LBVHSearchImpl::find_sph_neighbors(SimulationState& state, const SimConfig&
           gpu.snapshot_pos_x, gpu.snapshot_pos_y, gpu.snapshot_pos_z, n);
       const float threshold = config.neighbor.lbvh_rebuild_threshold > 0.0f
           ? config.neighbor.lbvh_rebuild_threshold
-          : compute_max_radius(state.particles, stream) * config.neighbor.lbvh_skin_factor * 0.5f;
+          : compute_max_radius(state.particles, gpu, stream) * config.neighbor.lbvh_skin_factor * 0.5f;
       gpu.rebuild_threshold_sq = threshold * threshold;
     }
   } else {

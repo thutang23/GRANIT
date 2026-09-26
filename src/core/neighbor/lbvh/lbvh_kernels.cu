@@ -3,6 +3,8 @@
 // =============================================================================
 
 #include "lbvh_manager.h"
+#include "max_support_reduce.cuh"
+#include "contact_dedup.cuh"
 #include "lbvh_periodic.cuh"
 #include "../rt/rt_backend.h"
 #include "../neighbor_types.h"
@@ -20,11 +22,13 @@
 #include <thrust/sort.h>
 #include <thrust/tuple.h>
 #include <thrust/functional.h>
-#include <thrust/reduce.h>
 #include <thrust/unique.h>
 #include <stdexcept>
 #include <string>
 #include <limits>
+#ifdef CUDADEM_ENABLE_PROFILING
+#include <nvtx3/nvToolsExt.h>
+#endif
 
 #ifndef CUDA_CHECK
 #define CUDA_CHECK(call)                                                       \
@@ -40,6 +44,21 @@
 
 namespace cudadem {
 namespace lbvh {
+
+struct LBVHProfileRange {
+  explicit LBVHProfileRange(const char* name) {
+#ifdef CUDADEM_ENABLE_PROFILING
+    nvtxRangePushA(name);
+#else
+    (void)name;
+#endif
+  }
+  ~LBVHProfileRange() {
+#ifdef CUDADEM_ENABLE_PROFILING
+    nvtxRangePop();
+#endif
+  }
+};
 
 // =============================================================================
 // Morton Code Utilities (for LBVH)
@@ -1081,40 +1100,6 @@ __global__ void copy_cached_contact_pairs_kernel(
 }
 
 // =============================================================================
-// Contact Deduplication
-// =============================================================================
-// Same (i,j) pair may be found from different periodic images.
-// Sort by (i,j) then remove duplicates, keeping first occurrence.
-
-static void deduplicate_contacts(
-    ContactPair* contacts,
-    int32_t raw_count,
-    int32_t* d_num_contacts,
-    cudaStream_t stream
-) {
-    if (raw_count <= 1) return;
-
-    // Sort by (i, j) pair
-    thrust::sort(thrust::cuda::par.on(stream),
-        contacts, contacts + raw_count,
-        [] __device__ (const ContactPair& a, const ContactPair& b) {
-            return (a.i < b.i) || (a.i == b.i && a.j < b.j);
-        });
-
-    // Remove duplicates (keep first - has correct image offset)
-    auto new_end = thrust::unique(thrust::cuda::par.on(stream),
-        contacts, contacts + raw_count,
-        [] __device__ (const ContactPair& a, const ContactPair& b) {
-            return a.i == b.i && a.j == b.j;
-        });
-
-    // Update count
-    int32_t new_count = static_cast<int32_t>(new_end - contacts);
-    cudaMemcpyAsync(d_num_contacts, &new_count, sizeof(int32_t),
-                    cudaMemcpyHostToDevice, stream);
-}
-
-// =============================================================================
 // Verlet Cache Helper Functions
 // =============================================================================
 
@@ -1323,6 +1308,12 @@ void LBVHSearchImpl::initialize(const SimConfig& config, SimulationState& state)
       static_cast<const LBVHAABB*>(nullptr), gpu_state.whole_domain,
       capacity, AABBMergeOp(), LBVHAABB{}));
   CUDA_CHECK(cudaMalloc(&gpu_state.domain_reduce_temp, gpu_state.domain_reduce_temp_bytes));
+  gpu_state.max_support.initialize();
+  if (num_particles > 0) {
+    const float* support = state.particles.support_extent
+        ? state.particles.support_extent : state.particles.radius;
+    gpu_state.max_support.reserve(support, capacity, nullptr);
+  }
 
   // Snapshot position buffers (float precision)
   CUDA_CHECK(cudaMalloc(&gpu_state.snapshot_pos_x, capacity * sizeof(float)));
@@ -1421,6 +1412,8 @@ void LBVHSearchImpl::shutdown(SimulationState& state, int32_t gpu_id) {
   cudaFree(gpu_state.atomic_flags);   gpu_state.atomic_flags = nullptr;
   cudaFree(gpu_state.whole_domain); gpu_state.whole_domain = nullptr;
   cudaFree(gpu_state.domain_reduce_temp); gpu_state.domain_reduce_temp = nullptr;
+  gpu_state.max_support.release();
+  gpu_state.contact_dedup.release();
   cudaFree(gpu_state.verlet_particles); gpu_state.verlet_particles = nullptr;
 
   if (gpu_state.snapshot_pos_x)   { cudaFree(gpu_state.snapshot_pos_x);   gpu_state.snapshot_pos_x = nullptr; }
@@ -1504,6 +1497,8 @@ void LBVHSearchImpl::shutdown_all() {
       cudaFree(pair.second.atomic_flags);
       cudaFree(pair.second.whole_domain);
       cudaFree(pair.second.domain_reduce_temp);
+      pair.second.max_support.release();
+      pair.second.contact_dedup.release();
       cudaFree(pair.second.verlet_particles); pair.second.verlet_particles = nullptr;
 
       if (pair.second.snapshot_pos_x)   { cudaFree(pair.second.snapshot_pos_x);   pair.second.snapshot_pos_x = nullptr; }
@@ -1748,16 +1743,19 @@ void LBVHSearchImpl::rebuild(SimulationState &state, const SimConfig &config,
       std::chrono::duration<float, std::milli>(t_end - t_start).count();
 }
 
-// Host helper: compute max radius/support_extent via Thrust
-// Prefer the interaction support extent for DEM and SPH; fall back to radius.
-static float compute_max_radius(const ParticleSoA& particles, cudaStream_t stream) {
-    float* extent_ptr = (particles.support_extent != nullptr)
-        ? particles.support_extent
-        : particles.radius;
-    thrust::device_ptr<float> r_ptr(extent_ptr);
-    return thrust::reduce(thrust::cuda::par.on(stream),
-                          r_ptr, r_ptr + particles.num_particles,
-                          0.0f, thrust::maximum<float>());
+// Keep CUB scratch and the result scalar per GPU. A zero-particle reduction
+// retains the old Thrust initial value; support extent retains radius fallback.
+static float compute_max_radius(const ParticleSoA& particles, LBVHGPUState& gpu,
+                                cudaStream_t stream) {
+    const int32_t n = particles.num_particles;
+    {
+      LBVHProfileRange range("LBVH: Max Support Reduce");
+      gpu.max_support.enqueue(particles.support_extent, particles.radius, n, stream);
+    }
+    {
+      LBVHProfileRange range("LBVH: Max Support Wait");
+      return gpu.max_support.wait(n, stream);
+    }
 }
 
 void LBVHSearchImpl::find_contacts(SimulationState &state,
@@ -1807,7 +1805,10 @@ void LBVHSearchImpl::find_contacts(SimulationState &state,
 
   // Always clear the result before any trivial return so a shrinking domain
   // cannot expose contacts from a previous call.
-  NeighborSearch::reset_contact_buffer(contacts, stream);
+  {
+    LBVHProfileRange range("LBVH: Contact Buffer Reset");
+    NeighborSearch::reset_contact_buffer(contacts, stream);
+  }
   if (num_local == 0 || N <= 1) {
     gpu_state.tracked_num_particles = N;
     gpu_state.tracked_num_local = num_local;
@@ -1839,7 +1840,7 @@ void LBVHSearchImpl::find_contacts(SimulationState &state,
 
   // [B] Resolve rebuild_threshold_sq on first call
   if (!force_rebuild_every_step && !gpu_state.threshold_resolved) {
-    float max_r = compute_max_radius(state.particles, stream);
+    float max_r = compute_max_radius(state.particles, gpu_state, stream);
     float threshold;
     if (config.neighbor.lbvh_rebuild_threshold > 0.0f) {
       threshold = config.neighbor.lbvh_rebuild_threshold;
@@ -1895,7 +1896,10 @@ void LBVHSearchImpl::find_contacts(SimulationState &state,
       CUDA_CHECK(cudaGetLastError());
       CUDA_CHECK(cudaMemcpyAsync(gpu_state.h_pinned_verlet_disp, gpu_state.d_verlet_disp_scaled,
                                 sizeof(float), cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaStreamSynchronize(stream));
+      {
+          LBVHProfileRange range("LBVH: Cache Displacement Wait");
+          CUDA_CHECK(cudaStreamSynchronize(stream));
+      }
       gpu_state.cached_verlet_disp_sq = *gpu_state.h_pinned_verlet_disp;
       gpu_state.verlet_readback_pending = false;
       gpu_state.steps_since_verlet_rebuild++;
@@ -1959,6 +1963,7 @@ void LBVHSearchImpl::find_contacts(SimulationState &state,
     CUDA_CHECK(cudaEventRecord(gpu_state.timing_start, stream));
   if (do_full_rebuild) {
     // [C-full] Full rebuild (existing pipeline)
+    LBVHProfileRange range("LBVH: Full Rebuild");
     rebuild(state, config, stream);
 
     // The position snapshot is only useful when a later step can take the
@@ -1973,10 +1978,12 @@ void LBVHSearchImpl::find_contacts(SimulationState &state,
     gpu_state.steps_since_rebuild = 0;
     gpu_state.stats.lbvh_full_rebuilds++;
   } else if (gpu_state.active_backend == NeighborBackend::RT) {
+    LBVHProfileRange range("LBVH: RT Update");
     gpu_state.rt_backend->update(rt_input(state, config), false, stream);
     gpu_state.stats.lbvh_fast_path_steps++;
   } else {
     // [C-fast] Fast path: refresh leaf AABBs + re-propagate
+    LBVHProfileRange range("LBVH: Refit");
 
     // skin_half is the rebuild threshold distance (used to inflate AABBs on fast path)
     float skin_half = sqrtf(gpu_state.rebuild_threshold_sq);
@@ -2030,7 +2037,7 @@ void LBVHSearchImpl::find_contacts(SimulationState &state,
       known_final_contact_count = contacts.h_num_contacts;
   } else if (pbc.is_enabled()) {
       // Periodic path: use periodic-aware kernel + deduplication
-      float max_r = compute_max_radius(state.particles, stream);
+      float max_r = compute_max_radius(state.particles, gpu_state, stream);
       ShearPhase shear_phase;
       if (config.shear_box.enabled) {
           const double search_distance = 2.0 * static_cast<double>(max_r)
@@ -2054,27 +2061,37 @@ void LBVHSearchImpl::find_contacts(SimulationState &state,
               pbc, max_r, config.shear_box.enabled, shear_phase);
           CUDA_CHECK(cudaGetLastError());
       };
-      launch_periodic();
+      { LBVHProfileRange range("LBVH: Periodic Query"); launch_periodic(); }
 
       // Deduplicate contacts (same i,j from different images)
-      int32_t raw_count = NeighborSearch::get_contact_count(contacts, stream);
+      int32_t raw_count;
+      {
+          LBVHProfileRange range("LBVH: Raw Count");
+          raw_count = NeighborSearch::get_contact_count(contacts, stream);
+      }
       while (config.shear_box.enabled && raw_count > contacts.max_contacts) {
           const int64_t doubled=2LL*contacts.max_contacts;
           const int64_t requested=std::max<int64_t>(raw_count,doubled);
           if(requested>std::numeric_limits<int32_t>::max())
               throw std::overflow_error("shear contact buffer capacity exceeds int32");
-          NeighborSearch::free_contact_buffer(contacts);
-          NeighborSearch::allocate_contact_buffer(contacts,static_cast<int32_t>(requested));
-          NeighborSearch::reset_contact_buffer(contacts,stream);
-          launch_periodic();
-          raw_count=NeighborSearch::get_contact_count(contacts,stream);
+          {
+              LBVHProfileRange range("LBVH: Contact Overflow Resize");
+              NeighborSearch::free_contact_buffer(contacts);
+              NeighborSearch::allocate_contact_buffer(contacts,static_cast<int32_t>(requested));
+              NeighborSearch::reset_contact_buffer(contacts,stream);
+          }
+          { LBVHProfileRange range("LBVH: Periodic Query"); launch_periodic(); }
+          { LBVHProfileRange range("LBVH: Raw Count");
+            raw_count=NeighborSearch::get_contact_count(contacts,stream); }
       }
       if (raw_count > contacts.max_contacts) {
           throw std::runtime_error("periodic contact buffer overflow: required="
               + std::to_string(raw_count) + ", capacity=" + std::to_string(contacts.max_contacts));
       }
       if (raw_count > 1) {
-          deduplicate_contacts(contacts.pairs, raw_count, contacts.num_contacts, stream);
+          LBVHProfileRange range("LBVH: Deduplicate");
+          deduplicate_contacts(contacts.pairs, raw_count, contacts.num_contacts,
+                               stream, gpu_state.contact_dedup);
       } else {
           known_final_contact_count = raw_count;
       }
@@ -2105,9 +2122,13 @@ void LBVHSearchImpl::find_contacts(SimulationState &state,
   // and the host mirror consumed by the main loop. A periodic deduplication
   // must complete before this readback; non-periodic paths only need the
   // clamp above.
-  const int32_t num_contacts_found = known_final_contact_count >= 0
-      ? known_final_contact_count
-      : NeighborSearch::get_contact_count(contacts, stream);
+  int32_t num_contacts_found;
+  {
+    LBVHProfileRange range("LBVH: Final Count");
+    num_contacts_found = known_final_contact_count >= 0
+        ? known_final_contact_count
+        : NeighborSearch::get_contact_count(contacts, stream);
+  }
   contacts.h_num_contacts = num_contacts_found;
 
   if (gpu_state.backend_timing_enabled) {

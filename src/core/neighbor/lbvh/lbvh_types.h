@@ -7,6 +7,8 @@
 #define CUDADEM_LBVH_TYPES_H
 
 #include "../neighbor_types.h"
+#include "max_support_reduce.h"
+#include "contact_dedup_workspace.h"
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <string>
@@ -87,6 +89,12 @@ struct LBVHGPUState {
     LBVHAABB* whole_domain;
     void* domain_reduce_temp;
     size_t domain_reduce_temp_bytes;
+
+    // Persistent maximum interaction-support reduction for periodic queries.
+    MaxSupportReduction max_support;
+
+    // Reused temporary allocations for periodic contact sort and unique.
+    ContactDedupWorkspace contact_dedup;
 
     // Topology caching
     float* snapshot_pos_x, *snapshot_pos_y, *snapshot_pos_z;

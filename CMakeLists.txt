@@ -31,7 +31,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
-option(BUILD_TESTING "Build host configuration and coefficient-asset tests" OFF)
+option(BUILD_TESTING "Build regression tests (GPU tests require CUDA devices)" OFF)
 option(GRANIT_BUILD_MULTIGPU "Build the multi-GPU DEM/SPH executable" ON)
 option(ENABLE_PROFILING "Enable production CUDA profiling markers" OFF)
 option(SPH_DEBUG "Enable SPH startup diagnostics" OFF)
@@ -179,9 +179,11 @@ install(TARGETS ${GRANIT_INSTALL_TARGETS} RUNTIME DESTINATION bin)
 install(DIRECTORY components/config/ DESTINATION share/granit/config FILES_MATCHING PATTERN "*.yaml")
 message(STATUS "GRANIT production package: M2L=${FMM_M2L_MODE}, local P2P FP32=${FMM_P2P_LOCAL_FP32}")
 
-# Host-only release regressions use the production parser and need no GPU.
+# Host regressions need no GPU; device regressions are labelled "gpu" and
+# report CTest's skip code when the required CUDA devices are unavailable.
 include(CTest)
 if(BUILD_TESTING)
+    find_package(Threads REQUIRED)
     add_executable(granit_config_defaults_test
         components/tests/release_defaults/config_defaults.cpp
         src/core/constant/config_host.cpp
@@ -207,4 +209,10 @@ if(BUILD_TESTING)
     target_include_directories(granit_fmm_halo_geometry_cache_test PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/src")
     add_test(NAME fmm_halo_geometry_cache COMMAND granit_fmm_halo_geometry_cache_test)
+    add_executable(granit_lbvh_contact_dedup_test
+        components/tests/unit_test/lbvh/contact_dedup.cu)
+    target_include_directories(granit_lbvh_contact_dedup_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(granit_lbvh_contact_dedup_test PRIVATE CUDA::cudart Threads::Threads yaml-cpp)
+    add_test(NAME lbvh_contact_dedup COMMAND granit_lbvh_contact_dedup_test)
+    set_tests_properties(lbvh_contact_dedup PROPERTIES LABELS "gpu" SKIP_RETURN_CODE 77)
 endif()
