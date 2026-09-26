@@ -202,4 +202,9 @@ if(BUILD_TESTING)
     add_executable(granit_g_table_test components/tests/release_defaults/g_table.cpp)
     target_include_directories(granit_g_table_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME g_table COMMAND granit_g_table_test)
+    add_executable(granit_fmm_halo_geometry_cache_test
+        components/tests/unit_test/body_fitted_fmm/test_halo_geometry_cache.cpp)
+    target_include_directories(granit_fmm_halo_geometry_cache_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME fmm_halo_geometry_cache COMMAND granit_fmm_halo_geometry_cache_test)
 endif()

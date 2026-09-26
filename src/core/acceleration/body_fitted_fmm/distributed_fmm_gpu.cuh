@@ -75,27 +75,28 @@ inline void fmm_make_query_stream(FMMQueryPeer& q,int device) {
     CUDA_CHECK(cudaEventCreateWithFlags(&q.end,cudaEventDisableTiming));
 }
 
-inline std::vector<FMMHaloBox> fmm_make_halo_geometry(const DistributedFMMState& s,int gpu,int depth) {
-    std::vector<::cudadem::MortonCoverCell> cover;
-    if(s.local_only) {
-        cover.push_back({{s.routing.min_x,s.routing.min_y,-INFINITY},
-                         {s.routing.max_x,s.routing.max_y,INFINITY},gpu});
-    } else cover=::cudadem::morton_cover(s.ownership_grid,s.cuts);
-    if(s.routing.enabled)for(auto& cell:cover) {
-        cell.lo[0]=std::max(cell.lo[0],s.routing.min_x);cell.hi[0]=std::min(cell.hi[0],s.routing.max_x);
-        cell.lo[1]=std::max(cell.lo[1],s.routing.min_y);cell.hi[1]=std::min(cell.hi[1],s.routing.max_y);
-    }
-    return fmm_halo_boxes(s.grid,depth,cover);
-}
-
 template<int D> inline void fmm_publish_halo(DistributedFMMState& s,int gpu,bool changed,cudaStream_t stream) {
     auto& h=s.halo;auto& q=h.table;auto& p=s.gpu_plan;
     fmm_make_query_stream(q,gpu);
-    if(changed) {
-        h.geometry=fmm_make_halo_geometry(s,gpu,p.depth);
+    BF_FMM_NVTX_RANGE("BF-FMM: Halo Geometry Cache Lookup");
+    const bool geometry_changed=!h.geometry_key.matches(s.grid,s.ownership_grid,s.cuts,
+        s.routing,s.local_only,gpu,p.depth);
+    BF_FMM_NVTX_END();
+    if(geometry_changed) {
+        BF_FMM_NVTX_RANGE("BF-FMM: Halo Geometry Rebuild");
+        h.geometry=fmm_make_halo_geometry(s.grid,s.ownership_grid,s.cuts,s.routing,
+            s.local_only,gpu,p.depth);
         h.boxes.reserve(h.geometry.size());
         if(!h.geometry.empty())CUDA_CHECK(cudaMemcpyAsync(h.boxes.data,h.geometry.data(),
             h.geometry.size()*sizeof(FMMHaloBox),cudaMemcpyHostToDevice,q.stream));
+        h.geometry_key.capture(s.grid,s.ownership_grid,s.cuts,s.routing,s.local_only,gpu,p.depth);
+        BF_FMM_NVTX_END();
+        // Geometry changes also invalidate the published key set, even if a
+        // caller did not invalidate its occupied-node identity first.
+        if(!changed)++s.publication_generation;
+        changed=true;
+    }
+    if(changed) {
         p.counts.reserve(size_t(p.owned_nodes)+1);p.offsets.reserve(size_t(p.owned_nodes)+1);
         CUDA_CHECK(cudaMemsetAsync(p.counts.data+p.owned_nodes,0,sizeof(uint64_t),q.stream));
         if(p.owned_nodes)fmm_halo_candidate_kernel<D,false><<<(p.owned_nodes+255)/256,256,0,q.stream>>>(
@@ -611,11 +612,15 @@ inline void exchange_distributed_fmm_sources(int gpu,fmm::FMMDeviceData* dd,
         else fmm_plan_identity_kernel<3><<<(p.owned_nodes+255)/256,256,0,stream>>>(
             runtime->device_context,p.owned_nodes,s.published_identity.data,s.published_changed.data,structural);
     }
+    BF_FMM_NVTX_RANGE("BF-FMM: Source Identity Readback");
     const bool changed=bool(fmm_read_scalar(s.published_changed.data,stream))||structural;
+    BF_FMM_NVTX_END();
     if(changed)++s.publication_generation;
     p.cached_nodes=p.owned_nodes;p.cutoff=effective_cutoff;s.published_nodes=p.owned_nodes;s.published_depth=p.depth;
     s.published_context=s.publication.context;s.published_arena=owned?dd->unified_nodes:nullptr;s.published_grid=grid;
+    BF_FMM_NVTX_RANGE("BF-FMM: Halo Publish");
     if(grid.dimension==2)fmm_publish_halo<2>(s,gpu,changed,stream);else fmm_publish_halo<3>(s,gpu,changed,stream);
+    BF_FMM_NVTX_END();
     std::vector<unsigned char> original_nodes,original_moments,original_children;
     if(owned && std::getenv("GRANIT_FMM_VALIDATE_SCHEDULE")) {
         original_nodes.resize(size_t(p.owned_nodes)*sizeof(UnifiedNode));
@@ -626,12 +631,14 @@ inline void exchange_distributed_fmm_sources(int gpu,fmm::FMMDeviceData* dd,
         CUDA_CHECK(cudaMemcpy(original_children.data(),dd->children_compact,original_children.size(),cudaMemcpyDeviceToHost));
     }
     const auto phase=::cudadem::PeerPhase::FmmSource;
+    BF_FMM_NVTX_RANGE("BF-FMM: Source Peer Wait");
     if(collective) {
         fmm_collective_check(s.coordinator->publish(phase,gpu,s.epoch,stream),s);
         for(int peer=0;peer<s.ranks;++peer)if(peer!=gpu)
             fmm_collective_check(s.coordinator->wait_for_published(phase,peer,gpu,s.epoch,stream),s);
         CUDA_CHECK(cudaStreamSynchronize(stream));
     } else CUDA_CHECK(cudaStreamSynchronize(stream));
+    BF_FMM_NVTX_END();
     for(int peer=0;peer<s.ranks;++peer) {
         if((peer==gpu&&!images)||(s.local_only&&peer!=gpu))continue;
         if(owned) {

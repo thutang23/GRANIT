@@ -1,6 +1,7 @@
 #pragma once
 
 #include "domain/morton_partition.h"
+#include "domain/shear_source_routing.h"
 #include "grouped_stencil_tables.cuh"
 #include <array>
 #include <set>
@@ -13,6 +14,42 @@ struct FMMHaloBox {
     int lo[3], hi[3];
     int level;
     uint32_t owners;
+};
+
+// Only inputs consumed by the ownership cover and halo box construction belong
+// in this key. Occupied Karras nodes and the shear phase do not change boxes.
+struct FMMHaloGeometryKey {
+    cudadem::MortonGrid gravity{}, ownership{};
+    std::vector<uint64_t> cuts;
+    double min_x=0, max_x=0, min_y=0, max_y=0;
+    int depth=0, local_gpu=0;
+    bool local_only=false, routing_enabled=false, valid=false;
+
+    static bool same_grid(const cudadem::MortonGrid& a,const cudadem::MortonGrid& b) {
+        return a.dimension==b.dimension && a.x==b.x && a.y==b.y &&
+            a.z==b.z && a.size==b.size;
+    }
+    bool matches(const cudadem::MortonGrid& g,const cudadem::MortonGrid& own,
+        const std::vector<uint64_t>& new_cuts,const cudadem::ShearSourceRouting& route,
+        bool local,int gpu,int new_depth) const {
+        if(!valid || !same_grid(gravity,g) || depth!=new_depth ||
+            local_only!=local || routing_enabled!=route.enabled)return false;
+        if(local) {
+            if(local_gpu!=gpu || min_x!=route.min_x || max_x!=route.max_x ||
+                min_y!=route.min_y || max_y!=route.max_y)return false;
+        } else if(!same_grid(ownership,own) || cuts!=new_cuts)return false;
+        return !route.enabled || (min_x==route.min_x && max_x==route.max_x &&
+            min_y==route.min_y && max_y==route.max_y);
+    }
+    void capture(const cudadem::MortonGrid& g,const cudadem::MortonGrid& own,
+        const std::vector<uint64_t>& new_cuts,const cudadem::ShearSourceRouting& route,
+        bool local,int gpu,int new_depth) {
+        gravity=g;ownership=own;depth=new_depth;local_only=local;
+        local_gpu=gpu;routing_enabled=route.enabled;
+        min_x=route.min_x;max_x=route.max_x;min_y=route.min_y;max_y=route.max_y;
+        if(local)cuts.clear();else cuts=new_cuts;
+        valid=true;
+    }
 };
 
 inline std::vector<std::array<int,3>> fmm_halo_parent_offsets(int dimension) {
@@ -106,6 +143,22 @@ inline std::vector<FMMHaloBox> fmm_halo_boxes(
         }
     } while(boxes.size()<previous);
     return boxes;
+}
+
+inline std::vector<FMMHaloBox> fmm_make_halo_geometry(
+    const cudadem::MortonGrid& gravity,const cudadem::MortonGrid& ownership,
+    const std::vector<uint64_t>& cuts,const cudadem::ShearSourceRouting& routing,
+    bool local_only,int gpu,int depth) {
+    std::vector<cudadem::MortonCoverCell> cover;
+    if(local_only) {
+        cover.push_back({{routing.min_x,routing.min_y,-INFINITY},
+                         {routing.max_x,routing.max_y,INFINITY},gpu});
+    } else cover=cudadem::morton_cover(ownership,cuts);
+    if(routing.enabled)for(auto& cell:cover) {
+        cell.lo[0]=std::max(cell.lo[0],routing.min_x);cell.hi[0]=std::min(cell.hi[0],routing.max_x);
+        cell.lo[1]=std::max(cell.lo[1],routing.min_y);cell.hi[1]=std::min(cell.hi[1],routing.max_y);
+    }
+    return fmm_halo_boxes(gravity,depth,cover);
 }
 
 #ifdef __CUDACC__

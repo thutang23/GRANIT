@@ -138,6 +138,7 @@ struct FMMProducerHalo {
     FMMDeviceBuffer<int> scalar, owner_masks;
     FMMDeviceBuffer<unsigned char> scratch;
     std::vector<FMMHaloBox> geometry;
+    FMMHaloGeometryKey geometry_key;
     int cells=0;
     uint64_t generation=0;
 };
