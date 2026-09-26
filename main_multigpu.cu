@@ -34,6 +34,7 @@
 #include "src/domain/morton_root_service.cuh"
 #include "src/domain/morton_work_kernels.cuh"
 #include "src/domain/communicator.h"
+#include "src/domain/peer_transfer.h"
 #include "src/domain/let_communicator.h"
 #include "src/domain/rcb_balancer.h"
 #include "src/domain/rcb_work_model.h"
@@ -1328,13 +1329,72 @@ public:
         std::vector<float> sph_h_max_candidates(static_cast<size_t>(num_gpus_), 0.0f);
         std::exception_ptr worker_failure;
         std::mutex worker_failure_mutex;
+        const bool prepare_distributed_peer_routes = num_gpus_ > 1 &&
+            domain_params_.morton_enabled &&
+            config_.acceleration.enable_self_gravity &&
+            config_.acceleration.gravity_method == SelfGravityMethod::BFFMM;
 
         // OpenMP parallel region - one thread per GPU
         #pragma omp parallel num_threads(num_gpus_)
         {
             try {
             int gpu_id = omp_get_thread_num();
-            CUDA_CHECK(cudaSetDevice(gpu_id));
+            if (prepare_distributed_peer_routes) {
+                // The initialization region uses different OpenMP workers.
+                // Prepare routes here so copy_peer_payload sees this worker's
+                // thread-local cache before its first distributed FMM step.
+                try {
+                    CUDA_CHECK(cudaSetDevice(gpu_id));
+                    #ifdef CUDADEM_ENABLE_PROFILING
+                    nvtxRangePushA("Peer Transfer: Prepare Routes");
+                    #endif
+                    try {
+                        for (int source = 0; source < num_gpus_; ++source)
+                            if (source != gpu_id)
+                                prepare_peer_payload_route(gpu_id, source);
+                    } catch (...) {
+                        #ifdef CUDADEM_ENABLE_PROFILING
+                        nvtxRangePop();
+                        #endif
+                        throw;
+                    }
+                    #ifdef CUDADEM_ENABLE_PROFILING
+                    nvtxRangePop();
+                    #endif
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(worker_failure_mutex);
+                    if (!worker_failure) worker_failure = std::current_exception();
+                }
+                // Finish each destination's source-order mapping choices
+                // before workers cache the reverse routes used by FMM's
+                // direct-flag publication (destination peer <- source gpu).
+                #pragma omp barrier
+                try {
+                    #ifdef CUDADEM_ENABLE_PROFILING
+                    nvtxRangePushA("Peer Transfer: Prepare Reverse Routes");
+                    #endif
+                    try {
+                        for (int destination = 0; destination < num_gpus_; ++destination)
+                            if (destination != gpu_id)
+                                prepare_peer_payload_route(destination, gpu_id);
+                    } catch (...) {
+                        #ifdef CUDADEM_ENABLE_PROFILING
+                        nvtxRangePop();
+                        #endif
+                        throw;
+                    }
+                    #ifdef CUDADEM_ENABLE_PROFILING
+                    nvtxRangePop();
+                    #endif
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(worker_failure_mutex);
+                    if (!worker_failure) worker_failure = std::current_exception();
+                }
+                #pragma omp barrier
+                if (worker_failure) std::rethrow_exception(worker_failure);
+            } else {
+                CUDA_CHECK(cudaSetDevice(gpu_id));
+            }
 
             GPUDomainState& my_state = gpu_states_[gpu_id];
             Communicator& comm = communicators_[gpu_id];
@@ -2142,6 +2202,7 @@ public:
 
                 // Halo reuses the migration buffers, so wait for the current
                 // migration consumers before overwriting them.
+                nvtxRangePushA("Halo: Buffer Reuse Wait");
                 for (int32_t peer = 0; peer < num_gpus_; ++peer) {
                     if (peer == gpu_id) continue;
                     require_phase(
@@ -2150,7 +2211,9 @@ public:
                             particle_exchange_epoch, stream),
                         "halo buffer reuse");
                 }
+                nvtxRangePop();
 
+                nvtxRangePushA("Halo: Identify and Pack");
                 const float halo_width = sph_mode_
                     ? 0.5f * config_.multigpu.halo_width_factor
                         * config_.sph.kernel_cutoff_factor * sph_global_h_max_
@@ -2162,12 +2225,16 @@ public:
                 comm.pack_halo_particles(my_state, stream);
                 calibration_event(false, timing_slot,
                                   CalibrationSegment::HaloPack, stream);
+                nvtxRangePop();
+                nvtxRangePushA("Halo: Publish");
                 require_phase(
                     phase_coordinator_.publish(
                         PeerPhase::Halo, gpu_id,
                         particle_exchange_epoch, stream),
                     "halo publication");
+                nvtxRangePop();
 
+                nvtxRangePushA("Halo: Peer Publication Wait");
                 for (int32_t peer = 0; peer < num_gpus_; ++peer) {
                     if (peer == gpu_id) continue;
                     require_phase(
@@ -2176,6 +2243,8 @@ public:
                             particle_exchange_epoch, my_state.comm_stream),
                         "halo peer publication");
                 }
+                nvtxRangePop();
+                nvtxRangePushA("Halo: Transfer");
                 calibration_event(true, timing_slot,
                                   CalibrationSegment::HaloTransfer,
                                   my_state.comm_stream);
@@ -2185,13 +2254,19 @@ public:
                                   my_state.comm_stream);
                 CUDA_CHECK(cudaEventRecord(halo_transfer_events_[gpu_id],
                                            my_state.comm_stream));
+                nvtxRangePop();
+                nvtxRangePushA("Halo: Transfer Completion Wait");
                 CUDA_CHECK(cudaStreamWaitEvent(stream, halo_transfer_events_[gpu_id], 0));
+                nvtxRangePop();
 
+                nvtxRangePushA("Halo: Unpack");
                 calibration_event(true, timing_slot,
                                   CalibrationSegment::HaloUnpack, stream);
                 comm.unpack_ghost_particles(my_state, stream);
                 calibration_event(false, timing_slot,
                                   CalibrationSegment::HaloUnpack, stream);
+                nvtxRangePop();
+                nvtxRangePushA("Halo: Consumption Acknowledgement");
                 for (int32_t peer = 0; peer < num_gpus_; ++peer) {
                     if (peer == gpu_id) continue;
                     require_phase(
@@ -2200,6 +2275,7 @@ public:
                             particle_exchange_epoch, stream),
                         "halo consumption acknowledgement");
                 }
+                nvtxRangePop();
                 nvtxRangePop();
 
                 if (timing_slot >= 0 && calibration_slot_sampled[timing_slot]) {

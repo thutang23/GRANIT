@@ -4,6 +4,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef CUDADEM_ENABLE_PROFILING
+#include <nvtx3/nvToolsExt.h>
+#endif
 
 namespace cudadem {
 
@@ -23,7 +26,50 @@ class PeerTransfer {
     cudaStream_t last_destination_stream_ = nullptr;
     cudaEvent_t staging_consumed_ = nullptr;
     std::vector<cudaStream_t> source_streams_;
-    std::vector<std::vector<int>> peer_mapping_; // -1 unknown, 0 staged, 1 mapped
+    struct PeerRoute {
+        int accessible = -1; // -1 unknown, 0 unavailable, 1 accessible
+        int mapping = -1;    // -1 untried, 0 staged, 1 mapped
+    };
+    std::vector<std::vector<PeerRoute>> peer_routes_;
+
+    // Called with the destination selected. Copy and startup preparation use
+    // the same route cache, including the handled mapping-limit fallback.
+    bool direct_route(int destination_device, int source_device) {
+        if (peer_routes_.size() <= static_cast<size_t>(destination_device))
+            peer_routes_.resize(static_cast<size_t>(destination_device) + 1);
+        auto& routes = peer_routes_[destination_device];
+        if (routes.size() <= static_cast<size_t>(source_device))
+            routes.resize(static_cast<size_t>(source_device) + 1);
+        PeerRoute& route = routes[source_device];
+        if (route.accessible < 0) {
+            int accessible = 0;
+            peer_transfer_check(cudaDeviceCanAccessPeer(&accessible, destination_device,
+                                                        source_device), "query peer access");
+            route.accessible = accessible ? 1 : 0;
+        }
+        // Read this on every call: changing the runtime override still takes
+        // effect after a route has been prepared or used.
+        const char* force_staging = std::getenv("GRANIT_FORCE_HOST_STAGING");
+        if (!route.accessible || (force_staging && std::string(force_staging) == "1"))
+            return false;
+        if (route.mapping < 0) {
+            #ifdef CUDADEM_ENABLE_PROFILING
+            nvtxRangePushA("Peer Transfer: Enable Mapping");
+            #endif
+            const cudaError_t enabled = cudaDeviceEnablePeerAccess(source_device, 0);
+            #ifdef CUDADEM_ENABLE_PROFILING
+            nvtxRangePop();
+            #endif
+            if (enabled == cudaSuccess) route.mapping = 1;
+            else if (enabled == cudaErrorPeerAccessAlreadyEnabled) {
+                cudaGetLastError(); route.mapping = 1;
+            } else if (enabled == cudaErrorTooManyPeers ||
+                       enabled == cudaErrorPeerAccessUnsupported) {
+                cudaGetLastError(); route.mapping = 0;
+            } else peer_transfer_check(enabled, "enable peer payload mapping");
+        }
+        return route.mapping == 1;
+    }
 public:
     PeerTransfer() = default;
     PeerTransfer(const PeerTransfer&) = delete;
@@ -44,6 +90,22 @@ public:
             }
         cudaSetDevice(previous);
     }
+    // Prepare a directed destination <- source route without moving payloads
+    // or changing the caller's selected device. A mapping-limit rejection is
+    // cached as a staged route exactly as it is during copy().
+    void prepare(int destination_device, int source_device) {
+        if (destination_device == source_device) return;
+        int previous_device = -1;
+        peer_transfer_check(cudaGetDevice(&previous_device), "read current device");
+        peer_transfer_check(cudaSetDevice(destination_device), "select peer destination");
+        try {
+            direct_route(destination_device, source_device);
+        } catch (...) {
+            cudaSetDevice(previous_device);
+            throw;
+        }
+        peer_transfer_check(cudaSetDevice(previous_device), "restore current device");
+    }
     void copy(void* destination, int destination_device, const void* source,
               int source_device, size_t bytes, cudaStream_t stream) {
         if (!bytes) return;
@@ -54,30 +116,10 @@ public:
                                                 cudaMemcpyDeviceToDevice, stream), "local payload");
             return;
         }
-        int accessible = 0;
-        peer_transfer_check(cudaDeviceCanAccessPeer(&accessible, destination_device,
-                                                    source_device), "query peer access");
-        const char* force_staging = std::getenv("GRANIT_FORCE_HOST_STAGING");
-        if (accessible && !(force_staging && std::string(force_staging) == "1")) {
-            if (peer_mapping_.size() <= static_cast<size_t>(destination_device))
-                peer_mapping_.resize(static_cast<size_t>(destination_device)+1);
-            auto& mappings=peer_mapping_[destination_device];
-            if (mappings.size() <= static_cast<size_t>(source_device))
-                mappings.resize(static_cast<size_t>(source_device)+1,-1);
-            if (mappings[source_device]<0) {
-                const cudaError_t enabled=cudaDeviceEnablePeerAccess(source_device,0);
-                if (enabled==cudaSuccess) mappings[source_device]=1;
-                else if (enabled==cudaErrorPeerAccessAlreadyEnabled) {
-                    cudaGetLastError(); mappings[source_device]=1;
-                } else if (enabled==cudaErrorTooManyPeers || enabled==cudaErrorPeerAccessUnsupported) {
-                    cudaGetLastError(); mappings[source_device]=0;
-                } else peer_transfer_check(enabled,"enable peer payload mapping");
-            }
-            if (mappings[source_device]) {
-                peer_transfer_check(cudaMemcpyPeerAsync(destination, destination_device,
-                                                        source, source_device, bytes, stream), "peer payload");
-                return;
-            }
+        if (direct_route(destination_device, source_device)) {
+            peer_transfer_check(cudaMemcpyPeerAsync(destination, destination_device,
+                                                    source, source_device, bytes, stream), "peer payload");
+            return;
         }
         // This also resolves the caller's cross-device source-ready event.
         peer_transfer_check(cudaStreamSynchronize(stream), "staged destination readiness");
@@ -115,10 +157,18 @@ public:
     }
 };
 
+inline PeerTransfer& worker_peer_transfer() {
+    thread_local PeerTransfer transfer;
+    return transfer;
+}
+
+inline void prepare_peer_payload_route(int dst_device, int src_device) {
+    worker_peer_transfer().prepare(dst_device, src_device);
+}
+
 inline void copy_peer_payload(void* dst, int dst_device, const void* src,
                               int src_device, size_t bytes, cudaStream_t stream) {
-    thread_local PeerTransfer transfer;
-    transfer.copy(dst, dst_device, src, src_device, bytes, stream);
+    worker_peer_transfer().copy(dst, dst_device, src, src_device, bytes, stream);
 }
 
 } // namespace cudadem

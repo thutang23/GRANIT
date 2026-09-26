@@ -164,6 +164,12 @@ if(GRANIT_BUILD_MULTIGPU)
     add_library(granit_domain ${GRANIT_DOMAIN_SOURCES})
     target_include_directories(granit_domain PRIVATE ${GRANIT_INCLUDE_DIRS})
     target_link_libraries(granit_domain PRIVATE CUDA::cudart yaml-cpp MPI::MPI_CXX)
+    # Shared inline transfer/coordinator helpers must see the same profiling
+    # definition in the domain library and in the solver translation units.
+    if(ENABLE_PROFILING)
+        target_compile_definitions(granit_domain PRIVATE CUDADEM_ENABLE_PROFILING)
+        target_link_libraries(granit_domain PRIVATE ${CMAKE_DL_LIBS})
+    endif()
     if(NVML_INCLUDE_DIR AND NVML_LIBRARY)
         target_include_directories(granit_domain PRIVATE ${NVML_INCLUDE_DIR})
         target_compile_definitions(granit_domain PRIVATE CUDADEM_HAS_NVML=1)
@@ -209,10 +215,25 @@ if(BUILD_TESTING)
     target_include_directories(granit_fmm_halo_geometry_cache_test PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/src")
     add_test(NAME fmm_halo_geometry_cache COMMAND granit_fmm_halo_geometry_cache_test)
+    add_executable(granit_peer_transfer_host_test
+        components/tests/unit_test/domain/test_peer_transfer_fake.cpp)
+    target_include_directories(granit_peer_transfer_host_test BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/components/tests/unit_test/domain/fake_cuda"
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(granit_peer_transfer_host_test PRIVATE Threads::Threads)
+    add_test(NAME peer_transfer_host COMMAND granit_peer_transfer_host_test)
+
+    add_executable(granit_peer_transfer_gpu_test
+        components/tests/unit_test/domain/test_peer_transfer.cu)
     add_executable(granit_lbvh_contact_dedup_test
         components/tests/unit_test/lbvh/contact_dedup.cu)
-    target_include_directories(granit_lbvh_contact_dedup_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    target_link_libraries(granit_lbvh_contact_dedup_test PRIVATE CUDA::cudart Threads::Threads yaml-cpp)
+    foreach(test_target granit_peer_transfer_gpu_test granit_lbvh_contact_dedup_test)
+        target_include_directories(${test_target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(${test_target} PRIVATE CUDA::cudart Threads::Threads)
+    endforeach()
+    target_link_libraries(granit_lbvh_contact_dedup_test PRIVATE yaml-cpp)
+    add_test(NAME peer_transfer_gpu COMMAND granit_peer_transfer_gpu_test)
     add_test(NAME lbvh_contact_dedup COMMAND granit_lbvh_contact_dedup_test)
-    set_tests_properties(lbvh_contact_dedup PROPERTIES LABELS "gpu" SKIP_RETURN_CODE 77)
+    set_tests_properties(peer_transfer_gpu lbvh_contact_dedup PROPERTIES
+        LABELS "gpu" SKIP_RETURN_CODE 77)
 endif()

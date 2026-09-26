@@ -7,6 +7,9 @@
 // consumer that owns the buffer it is about to use.
 
 #include <cuda_runtime.h>
+#ifdef CUDADEM_ENABLE_PROFILING
+#include <nvtx3/nvToolsExt.h>
+#endif
 
 #include <array>
 #include <chrono>
@@ -174,7 +177,15 @@ public:
         const size_t edge = channel.edge(producer, consumer);
         auto next_report = std::chrono::steady_clock::now() + stall_period_;
         while (!aborted_ && channel.acknowledged[edge] < expected_epoch) {
-            if (cv_.wait_until(lock, next_report) == std::cv_status::timeout) {
+            std::cv_status wait_status;
+            {
+#ifdef CUDADEM_ENABLE_PROFILING
+                ScopedWaitNvtx wait_range("wait_for_consumed", consumed_phase,
+                                          producer, consumer, expected_epoch);
+#endif
+                wait_status = cv_.wait_until(lock, next_report);
+            }
+            if (wait_status == std::cv_status::timeout) {
                 report_stall_locked("consumed acknowledgement", consumed_phase, producer, consumer,
                                     expected_epoch, channel.acknowledged[edge]);
                 next_report = std::chrono::steady_clock::now() + stall_period_;
@@ -205,6 +216,9 @@ public:
             return false;
         }
         channel.published[producer] = epoch;
+#ifdef CUDADEM_ENABLE_PROFILING
+        mark_epoch_nvtx("published", phase, producer, -1, epoch);
+#endif
         cv_.notify_all();
         return true;
     }
@@ -219,7 +233,15 @@ public:
         Channel& channel = channel_locked(phase);
         auto next_report = std::chrono::steady_clock::now() + stall_period_;
         while (!aborted_ && channel.published[producer] < epoch) {
-            if (cv_.wait_until(lock, next_report) == std::cv_status::timeout) {
+            std::cv_status wait_status;
+            {
+#ifdef CUDADEM_ENABLE_PROFILING
+                ScopedWaitNvtx wait_range("wait_for_published", phase,
+                                          producer, consumer, epoch);
+#endif
+                wait_status = cv_.wait_until(lock, next_report);
+            }
+            if (wait_status == std::cv_status::timeout) {
                 report_stall_locked("producer-ready event", phase, producer, consumer,
                                     epoch, channel.published[producer]);
                 next_report = std::chrono::steady_clock::now() + stall_period_;
@@ -258,6 +280,9 @@ public:
             return false;
         }
         channel.acknowledged[edge] = epoch;
+#ifdef CUDADEM_ENABLE_PROFILING
+        mark_epoch_nvtx("acknowledged", phase, producer, consumer, epoch);
+#endif
         cv_.notify_all();
         return true;
     }
@@ -286,6 +311,69 @@ public:
     }
 
 private:
+#ifdef CUDADEM_ENABLE_PROFILING
+    static const char* phase_name_nvtx(PeerPhase phase) {
+        switch (phase) {
+            case PeerPhase::Migration: return "Migration";
+            case PeerPhase::Halo: return "Halo";
+            case PeerPhase::Let: return "Let";
+            case PeerPhase::YorpReduction: return "YorpReduction";
+            case PeerPhase::YorpState: return "YorpState";
+            case PeerPhase::FmmSource: return "FmmSource";
+            case PeerPhase::FmmProjection: return "FmmProjection";
+            case PeerPhase::FmmCellRequests: return "FmmCellRequests";
+            case PeerPhase::FmmCellReplies: return "FmmCellReplies";
+            case PeerPhase::FmmParticleRequests: return "FmmParticleRequests";
+            case PeerPhase::FmmParticleReplies: return "FmmParticleReplies";
+        }
+        return "Unknown";
+    }
+
+    static nvtxEventAttributes_t epoch_attributes_nvtx(const char* label, uint64_t epoch) {
+        nvtxEventAttributes_t attributes = {};
+        attributes.version = NVTX_VERSION;
+        attributes.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+        attributes.messageType = NVTX_MESSAGE_TYPE_ASCII;
+        attributes.message.ascii = label;
+        attributes.payloadType = NVTX_PAYLOAD_TYPE_UNSIGNED_INT64;
+        attributes.payload.ullValue = epoch;
+        return attributes;
+    }
+
+    class ScopedWaitNvtx {
+    public:
+        ScopedWaitNvtx(const char* operation, PeerPhase phase, int producer,
+                       int consumer, uint64_t epoch) {
+            char label[160];
+            std::snprintf(label, sizeof(label),
+                          "PhaseCoordinator %s cv.wait_until phase=%s producer=%d consumer=%d epoch=%llu",
+                          operation, phase_name_nvtx(phase), producer, consumer,
+                          static_cast<unsigned long long>(epoch));
+            const auto attributes = epoch_attributes_nvtx(label, epoch);
+            range_ = nvtxRangeStartEx(&attributes);
+        }
+
+        ~ScopedWaitNvtx() { nvtxRangeEnd(range_); }
+
+        ScopedWaitNvtx(const ScopedWaitNvtx&) = delete;
+        ScopedWaitNvtx& operator=(const ScopedWaitNvtx&) = delete;
+
+    private:
+        nvtxRangeId_t range_;
+    };
+
+    static void mark_epoch_nvtx(const char* operation, PeerPhase phase, int producer,
+                                int consumer, uint64_t epoch) {
+        char label[160];
+        std::snprintf(label, sizeof(label),
+                      "PhaseCoordinator %s phase=%s producer=%d consumer=%d epoch=%llu",
+                      operation, phase_name_nvtx(phase), producer, consumer,
+                      static_cast<unsigned long long>(epoch));
+        const auto attributes = epoch_attributes_nvtx(label, epoch);
+        nvtxMarkEx(&attributes);
+    }
+#endif
+
     struct Channel {
         std::vector<cudaEvent_t> ready;
         std::vector<cudaEvent_t> consumed;
