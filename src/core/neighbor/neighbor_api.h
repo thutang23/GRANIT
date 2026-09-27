@@ -88,7 +88,7 @@ public:
     ) {
         switch (config.neighbor.method) {
             case NeighborMethod::CELL_LINKED_LIST:
-                cll::CLLSearchImpl::find_contacts(state, config, contacts, stream);
+                cll::CLLSearchImpl::find_contacts(state, config, contacts, evaluation_time, stream);
                 break;
             case NeighborMethod::LBVH:
                 lbvh::LBVHSearchImpl::find_contacts(state, config, contacts, evaluation_time, stream);

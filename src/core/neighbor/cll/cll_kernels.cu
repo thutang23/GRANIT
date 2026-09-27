@@ -19,6 +19,8 @@
 #include "../neighbor_types.h"
 #include "../neighbor_api.h"  // For NeighborSearch contact buffer helpers
 #include "../../wall/wall.h"  // For PeriodicBoundaryConfig
+#include "../../shear/shear_box.h"
+#include "../lbvh/max_support_reduce.cuh"
 #ifdef CUDADEM_CPU_MOCK
 #include "cuda_utils.h"
 #else
@@ -41,6 +43,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
+#ifdef CUDADEM_ENABLE_PROFILING
+#include <nvtx3/nvToolsExt.h>
+#endif
 
 namespace cudadem {
 
@@ -54,6 +61,99 @@ namespace cudadem {
 __constant__ NeighborParamsGPU dev_neighbor_params;
 
 namespace cll {
+
+struct ShearProfileRange {
+    explicit ShearProfileRange(const char* name) {
+#ifdef CUDADEM_ENABLE_PROFILING
+        nvtxRangePushA(name);
+#else
+        (void)name;
+#endif
+    }
+    ~ShearProfileRange() {
+#ifdef CUDADEM_ENABLE_PROFILING
+        nvtxRangePop();
+#endif
+    }
+};
+
+static void shear_cuda_check(cudaError_t error) {
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
+struct ShearGrid {
+    double min_x, min_y, max_x, max_y, cell_size, inverse_cell_size;
+    double length_x, length_y, reduced_shift, search_range;
+    int32_t nx, ny;
+};
+
+__global__ void shear_bin_kernel(const double* x, const double* y,
+                                  int32_t* heads, int32_t* next,
+                                  int32_t count, ShearGrid grid) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    int32_t cx = static_cast<int32_t>(floor((x[i] - grid.min_x) * grid.inverse_cell_size));
+    int32_t cy = static_cast<int32_t>(floor((y[i] - grid.min_y) * grid.inverse_cell_size));
+    cx = max(0, min(cx, grid.nx - 1));
+    cy = max(0, min(cy, grid.ny - 1));
+    next[i] = atomicExch(&heads[static_cast<int64_t>(cy) * grid.nx + cx], i);
+}
+
+__global__ void shear_query_kernel(
+    const double* x, const double* y, const double* z,
+    const float* support, const float* radius, const int32_t* clump_id,
+    const int32_t* heads, const int32_t* next,
+    ContactPair* pairs, int32_t* count, int32_t capacity,
+    int32_t num_local, ShearGrid grid, float skin) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_local) return;
+    const double xi = x[i], yi = y[i], zi = z[i];
+    const float ri = support ? support[i] : radius[i];
+    const int32_t ci = clump_id ? clump_id[i] : -2;
+    for (int ix = -1; ix <= 1; ++ix) {
+        const double qx = xi - ix * grid.length_x;
+        if (qx < grid.min_x - grid.cell_size ||
+            qx > grid.max_x + grid.cell_size) continue;
+        for (int iy = -1; iy <= 1; ++iy) {
+            const double qy = yi - iy * grid.length_y + ix * grid.reduced_shift;
+            if (qy < grid.min_y - grid.cell_size ||
+                qy > grid.max_y + grid.cell_size) continue;
+            const int32_t cx = static_cast<int32_t>(floor((qx - grid.min_x) * grid.inverse_cell_size));
+            const int32_t cy = static_cast<int32_t>(floor((qy - grid.min_y) * grid.inverse_cell_size));
+            for (int32_t dy = -1; dy <= 1; ++dy) {
+                const int32_t by = cy + dy;
+                if (by < 0 || by >= grid.ny) continue;
+                for (int32_t dx = -1; dx <= 1; ++dx) {
+                    const int32_t bx = cx + dx;
+                    if (bx < 0 || bx >= grid.nx) continue;
+                    for (int32_t j = heads[static_cast<int64_t>(by) * grid.nx + bx];
+                         j != -1; j = next[j]) {
+                        if (j <= i || (ci > 0 && clump_id[j] == ci)) continue;
+                        // Match the periodic LBVH narrow-phase arithmetic and
+                        // coincident-particle exclusion at the same epoch.
+                        const float qfx = static_cast<float>(xi)
+                            - static_cast<float>(ix * grid.length_x);
+                        const float qfy = static_cast<float>(yi)
+                            - static_cast<float>(iy * grid.length_y
+                                - ix * grid.reduced_shift);
+                        const float ddx = static_cast<float>(x[j]) - qfx;
+                        const float ddy = static_cast<float>(y[j]) - qfy;
+                        const float ddz = static_cast<float>(z[j])
+                            - static_cast<float>(zi);
+                        const float dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
+                        const float rj = support ? support[j] : radius[j];
+                        const float limit = ri + rj + skin;
+                        if (!(dist_sq < limit * limit && dist_sq > 1e-12f)) continue;
+                        if (!(ri + rj - sqrtf(dist_sq) > -skin)) continue;
+                        const int32_t slot = atomicAdd(count, 1);
+                        if (slot >= 0 && slot < capacity)
+                            pairs[slot] = ContactPair(i, j, ix, iy, 0);
+                    }
+                }
+            }
+        }
+    }
+}
 
 // =============================================================================
 // Morton Code (Z-Order Curve) Functions
@@ -710,6 +810,18 @@ void CLLSearchImpl::initialize(
         shutdown(state, gpu_id);
     }
 
+    if (config.shear_box.enabled) {
+        // The wide, vertically thin shear box cannot use the 10-bit/axis
+        // Morton grid below. Its bins are allocated from the current support
+        // radius on each evaluation, after migration and ghost exchange.
+        gpu_state.shear_max_support.initialize();
+        gpu_state.initialized = true;
+        gpu_state.grid_valid = false;
+        gpu_state.stats = NeighborSearchStats();
+        state.neighbor.active_method = NeighborMethod::CELL_LINKED_LIST;
+        return;
+    }
+
     int32_t num_particles = state.particles.num_particles;
     if (num_particles == 0) {
         std::cerr << "WARNING: No particles for neighbor search on GPU " << gpu_id << std::endl;
@@ -1025,6 +1137,8 @@ bool CLLSearchImpl::needs_rebuild(
 ) {
     CLLGPUState& gpu_state = get_gpu_state();
 
+    if (config.shear_box.enabled) return true;
+
     if (!gpu_state.grid_valid) return true;
 
     int32_t num_particles = state.particles.num_particles;
@@ -1110,6 +1224,7 @@ void CLLSearchImpl::find_contacts(
     SimulationState& state,
     const SimConfig& config,
     ContactListBuffer& contacts,
+    double evaluation_time,
     cudaStream_t stream
 ) {
     CLLGPUState& gpu_state = get_gpu_state();
@@ -1117,6 +1232,133 @@ void CLLSearchImpl::find_contacts(
     if (!gpu_state.initialized) {
         std::cerr << "ERROR: CLLSearchImpl not initialized on GPU " << gpu_state.gpu_id << std::endl;
         return;
+    }
+
+    if (config.shear_box.enabled) {
+        const int32_t n = state.particles.num_particles;
+        const int32_t num_local = state.particles.num_local;
+        if (n < 0 || num_local < 0 || num_local > n)
+            throw std::runtime_error("invalid shear CLL local/ghost particle counts");
+        if (!contacts.pairs || !contacts.num_contacts || contacts.max_contacts <= 0)
+            throw std::runtime_error("shear CLL contact buffer is unallocated");
+        if (n == 0 || num_local == 0) {
+            NeighborSearch::reset_contact_buffer(contacts, stream);
+            gpu_state.stats.num_contacts_found = 0;
+            return;
+        }
+
+        float max_support = 0.0f;
+        {
+            ShearProfileRange range("CLL Shear: Max Support");
+            gpu_state.shear_max_support.enqueue(state.particles.support_extent,
+                state.particles.radius, n, stream);
+            max_support = gpu_state.shear_max_support.wait(n, stream);
+        }
+        const double skin = config.neighbor.verlet_buffer_enabled
+            ? static_cast<double>(config.neighbor.verlet_skin) : 0.0;
+        const double search_range = 2.0 * static_cast<double>(max_support) + skin;
+        const double min_x = config.domain.box_min.x;
+        const double min_y = config.domain.box_min.y;
+        const double max_x = config.domain.box_max.x;
+        const double max_y = config.domain.box_max.y;
+        const double lx = max_x - min_x, ly = max_y - min_y;
+        if (!std::isfinite(search_range) || search_range <= 0.0 ||
+            !(search_range < 0.5 * lx) || !(search_range < 0.5 * ly))
+            throw std::runtime_error("shear CLL unique-image condition violated: 2*max_support+skin must be positive and below half Lx and Ly");
+        const ShearPhase phase = compute_shear_phase_checked(
+            config.shear_box, lx, ly, evaluation_time);
+        // The extra rounding margin keeps the 3x3 cell stencil conservative.
+        const double cell_size = std::nextafter(search_range * 1.001,
+            std::numeric_limits<double>::infinity());
+        const double cells_x = std::ceil(lx / cell_size);
+        const double cells_y = std::ceil(ly / cell_size);
+        if (!(cells_x >= 1.0) || !(cells_y >= 1.0) ||
+            cells_x * cells_y > std::numeric_limits<int32_t>::max())
+            throw std::runtime_error("shear CLL XY bin grid exceeds int32 capacity");
+        const int32_t nx = static_cast<int32_t>(cells_x);
+        const int32_t ny = static_cast<int32_t>(cells_y);
+        const int32_t num_bins = static_cast<int32_t>(cells_x * cells_y);
+        const ShearGrid grid{min_x, min_y, max_x, max_y, cell_size,
+            1.0 / cell_size, lx, ly, phase.reduced_shift, search_range, nx, ny};
+
+        {
+            ShearProfileRange range("CLL Shear: Resize");
+            if (num_bins > gpu_state.shear_heads_capacity) {
+                const int64_t grown = std::max<int64_t>(num_bins,
+                    2LL * gpu_state.shear_heads_capacity);
+                const int32_t target = static_cast<int32_t>(std::min<int64_t>(
+                    grown, std::numeric_limits<int32_t>::max()));
+                int32_t* larger = nullptr;
+                shear_cuda_check(cudaMalloc(&larger, static_cast<size_t>(target) * sizeof(int32_t)));
+                if (gpu_state.shear_heads) shear_cuda_check(cudaFree(gpu_state.shear_heads));
+                gpu_state.shear_heads = larger;
+                gpu_state.shear_heads_capacity = target;
+            }
+            if (n > gpu_state.shear_particle_capacity) {
+                const int64_t grown = std::max<int64_t>(n,
+                    std::max<int64_t>(1024,
+                        2LL * gpu_state.shear_particle_capacity));
+                const int32_t target = static_cast<int32_t>(std::min<int64_t>(
+                    grown, std::numeric_limits<int32_t>::max()));
+                int32_t* larger = nullptr;
+                shear_cuda_check(cudaMalloc(&larger, static_cast<size_t>(target) * sizeof(int32_t)));
+                if (gpu_state.shear_next) shear_cuda_check(cudaFree(gpu_state.shear_next));
+                gpu_state.shear_next = larger;
+                gpu_state.shear_particle_capacity = target;
+            }
+        }
+        {
+            ShearProfileRange range("CLL Shear: Clear Bins");
+            shear_cuda_check(cudaMemsetAsync(gpu_state.shear_heads, 0xff,
+                static_cast<size_t>(num_bins) * sizeof(int32_t), stream));
+        }
+        const int threads = 256;
+        {
+            ShearProfileRange range("CLL Shear: Bin");
+            shear_bin_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
+                state.particles.pos_x, state.particles.pos_y,
+                gpu_state.shear_heads, gpu_state.shear_next, n, grid);
+            shear_cuda_check(cudaGetLastError());
+        }
+        for (;;) {
+            NeighborSearch::reset_contact_buffer(contacts, stream);
+            {
+                ShearProfileRange range("CLL Shear: Query");
+                shear_query_kernel<<<(num_local + threads - 1) / threads, threads, 0, stream>>>(
+                    state.particles.pos_x, state.particles.pos_y, state.particles.pos_z,
+                    state.particles.support_extent, state.particles.radius,
+                    state.particles.clump_id, gpu_state.shear_heads, gpu_state.shear_next,
+                    contacts.pairs, contacts.num_contacts, contacts.max_contacts,
+                    // Every shear evaluation rebuilds, so history must reflect
+                    // current material support without a future-motion shell.
+                    num_local, grid, 0.0f);
+                shear_cuda_check(cudaGetLastError());
+            }
+            int32_t found;
+            {
+                ShearProfileRange range("CLL Shear: Count");
+                found = NeighborSearch::get_contact_count(contacts, stream);
+            }
+            if (found < 0)
+                throw std::overflow_error("shear CLL contact count overflowed int32");
+            if (found <= contacts.max_contacts) {
+                gpu_state.stats.num_contacts_found = found;
+                gpu_state.stats.num_rebuilds++;
+                gpu_state.stats.cache_misses++;
+                state.neighbor.num_particles = n;
+                return;
+            }
+            const int64_t grown = std::max<int64_t>(found,
+                2LL * contacts.max_contacts);
+            if (grown > std::numeric_limits<int32_t>::max())
+                throw std::overflow_error("shear CLL contact buffer exceeds int32 capacity");
+            {
+                ShearProfileRange range("CLL Shear: Overflow Resize");
+                NeighborSearch::free_contact_buffer(contacts);
+                NeighborSearch::allocate_contact_buffer(contacts,
+                    static_cast<int32_t>(grown));
+            }
+        }
     }
 
     // Compute current cell IDs
@@ -1313,6 +1555,8 @@ void CLLSearchImpl::rebuild(
     const SimConfig& config,
     cudaStream_t stream
 ) {
+    // Shear bins depend on the current phase and are rebuilt by find_contacts.
+    if (config.shear_box.enabled) return;
     CLLGPUState& gpu_state = get_gpu_state();
 
     int32_t num_particles = state.particles.num_particles;
@@ -1401,6 +1645,7 @@ void CLLSearchImpl::launch_async_displacement_monitor(
     const SimConfig& config,
     cudaStream_t stream
 ) {
+    if (config.shear_box.enabled) return;
     if (!config.neighbor.verlet_buffer_enabled) return;
 
     CLLGPUState& gpu_state = get_gpu_state();
@@ -1779,6 +2024,15 @@ void CLLSearchImpl::shutdown(SimulationState& state, int32_t gpu_id) {
     if (current_gpu != gpu_id) {
         cudaSetDevice(gpu_id);
     }
+
+    if (gpu_state.shear_heads) cudaFree(gpu_state.shear_heads);
+    if (gpu_state.shear_next) cudaFree(gpu_state.shear_next);
+    gpu_state.shear_heads = nullptr;
+    gpu_state.shear_next = nullptr;
+    gpu_state.shear_heads_capacity = 0;
+    gpu_state.shear_particle_capacity = 0;
+    if (gpu_state.shear_max_support.device_result)
+        gpu_state.shear_max_support.release();
 
     // Free sorting buffers
     if (gpu_state.prev_cell_ids) {

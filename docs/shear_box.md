@@ -114,6 +114,13 @@ neighbor:
   update_frequency: 1
 ```
 
+`neighbor.method: cll` is also supported for DEM shear boxes. It rebuilds
+2D XY cell bins at each contact evaluation using the current particle support
+extent and shear phase, then checks full 3D distances. The contact search
+requires `2*max_support+verlet_skin` to be less than half each planar box
+length so every particle pair has a unique periodic image. The vertical box
+extent does not constrain the bin size. `update_frequency` must remain `1`.
+
 Keep `shear_box.gravity_images.cutoff_radius: 0.0` when comparing the uncut multi-GPU gravity calculation. All compared runs must use
 the same physical particles, image layers, and force parameters. A positive
 cutoff changes the requested gravity calculation and cannot substitute for an

@@ -234,6 +234,11 @@ if(BUILD_TESTING)
     target_link_libraries(granit_lbvh_contact_dedup_test PRIVATE yaml-cpp)
     add_test(NAME peer_transfer_gpu COMMAND granit_peer_transfer_gpu_test)
     add_test(NAME lbvh_contact_dedup COMMAND granit_lbvh_contact_dedup_test)
+    granit_solver(granit_cll_shear_contacts_test
+        components/tests/unit_test/cll/shear_contacts.cu)
+    add_test(NAME cll_shear_contacts COMMAND granit_cll_shear_contacts_test)
     set_tests_properties(peer_transfer_gpu lbvh_contact_dedup PROPERTIES
+        LABELS "gpu" SKIP_RETURN_CODE 77)
+    set_tests_properties(cll_shear_contacts PROPERTIES
         LABELS "gpu" SKIP_RETURN_CODE 77)
 endif()

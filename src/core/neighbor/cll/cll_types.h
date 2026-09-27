@@ -7,6 +7,7 @@
 #define CUDADEM_CLL_TYPES_H
 
 #include "../neighbor_types.h"
+#include "../lbvh/max_support_reduce.h"
 #include <cuda_runtime.h>
 #include <cstdint>
 
@@ -22,6 +23,14 @@ struct CLLGPUState {
     bool initialized;
     bool grid_valid;
     int32_t last_rebuild_step;
+
+    // Shear-only XY bins. The sparse vertical direction is filtered exactly
+    // during the query; these buffers grow after migration or ghost exchange.
+    int32_t* shear_heads;
+    int32_t* shear_next;
+    int32_t shear_heads_capacity;
+    int32_t shear_particle_capacity;
+    lbvh::MaxSupportReduction shear_max_support;
 
     // Internal buffers (not exposed in NeighborData)
     int32_t* prev_cell_ids;        // Previous cell IDs for change detection
@@ -64,6 +73,8 @@ struct CLLGPUState {
 
     CLLGPUState()
         : gpu_id(-1), initialized(false), grid_valid(false), last_rebuild_step(-1),
+          shear_heads(nullptr), shear_next(nullptr), shear_heads_capacity(0),
+          shear_particle_capacity(0),
           prev_cell_ids(nullptr), temp_keys(nullptr), temp_values(nullptr),
           temp_pos_x(nullptr), temp_pos_y(nullptr), temp_pos_z(nullptr),
           temp_vel_x(nullptr), temp_vel_y(nullptr), temp_vel_z(nullptr),

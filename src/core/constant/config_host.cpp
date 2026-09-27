@@ -1727,8 +1727,9 @@ SimConfig parse_yaml(const std::string& yaml_path) {
         }
         if (config.clump.num_instances > 0)
             throw std::runtime_error("shear_box does not support clumps");
-        if (config.neighbor.method != NeighborMethod::LBVH)
-            throw std::runtime_error("shear_box requires neighbor.method: lbvh");
+        if (config.neighbor.method != NeighborMethod::LBVH &&
+            config.neighbor.method != NeighborMethod::CELL_LINKED_LIST)
+            throw std::runtime_error("shear_box requires neighbor.method: lbvh or cll");
         if (config.neighbor.update_frequency != 1)
             throw std::runtime_error(
                 "shear_box currently requires neighbor.update_frequency: 1");

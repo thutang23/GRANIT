@@ -33,6 +33,7 @@ public:
         SimulationState& state,
         const SimConfig& config,
         ContactListBuffer& contacts,
+        double evaluation_time,
         cudaStream_t stream = 0
     );
 
