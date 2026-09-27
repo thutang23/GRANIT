@@ -28,9 +28,9 @@ constexpr int N = 8;
 
 __global__ void brute_pairs(const double* x, const double* y, const double* z,
                             const float* h, ContactPair* pairs,
-                            unsigned long long* count, float cutoff, float skin) {
+                            unsigned long long* count, int num_local, float cutoff, float skin) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= N) return;
+  if (i >= num_local) return;
   for (int j = i + 1; j < N; ++j) {
     if (cudadem::sph_pair_candidate(float(x[i])-float(x[j]),
                                      float(y[i])-float(y[j]),
@@ -156,19 +156,21 @@ int main() {
     CHECK(cudaMemcpy(dnodes, nodes.data(), sizeof(nodes), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(dboxes, boxes.data(), sizeof(boxes), cudaMemcpyHostToDevice));
 
-    for (float skin : {0.0f, 0.002f}) {
+    for (float skin : {0.0f, 0.002f}) for (int num_local : {N, 3, 0}) {
       CHECK(cudaMemset(found_count, 0, sizeof(unsigned long long)));
       CHECK(cudaMemset(reference_count, 0, sizeof(unsigned long long)));
       CHECK(cudaMemset(overflow, 0, sizeof(int32_t)));
       cudadem::lbvh::sph_find_pairs_kernel<<<1, 32>>>(
           dx, dy, dz, dh, dnodes, dboxes, dorder, found, found_count,
-          28, N, cutoff, skin, overflow);
-      brute_pairs<<<1, 32>>>(dx, dy, dz, dh, reference, reference_count, cutoff, skin);
+          28, N, num_local, cutoff, skin, overflow);
+      brute_pairs<<<1, 32>>>(dx, dy, dz, dh, reference, reference_count,
+                             num_local, cutoff, skin);
       CHECK(cudaDeviceSynchronize());
       int32_t overflowed = 0;
       CHECK(cudaMemcpy(&overflowed, overflow, sizeof(overflowed), cudaMemcpyDeviceToHost));
       if (overflowed || read_pairs(found, found_count) != read_pairs(reference, reference_count)) {
-        std::fprintf(stderr, "SPH LBVH pair-set mismatch at phase %d, skin %g\n", phase, skin);
+        std::fprintf(stderr, "SPH LBVH pair-set mismatch at phase %d, skin %g, locals %d\n",
+                     phase, skin, num_local);
         return 1;
       }
     }

@@ -244,7 +244,8 @@ void LBVHSearchImpl::find_sph_neighbors(SimulationState& state, const SimConfig&
           state.particles.pos_x, state.particles.pos_y, state.particles.pos_z,
           state.particles.smoothing_length, gpu.nodes, gpu.aabbs, gpu.sorted_indices,
           gpu.sph_pairs.pairs, gpu.sph_pair_count, gpu.sph_pairs.max_contacts,
-          n, config.sph.kernel_cutoff_factor, skin, gpu.sph_overflow);
+          n, state.particles.num_local, config.sph.kernel_cutoff_factor, skin,
+          gpu.sph_overflow);
       CUDA_CHECK(cudaGetLastError());
       CUDA_CHECK(cudaMemcpyAsync(&count, gpu.sph_pair_count, sizeof(count), cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaMemcpyAsync(&overflow, gpu.sph_overflow, sizeof(overflow), cudaMemcpyDeviceToHost, stream));
