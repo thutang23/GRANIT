@@ -18,6 +18,8 @@
 #include "src/core/neighbor/lbvh/lbvh_types.h"
 #include "src/core/neighbor/sph_pair.cuh"
 #include "src/core/sph/sph_device_helpers.cuh"
+#include <cfloat>
+#include <math_constants.h>
 
 namespace cudadem {
 
@@ -131,11 +133,18 @@ __device__ void for_each_sph_neighbor_lbvh(
     // cannot be a distinct neighbor to visit.
     if (neighbor.num_particles <= 1) return;
 
-    float query_r = 0.5f * (hi + dev_sph_h_max_global) * kernel_cutoff_factor;
+    // Each SPH LBVH leaf contributes half of K*hj. The query contributes
+    // half of K*hi; round outward to retain cutoff and float-position edges.
+    float query_r = nextafterf((0.5f * kernel_cutoff_factor * hi) *
+        (1.0f + 8.0f * FLT_EPSILON) + 2.0f * sqrtf(FLT_MIN), CUDART_INF_F);
 
     lbvh::LBVHAABB query_box;
-    query_box.lower = make_float4(pi_x - query_r, pi_y - query_r, pi_z - query_r, 0.0f);
-    query_box.upper = make_float4(pi_x + query_r, pi_y + query_r, pi_z + query_r, 0.0f);
+    query_box.lower = make_float4(nextafterf(pi_x - query_r, -CUDART_INF_F),
+                                  nextafterf(pi_y - query_r, -CUDART_INF_F),
+                                  nextafterf(pi_z - query_r, -CUDART_INF_F), 0.0f);
+    query_box.upper = make_float4(nextafterf(pi_x + query_r, CUDART_INF_F),
+                                  nextafterf(pi_y + query_r, CUDART_INF_F),
+                                  nextafterf(pi_z + query_r, CUDART_INF_F), 0.0f);
 
     constexpr int STACK_SIZE = 128;
     uint32_t stack[STACK_SIZE];
@@ -174,11 +183,11 @@ __device__ void for_each_sph_neighbor_lbvh(
                     float dy_ij = pi_y - pj_y;
                     float dz_ij = pi_z - pj_z;
                     float dist_sq = dx_ij * dx_ij + dy_ij * dy_ij + dz_ij * dz_ij;
-                    float query_r_sq = query_r * query_r;
-                    if (dist_sq < query_r_sq) {
-                        float dist = sqrtf(dist_sq);
-                        lambda(j, dx_ij, dy_ij, dz_ij, dist);
-                    }
+                    // The gravity callback checks double-precision positions.
+                    // A float sphere test here could discard an exact cutoff
+                    // neighbor because of coordinate rounding.
+                    float dist = sqrtf(dist_sq);
+                    lambda(j, dx_ij, dy_ij, dz_ij, dist);
                 }
             } else {  // Internal node
                 if (stack_ptr < stack_end) {
@@ -202,11 +211,8 @@ __device__ void for_each_sph_neighbor_lbvh(
                     float dy_ij = pi_y - pj_y;
                     float dz_ij = pi_z - pj_z;
                     float dist_sq = dx_ij * dx_ij + dy_ij * dy_ij + dz_ij * dz_ij;
-                    float query_r_sq = query_r * query_r;
-                    if (dist_sq < query_r_sq) {
-                        float dist = sqrtf(dist_sq);
-                        lambda(j, dx_ij, dy_ij, dz_ij, dist);
-                    }
+                    float dist = sqrtf(dist_sq);
+                    lambda(j, dx_ij, dy_ij, dz_ij, dist);
                 }
             } else {  // Internal node
                 if (stack_ptr < stack_end) {

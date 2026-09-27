@@ -7,6 +7,13 @@
 
 namespace cudadem::lbvh {
 
+// Match cub::Max's comparison, including ties and NaNs.
+struct SupportMaximum {
+  __host__ __device__ float operator()(float a, float b) const {
+    return b > a ? b : a;
+  }
+};
+
 inline void MaxSupportReduction::checked(cudaError_t error) {
   if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -32,7 +39,7 @@ inline void MaxSupportReduction::reserve(const float* values, int32_t n, cudaStr
       ? n : (n > grown ? n : grown));
   size_t needed = 0;
   checked(cub::DeviceReduce::Reduce(nullptr, needed, values, device_result,
-      target, cub::Max(), 0.0f, stream));
+      target, SupportMaximum{}, 0.0f, stream));
   if (needed > temp_bytes) {
     void* larger = nullptr;
     checked(cudaMalloc(&larger, needed));
@@ -50,7 +57,7 @@ inline void MaxSupportReduction::enqueue(const float* support_extent, const floa
     throw std::runtime_error("LBVH maximum support input or output is null");
   reserve(values, n, stream);
   checked(cub::DeviceReduce::Reduce(temp, temp_bytes, values, device_result,
-      n, cub::Max(), 0.0f, stream));
+      n, SupportMaximum{}, 0.0f, stream));
   checked(cudaMemcpyAsync(host_result, device_result, sizeof(float),
       cudaMemcpyDeviceToHost, stream));
 }

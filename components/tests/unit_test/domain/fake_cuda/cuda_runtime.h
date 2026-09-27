@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 
 enum cudaError_t {
@@ -57,6 +58,12 @@ inline cudaError_t cudaGetDevice(int* device) {
 inline cudaError_t cudaSetDevice(int device) {
     fake_cuda::current_device = device;
     return cudaSuccess;
+}
+inline cudaError_t cudaDeviceGetPCIBusId(char* bus_id, int length, int device) {
+    if (length <= 0 || device < 0 || device > 255) return cudaErrorUnknown;
+    const int written = std::snprintf(bus_id, static_cast<size_t>(length),
+                                      "0000:%02x:00.0", device);
+    return written >= 0 && written < length ? cudaSuccess : cudaErrorUnknown;
 }
 inline cudaError_t cudaDeviceCanAccessPeer(int* accessible, int, int) {
     ++fake_cuda::can_access_calls;

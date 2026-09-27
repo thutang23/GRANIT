@@ -76,6 +76,7 @@
 #include <thrust/extrema.h>
 #include <thrust/execution_policy.h>
 #include <thrust/iterator/constant_iterator.h>
+#include <thrust/iterator/counting_iterator.h>
 
 #ifdef CUDADEM_HAVE_LET
 #include "domain/let_communicator.h"

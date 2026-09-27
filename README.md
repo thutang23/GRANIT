@@ -7,8 +7,8 @@ dependencies, configuration references, and redistribution notices.
 
 ## Build
 
-Use Linux, a CUDA-compatible C++17 compiler with OpenMP, CUDA Toolkit 12.1,
-and CMake 3.18 or newer. The multi-GPU executable also requires MPI development
+Use Linux, a CUDA-compatible C++17 compiler with OpenMP, CUDA Toolkit 12.x
+(the original baseline is 12.1) or 13.2, and CMake 3.18 or newer. The multi-GPU executable also requires MPI development
 headers and libraries. yaml-cpp is fetched from its official upstream
 repository at a fixed revision. The first configuration
 needs network access unless their sources are already cached.
@@ -19,11 +19,29 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 cmake --build build -j
 ```
 
-The default architecture list is `70;75;80;86;87;89;90`: native code and PTX
-for Volta, Turing, Ampere (including Orin), Ada and Hopper. For a faster local
-build, override it with `-DCMAKE_CUDA_ARCHITECTURES=89` on an L40. CUDA 12.1
-cannot emit native Blackwell code; bundled PTX provides the forward-compatibility
-route described by [NVIDIA](https://docs.nvidia.com/cuda/archive/12.9.0/blackwell-compatibility-guide/index.html).
+Use a separate build directory when switching toolkits. For CUDA 13.2:
+
+```bash
+cmake -S . -B build-cuda13 -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.2/bin/nvcc
+cmake --build build-cuda13 -j
+```
+
+Default architectures include native code and PTX:
+
+| Toolkit | Default `CMAKE_CUDA_ARCHITECTURES` | GPU support |
+| --- | --- | --- |
+| CUDA 12.x | `70;75;80;86;87;89;90` | Volta, Turing, Ampere (including Orin), Ada, Hopper |
+| CUDA 13.2 | `75;80;86;87;89;90` | Turing, Ampere (including Orin), Ada, Hopper |
+
+CUDA 13 removed Volta compilation support. Keep using a CUDA 12.x build for
+Volta; the source tree and solver features are shared between both toolkits.
+An explicit `CMAKE_CUDA_ARCHITECTURES` or `CUDAARCHS` selection is preserved,
+so it must be supported by the chosen toolkit. For a faster local build,
+use `-DCMAKE_CUDA_ARCHITECTURES=80` on an A100 or `89` on an L40.
+CUDA 12.1 cannot emit native Blackwell code; bundled PTX provides the
+forward-compatibility route described by
+[NVIDIA](https://docs.nvidia.com/cuda/archive/12.9.0/blackwell-compatibility-guide/index.html).
 Blackwell hardware execution is not part of this checkout's local validation.
 Executables are written to
 `build/bin/`:

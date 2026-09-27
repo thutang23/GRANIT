@@ -56,6 +56,17 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 cmake --build build -j
 ```
 
+CUDA 12.x and CUDA 13.2 use the same pinned OptiX headers. To use CUDA 13.2,
+select its `nvcc` in a fresh build directory. The embedded OptiX PTX targets
+`compute_70` with CUDA 12.x and `compute_75` with CUDA 13.2, whose compiler no
+longer accepts `compute_70`. Runtime selection still requires RT cores; Volta
+never used this optional backend. CUDA 12.x builds retain Volta support through
+the existing CUDA neighbor implementation.
+
+The NVIDIA driver must support the selected CUDA toolkit and its generated
+PTX as well as OptiX. The OptiX 8.0 R535 minimum alone does not establish
+compatibility with CUDA 13.2-generated PTX.
+
 The header fetch needs network access on the first configuration. An invalid
 explicit `OPTIX_INCLUDE_DIR` fails configuration with the missing header and
 instructions to provide a valid directory or disable OptiX. The build does

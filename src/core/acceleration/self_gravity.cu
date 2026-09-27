@@ -42,6 +42,7 @@
 #include "../sph/sph_gravity_correction.h"
 #include "../sph/sph_physics.h"
 #include "../sph/sph_neighbor_query.cuh"
+#include "../neighbor/lbvh/lbvh_manager.h"
 #include "../particle_model/clump.h"
 #include "body_fitted_fmm/clump_p3_gravity.cuh"
 #include "body_fitted_fmm/clump_gravity_body_view.cuh"
@@ -62,8 +63,14 @@
 namespace cudadem {
 
 __global__ void sph_gravity_softening_correction_kernel(
-    ParticleSoA p, NeighborData neighbors, double G, double epsilon, int count, bool outer) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    ParticleSoA p, NeighborData neighbors, double G, double epsilon, int count, bool outer,
+    int query_count, bool morton_order) {
+    const int rank = blockIdx.x * blockDim.x + threadIdx.x;
+    if (rank >= query_count) return;
+    // Schedule nearby targets together without changing the canonical target
+    // index or the per-target BVH traversal/accumulation order. All leaves,
+    // including ghosts, remain in the tree; only owned targets write forces.
+    const int i = morton_order ? static_cast<int>(neighbors.sorted_indices[rank]) : rank;
     if (i >= count) return;
     // h may have evolved since the hydro adjacency was built. The point BVH
     // remains valid at these positions, but its cached support list may not.
@@ -102,15 +109,33 @@ void add_sph_gravity_softening_correction(
     if (!n) return;
     if (compute_sph_h_min(state, n, stream) < config.sph.hsml_min)
         throw std::runtime_error("SPH FMM requires imported smoothing lengths >= hsml_min");
+    // The single-GPU hydro tree predates this stage's smoothing-length update.
+    // Multi-GPU already rebuilds after its post-force halo refresh.
+    if (!config.multigpu.enabled &&
+        state.neighbor.active_method == NeighborMethod::LBVH)
+        lbvh::LBVHSearchImpl::refresh_sph_bounds(state, stream);
     const double epsilon = sph_gravity_regularization_length(config, stream);
     // Subtracting large baseline forces can erase the softened force even in
     // FP64. Reject a poorly scaled baseline instead of silently losing it.
     if (!(epsilon > 0.0) || compute_sph_h_max(state, n, stream) > 128.0 * epsilon)
         throw std::runtime_error("SPH FMM compact correction requires h_max/epsilon <= 128; "
                                  "use physical h bounds and a shallower FMM depth");
-    sph_gravity_softening_correction_kernel<<<(n+255)/256,256,0,stream>>>(
+    // An LBVH order is a permutation of *all* local and ghost indices. Query
+    // every rank and discard ghost targets after mapping; restricting the
+    // launch to n ranks would miss owned targets sorted behind ghosts.
+    // The multi-GPU force stage exposes only owned particles through
+    // ParticleSoA::num_particles, but keeps num_ghost and the tree's full
+    // particle count current after its halo refresh.
+    const int tree_count = state.neighbor.num_particles;
+    const bool morton_order = state.neighbor.active_method == NeighborMethod::LBVH &&
+        state.neighbor.sorted_indices && state.neighbor.nodes && state.neighbor.aabbs &&
+        tree_count == n + state.particles.num_ghost &&
+        tree_count <= state.particles.capacity && tree_count > 1;
+    const int query_count = morton_order ? tree_count : n;
+    sph_gravity_softening_correction_kernel<<<(query_count+255)/256,256,0,stream>>>(
         state.particles, state.neighbor,
-        config.acceleration.unified_fmm.gravitational_constant, epsilon, n, outer);
+        config.acceleration.unified_fmm.gravitational_constant, epsilon, n, outer,
+        query_count, morton_order);
     CUDA_CHECK(cudaGetLastError());
 }
 

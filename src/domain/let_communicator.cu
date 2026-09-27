@@ -16,6 +16,7 @@
 // =============================================================================
 
 #include "let_communicator.h"
+#include "peer_transfer.h"
 #include "multigpu_phase_coordinator.h"
 #include "domain_manager.h"
 #include "cuda_utils.h"
@@ -912,22 +913,22 @@ bool LETCommunicator::wait_and_stage_fmm_recv_counts(uint64_t epoch, cudaStream_
         int32_t dst_node = state_.h_fmm_recv_node_offsets[p];
         for (int m = 1; m < 256; ++m) {
             if (!(m & (1 << state_.gpu_id)) || !plan.shared_count[m]) continue;
-            CUDA_CHECK(cudaMemcpyPeerAsync(state_.d_fmm_recv_nodes + dst_node, state_.gpu_id,
+            copy_peer_payload(state_.d_fmm_recv_nodes + dst_node, state_.gpu_id,
                 g_fmm_send_nodes[p] + plan.shared_offset[m], p,
-                static_cast<size_t>(plan.shared_count[m]) * sizeof(FMMLETNode), s));
+                static_cast<size_t>(plan.shared_count[m]) * sizeof(FMMLETNode), s);
             dst_node += plan.shared_count[m];
         }
         if (plan.residual_count[state_.gpu_id]) {
-            CUDA_CHECK(cudaMemcpyPeerAsync(state_.d_fmm_recv_nodes + dst_node, state_.gpu_id,
+            copy_peer_payload(state_.d_fmm_recv_nodes + dst_node, state_.gpu_id,
                 g_fmm_send_nodes[p] + plan.residual_offset[state_.gpu_id], p,
-                static_cast<size_t>(plan.residual_count[state_.gpu_id]) * sizeof(FMMLETNode), s));
+                static_cast<size_t>(plan.residual_count[state_.gpu_id]) * sizeof(FMMLETNode), s);
             dst_node += plan.residual_count[state_.gpu_id];
         }
         if (dst_node != state_.h_fmm_recv_node_offsets[p] + recv_nodes_host[p])
             throw std::runtime_error("LET sender plan/node count mismatch");
-        if (recv_particles_host[p]) CUDA_CHECK(cudaMemcpyPeerAsync(state_.d_fmm_recv_particles + state_.h_fmm_recv_particle_offsets[p], state_.gpu_id,
+        if (recv_particles_host[p]) copy_peer_payload(state_.d_fmm_recv_particles + state_.h_fmm_recv_particle_offsets[p], state_.gpu_id,
             g_fmm_send_particles[p] + plan.particle_offset[state_.gpu_id], p,
-            recv_particles_host[p] * sizeof(LETParticle), s));
+            recv_particles_host[p] * sizeof(LETParticle), s);
         if (transfer_timing) {
             CUDA_CHECK(cudaEventRecord(transfer_timing->stop, s));
             transfer_timing->pending = true;

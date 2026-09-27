@@ -53,15 +53,25 @@ struct NvmlLinkEvidence {
     bool shared_switch_with_peer = false;
 };
 
+struct NvmlRemoteEndpoint {
+    std::string pci_id;
+    bool is_switch = false;
+};
+
 // NVML reports active physical NVLink ports.  A remote PCI endpoint that is a
-// peer GPU proves a direct link; a common endpoint that is not any GPU proves
-// that both GPUs attach to the same NVSwitch.  All failed/ambiguous probes are
-// intentionally left unclassified.
+// peer GPU proves a direct link; a common endpoint typed by NVML as SWITCH
+// proves that both GPUs attach to the same NVSwitch. All failed/ambiguous
+// probes are intentionally left unclassified.
 std::vector<std::vector<NvmlLinkEvidence>> query_nvml_link_evidence(
     const std::vector<std::string>& cuda_pci_bus_ids) {
     const size_t count = cuda_pci_bus_ids.size();
     std::vector<std::vector<NvmlLinkEvidence>> evidence(
         count, std::vector<NvmlLinkEvidence>(count));
+    std::vector<std::string> normalized_gpu_ids(count);
+    for (size_t i = 0; i < count; ++i) {
+        normalized_gpu_ids[i] = normalize_pci_bus_id(cuda_pci_bus_ids[i]);
+        if (normalized_gpu_ids[i].empty()) return evidence;
+    }
     if (nvmlInit_v2() != NVML_SUCCESS) return evidence;
 
     std::vector<nvmlDevice_t> devices(count, nullptr);
@@ -72,7 +82,7 @@ std::vector<std::vector<NvmlLinkEvidence>> query_nvml_link_evidence(
         }
     }
 
-    std::vector<std::vector<std::string>> active_remote_endpoints(count);
+    std::vector<std::vector<NvmlRemoteEndpoint>> active_remote_endpoints(count);
     for (size_t i = 0; i < count; ++i) {
         for (unsigned int link = 0; link < NVML_NVLINK_MAX_LINKS; ++link) {
             nvmlEnableState_t state = NVML_FEATURE_DISABLED;
@@ -81,31 +91,38 @@ std::vector<std::vector<NvmlLinkEvidence>> query_nvml_link_evidence(
             nvmlPciInfo_t remote_pci{};
             if (nvmlDeviceGetNvLinkRemotePciInfo_v2(devices[i], link, &remote_pci) != NVML_SUCCESS ||
                 remote_pci.busId[0] == '\0') continue;
-            active_remote_endpoints[i].emplace_back(remote_pci.busId);
+            const std::string endpoint = normalize_pci_bus_id(remote_pci.busId);
+            if (endpoint.empty()) continue;
+            nvmlIntNvLinkDeviceType_t remote_type = NVML_NVLINK_DEVICE_TYPE_UNKNOWN;
+            const bool is_switch =
+                nvmlDeviceGetNvLinkRemoteDeviceType(devices[i], link, &remote_type) == NVML_SUCCESS &&
+                remote_type == NVML_NVLINK_DEVICE_TYPE_SWITCH;
+            active_remote_endpoints[i].push_back({endpoint, is_switch});
         }
     }
 
     for (size_t i = 0; i < count; ++i) {
         for (size_t j = 0; j < count; ++j) {
             if (i == j) continue;
-            for (const std::string& endpoint : active_remote_endpoints[i]) {
-                if (endpoint == cuda_pci_bus_ids[j]) {
+            for (const NvmlRemoteEndpoint& endpoint : active_remote_endpoints[i]) {
+                if (endpoint.pci_id == normalized_gpu_ids[j]) {
                     evidence[i][j].direct_to_peer = true;
                     break;
                 }
             }
             if (evidence[i][j].direct_to_peer) continue;
-            for (const std::string& endpoint : active_remote_endpoints[i]) {
+            for (const NvmlRemoteEndpoint& endpoint : active_remote_endpoints[i]) {
+                if (!endpoint.is_switch) continue;
                 // A GPU PCI endpoint would have established direct evidence
                 // above (or be an unproven route); it is not treated as a
                 // switch endpoint.
                 bool is_gpu_endpoint = false;
-                for (const std::string& gpu_pci : cuda_pci_bus_ids) {
-                    if (endpoint == gpu_pci) { is_gpu_endpoint = true; break; }
+                for (const std::string& gpu_pci : normalized_gpu_ids) {
+                    if (endpoint.pci_id == gpu_pci) { is_gpu_endpoint = true; break; }
                 }
                 if (is_gpu_endpoint) continue;
-                for (const std::string& peer_endpoint : active_remote_endpoints[j]) {
-                    if (endpoint == peer_endpoint) {
+                for (const NvmlRemoteEndpoint& peer_endpoint : active_remote_endpoints[j]) {
+                    if (peer_endpoint.is_switch && endpoint.pci_id == peer_endpoint.pci_id) {
                         evidence[i][j].shared_switch_with_peer = true;
                         break;
                     }
@@ -244,9 +261,12 @@ void Communicator::initialize(int32_t device_id, int32_t num_gpus, int32_t max_p
         h_send_index_buffers[peer] = buffers_[peer].d_send_indices;
     }
     CUDA_CHECK(cudaMalloc(&d_send_particle_buffers_, num_gpus * sizeof(PackedParticle*)));
+    CUDA_CHECK(cudaMalloc(&d_send_sph_halo_buffers_, num_gpus * sizeof(SphHaloParticle*)));
     CUDA_CHECK(cudaMalloc(&d_send_index_buffers_, num_gpus * sizeof(int32_t*)));
     CUDA_CHECK(cudaMemcpy(d_send_particle_buffers_, h_send_particle_buffers.data(),
                           num_gpus * sizeof(PackedParticle*), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_send_sph_halo_buffers_, 0,
+                          num_gpus * sizeof(SphHaloParticle*)));
     CUDA_CHECK(cudaMemcpy(d_send_index_buffers_, h_send_index_buffers.data(),
                           num_gpus * sizeof(int32_t*), cudaMemcpyHostToDevice));
 
@@ -343,6 +363,7 @@ void Communicator::query_topology() {
                                                      direct_nvlink_proven,
                                                      nvswitch_path_proven);
             topology_.link_class[i][j] = link;
+            register_peer_link_class(cuda_pci_bus_ids[i], cuda_pci_bus_ids[j], link);
             topology_.is_nvlink[i][j] = is_nvlink_fabric(link);
             topology_.nvlink_available = topology_.nvlink_available || is_nvlink_fabric(link);
         }
@@ -355,19 +376,21 @@ void Communicator::query_topology() {
 
 CommunicationAllocationTelemetry Communicator::allocation_telemetry() const {
     CommunicationAllocationTelemetry telemetry;
-    telemetry.send_particle_bytes = static_cast<size_t>(send_arena_capacity_) * sizeof(PackedParticle);
-    telemetry.recv_particle_bytes = static_cast<size_t>(recv_arena_capacity_) * sizeof(PackedParticle);
+    telemetry.send_particle_bytes = static_cast<size_t>(send_arena_capacity_) * sizeof(PackedParticle)
+        + static_cast<size_t>(send_sph_halo_capacity_) * sizeof(SphHaloParticle);
+    telemetry.recv_particle_bytes = static_cast<size_t>(recv_arena_capacity_) * sizeof(PackedParticle)
+        + static_cast<size_t>(recv_sph_halo_capacity_) * sizeof(SphHaloParticle);
     telemetry.send_history_bytes = static_cast<size_t>(send_history_arena_capacity_) * sizeof(ContactHistoryPacked)
         + static_cast<size_t>(send_wall_history_arena_capacity_) * sizeof(WallContactHistoryPacked);
     telemetry.recv_history_bytes = static_cast<size_t>(recv_history_arena_capacity_) * sizeof(ContactHistoryPacked)
         + static_cast<size_t>(recv_wall_history_arena_capacity_) * sizeof(WallContactHistoryPacked);
-    telemetry.send_index_bytes = static_cast<size_t>(send_arena_capacity_) * sizeof(int32_t);
+    telemetry.send_index_bytes = static_cast<size_t>(send_index_arena_capacity_) * sizeof(int32_t);
     // Five particle-indexed int32 arrays: halo mask, migration indices and
     // destinations, keep flags, and compacted indices. Scalar/pointer/box
     // metadata and the CUB scan workspace are also live communicator memory.
     telemetry.workspace_bytes = static_cast<size_t>(max_particles_) * (4 + (num_gpus_ + 31) / 32) * sizeof(int32_t)
         + cub_scan_temp_bytes_
-        + static_cast<size_t>(2 * num_gpus_) * sizeof(void*)
+        + static_cast<size_t>(3 * num_gpus_) * sizeof(void*)
         + static_cast<size_t>(5 * num_gpus_ + 3) * sizeof(int32_t)
         + static_cast<size_t>(6 * MAX_MULTI_GPUS) * sizeof(double);
     for (int32_t peer = 0; peer < num_gpus_; ++peer) {
@@ -389,8 +412,10 @@ HaloTransferSummary Communicator::halo_transfer_summary() const {
         summary.active_send_peers += buffer.h_send_count > 0;
         summary.active_receive_peers += buffer.h_recv_count > 0;
     }
-    summary.sent_bytes = static_cast<size_t>(summary.sent_particles) * sizeof(PackedParticle);
-    summary.received_bytes = static_cast<size_t>(summary.received_particles) * sizeof(PackedParticle);
+    const size_t packet_bytes = sph_halo_mode_
+        ? sph_halo_payload_bytes(sph_halo_payload_) : sizeof(PackedParticle);
+    summary.sent_bytes = static_cast<size_t>(summary.sent_particles) * packet_bytes;
+    summary.received_bytes = static_cast<size_t>(summary.received_particles) * packet_bytes;
     return summary;
 }
 
@@ -480,38 +505,88 @@ void Communicator::ensure_workspace_capacity(const int32_t required_capacity) {
                 allocation_telemetry().workspace_bytes);
 }
 
-void Communicator::layout_send_arena(const std::vector<int32_t>& counts) {
+void Communicator::layout_send_indices(const std::vector<int32_t>& counts) {
     int64_t total = 0;
     for (int32_t peer = 0; peer < num_gpus_; ++peer) if (peer != device_id_) total += counts[peer];
     if (total > std::numeric_limits<int32_t>::max())
         throw std::runtime_error("Communication send arena exceeds int32 indexing on GPU " + std::to_string(device_id_));
     const int32_t required = static_cast<int32_t>(total);
+    if (required > send_index_arena_capacity_) {
+        const int32_t old_capacity = send_index_arena_capacity_;
+        const int32_t capacity = grown_capacity(required, old_capacity, "send indices", device_id_);
+        cudaFree(d_send_index_arena_);
+        d_send_index_arena_ = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_send_index_arena_, static_cast<size_t>(capacity) * sizeof(int32_t)));
+        send_index_arena_capacity_ = capacity;
+        log_communication_growth(device_id_, "send-indices", old_capacity,
+                                 required, capacity, sizeof(int32_t));
+    }
+    int32_t offset = 0;
+    std::vector<int32_t*> indices(num_gpus_, nullptr);
+    for (int32_t peer = 0; peer < num_gpus_; ++peer) {
+        if (peer == device_id_) continue;
+        CommBuffer& b = buffers_[peer];
+        const int32_t count = counts[peer];
+        b.particle_capacity = count;
+        b.d_send_indices = count > 0 ? d_send_index_arena_ + offset : nullptr;
+        indices[peer] = b.d_send_indices;
+        offset += count;
+    }
+    send_particle_capacity_ = required;
+    CUDA_CHECK(cudaMemcpy(d_send_index_buffers_, indices.data(),
+                          num_gpus_ * sizeof(int32_t*), cudaMemcpyHostToDevice));
+}
+
+void Communicator::layout_send_arena(const std::vector<int32_t>& counts) {
+    layout_send_indices(counts);
+    const int32_t required = send_particle_capacity_;
     if (required > send_arena_capacity_) {
         const int32_t old_capacity = send_arena_capacity_;
         const int32_t capacity = grown_capacity(required, send_arena_capacity_, "send", device_id_);
-        cudaFree(d_send_particle_arena_); cudaFree(d_send_index_arena_);
-        d_send_particle_arena_ = nullptr; d_send_index_arena_ = nullptr;
+        cudaFree(d_send_particle_arena_);
+        d_send_particle_arena_ = nullptr;
         cudaError_t status = cudaMalloc(&d_send_particle_arena_, static_cast<size_t>(capacity) * sizeof(PackedParticle));
         if (status != cudaSuccess) throw std::runtime_error("OOM growing send particle arena on GPU " + std::to_string(device_id_) + ": " + cudaGetErrorString(status));
-        CUDA_CHECK(cudaMalloc(&d_send_index_arena_, static_cast<size_t>(capacity) * sizeof(int32_t)));
         send_arena_capacity_ = capacity;
-        log_communication_growth(device_id_, "send-particle-index", old_capacity,
-                                 required, capacity,
-                                 sizeof(PackedParticle) + sizeof(int32_t));
+        log_communication_growth(device_id_, "send-particle", old_capacity,
+                                 required, capacity, sizeof(PackedParticle));
     }
     int32_t offset = 0;
-    std::vector<PackedParticle*> particles(num_gpus_, nullptr); std::vector<int32_t*> indices(num_gpus_, nullptr);
+    std::vector<PackedParticle*> particles(num_gpus_, nullptr);
     for (int32_t peer = 0; peer < num_gpus_; ++peer) {
         if (peer == device_id_) continue;
         CommBuffer& b = buffers_[peer]; const int32_t count = counts[peer];
-        b.particle_capacity = count;
         b.d_send_particles = count > 0 ? d_send_particle_arena_ + offset : nullptr;
-        b.d_send_indices = count > 0 ? d_send_index_arena_ + offset : nullptr;
-        particles[peer] = b.d_send_particles; indices[peer] = b.d_send_indices; offset += count;
+        particles[peer] = b.d_send_particles; offset += count;
     }
-    send_particle_capacity_ = required;
     CUDA_CHECK(cudaMemcpy(d_send_particle_buffers_, particles.data(), num_gpus_ * sizeof(PackedParticle*), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_send_index_buffers_, indices.data(), num_gpus_ * sizeof(int32_t*), cudaMemcpyHostToDevice));
+}
+
+void Communicator::layout_sph_send_arena(const std::vector<int32_t>& counts) {
+    layout_send_indices(counts);
+    const int32_t required = send_particle_capacity_;
+    if (required > send_sph_halo_capacity_) {
+        const int32_t old_capacity = send_sph_halo_capacity_;
+        const int32_t capacity = grown_capacity(required, old_capacity, "send SPH halo", device_id_);
+        cudaFree(d_send_sph_halo_arena_);
+        d_send_sph_halo_arena_ = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_send_sph_halo_arena_, static_cast<size_t>(capacity) * sizeof(SphHaloParticle)));
+        send_sph_halo_capacity_ = capacity;
+        log_communication_growth(device_id_, "send-sph-halo", old_capacity,
+                                 required, capacity, sizeof(SphHaloParticle));
+    }
+    int32_t offset = 0;
+    std::vector<SphHaloParticle*> halos(num_gpus_, nullptr);
+    for (int32_t peer = 0; peer < num_gpus_; ++peer) {
+        if (peer == device_id_) continue;
+        CommBuffer& b = buffers_[peer];
+        const int32_t count = counts[peer];
+        b.d_send_sph_halos = count > 0 ? d_send_sph_halo_arena_ + offset : nullptr;
+        halos[peer] = b.d_send_sph_halos;
+        offset += count;
+    }
+    CUDA_CHECK(cudaMemcpy(d_send_sph_halo_buffers_, halos.data(),
+                          num_gpus_ * sizeof(SphHaloParticle*), cudaMemcpyHostToDevice));
 }
 
 void Communicator::layout_recv_arena(const std::vector<int32_t>& counts) {
@@ -533,6 +608,33 @@ void Communicator::layout_recv_arena(const std::vector<int32_t>& counts) {
     for (int32_t peer = 0; peer < num_gpus_; ++peer) if (peer != device_id_) {
         CommBuffer& b = buffers_[peer]; const int32_t count = counts[peer];
         b.d_recv_particles = count > 0 ? d_recv_particle_arena_ + offset : nullptr;
+        offset += count;
+    }
+}
+
+void Communicator::layout_sph_recv_arena(const std::vector<int32_t>& counts) {
+    int64_t total = 0;
+    for (int32_t peer = 0; peer < num_gpus_; ++peer)
+        if (peer != device_id_) total += counts[peer];
+    if (total > std::numeric_limits<int32_t>::max())
+        throw std::runtime_error("SPH halo receive arena exceeds int32 indexing on GPU " + std::to_string(device_id_));
+    const int32_t required = static_cast<int32_t>(total);
+    if (required > recv_sph_halo_capacity_) {
+        const int32_t old_capacity = recv_sph_halo_capacity_;
+        const int32_t capacity = grown_capacity(required, old_capacity, "receive SPH halo", device_id_);
+        cudaFree(d_recv_sph_halo_arena_);
+        d_recv_sph_halo_arena_ = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_recv_sph_halo_arena_, static_cast<size_t>(capacity) * sizeof(SphHaloParticle)));
+        recv_sph_halo_capacity_ = capacity;
+        log_communication_growth(device_id_, "receive-sph-halo", old_capacity,
+                                 required, capacity, sizeof(SphHaloParticle));
+    }
+    int32_t offset = 0;
+    for (int32_t peer = 0; peer < num_gpus_; ++peer) {
+        if (peer == device_id_) continue;
+        CommBuffer& b = buffers_[peer];
+        const int32_t count = counts[peer];
+        b.d_recv_sph_halos = count > 0 ? d_recv_sph_halo_arena_ + offset : nullptr;
         offset += count;
     }
 }
@@ -690,9 +792,12 @@ void Communicator::identify_halo_particles(
 
 void Communicator::pack_halo_particles(
     const GPUDomainState& gpu_state,
-    cudaStream_t stream
+    cudaStream_t stream,
+    bool sph_halo
 ) {
     CUDA_CHECK(cudaSetDevice(device_id_));
+    sph_halo_mode_ = sph_halo;
+    sph_halo_payload_ = SphHaloPayload::Full;
 
     int32_t num_local = gpu_state.subdomain.num_local_particles;
     if (num_local <= 0) {
@@ -735,26 +840,63 @@ void Communicator::pack_halo_particles(
     }
 
     std::vector<int32_t> counts(h_pinned_send_counts_, h_pinned_send_counts_ + num_gpus_);
-    layout_send_arena(counts);
+    if (sph_halo_mode_) layout_sph_send_arena(counts);
+    else layout_send_arena(counts);
     CUDA_CHECK(cudaMemsetAsync(d_all_send_counts_, 0, num_gpus_ * sizeof(int32_t), stream));
-    direct_scatter_halo_particles_kernel<<<num_blocks, block_size, 0, stream>>>(
-        gpu_state.d_is_halo, d_halo_dest_mask_, d_send_particle_buffers_, d_send_index_buffers_,
-        d_all_send_counts_, send_particle_capacity_, make_particle_pack_source(gpu_state),
-        num_local, device_id_, num_gpus_);
+    if (sph_halo_mode_) {
+        direct_scatter_sph_halos_kernel<<<num_blocks, block_size, 0, stream>>>(
+            gpu_state.d_is_halo, d_halo_dest_mask_, d_send_sph_halo_buffers_, d_send_index_buffers_,
+            d_all_send_counts_, send_particle_capacity_, make_particle_pack_source(gpu_state),
+            num_local, device_id_, num_gpus_);
+    } else {
+        direct_scatter_halo_particles_kernel<<<num_blocks, block_size, 0, stream>>>(
+            gpu_state.d_is_halo, d_halo_dest_mask_, d_send_particle_buffers_, d_send_index_buffers_,
+            d_all_send_counts_, send_particle_capacity_, make_particle_pack_source(gpu_state),
+            num_local, device_id_, num_gpus_);
+    }
 
 }
 
 void Communicator::repack_halo_particles(
-    const GPUDomainState& gpu_state, cudaStream_t stream) {
+    const GPUDomainState& gpu_state, cudaStream_t stream, bool sph_halo,
+    SphHaloPayload payload) {
     CUDA_CHECK(cudaSetDevice(device_id_));
+    if (sph_halo_mode_ != sph_halo)
+        throw std::runtime_error("Halo repack format changed without rebuilding send lists");
+    if (!sph_halo && payload != SphHaloPayload::Full)
+        throw std::runtime_error("SPH refresh payload requested for DEM halos");
+    if (sph_halo_payload_bytes(payload) == 0)
+        throw std::runtime_error("Invalid SPH halo refresh payload");
+    sph_halo_payload_ = payload;
     const auto source = make_particle_pack_source(gpu_state);
     for (int32_t peer = 0; peer < num_gpus_; ++peer) {
         if (peer == device_id_) continue;
         const auto& buffer = buffers_[peer];
-        if (buffer.h_send_count > 0)
-            repack_halo_particles_kernel<<<(buffer.h_send_count+255)/256,256,0,stream>>>(
-                buffer.d_send_particles, buffer.d_send_indices,
-                buffer.h_send_count, source, device_id_);
+        if (buffer.h_send_count > 0) {
+            if (sph_halo_mode_) {
+                const int blocks = (buffer.h_send_count+255)/256;
+                switch (payload) {
+                case SphHaloPayload::Full:
+                    repack_sph_halos_kernel<<<blocks,256,0,stream>>>(
+                        buffer.d_send_sph_halos, buffer.d_send_indices,
+                        buffer.h_send_count, source);
+                    break;
+                case SphHaloPayload::Thermo:
+                    repack_sph_thermo_refresh_kernel<<<blocks,256,0,stream>>>(
+                        reinterpret_cast<SphThermoRefresh*>(buffer.d_send_sph_halos),
+                        buffer.d_send_indices, buffer.h_send_count, source);
+                    break;
+                case SphHaloPayload::Force:
+                    repack_sph_force_refresh_kernel<<<blocks,256,0,stream>>>(
+                        reinterpret_cast<SphForceRefresh*>(buffer.d_send_sph_halos),
+                        buffer.d_send_indices, buffer.h_send_count, source);
+                    break;
+                }
+            } else
+                repack_halo_particles_kernel<<<(buffer.h_send_count+255)/256,256,0,stream>>>(
+                    buffer.d_send_particles, buffer.d_send_indices,
+                    buffer.h_send_count, source, device_id_);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -784,13 +926,16 @@ void Communicator::transfer_halos(
     cudaStream_t stream
 ) {
     CUDA_CHECK(cudaSetDevice(device_id_));
+    if (sph_halo_mode_ && sph_halo_payload_bytes(sph_halo_payload_) == 0)
+        throw std::runtime_error("Invalid SPH halo transfer payload");
     std::vector<int32_t> incoming(num_gpus_, 0);
     for (int32_t peer = 0; peer < num_gpus_; ++peer)
         if (peer != device_id_) {
             const CommBuffer& source = all_communicators[peer].buffers_[device_id_];
             incoming[peer] = source.h_send_count;
         }
-    layout_recv_arena(incoming);
+    if (sph_halo_mode_) layout_sph_recv_arena(incoming);
+    else layout_recv_arena(incoming);
 
     // Receive halos from all peer GPUs
     for (int32_t peer = 0; peer < num_gpus_; ++peer) {
@@ -810,13 +955,20 @@ void Communicator::transfer_halos(
         my_recv_buf.h_recv_count = 0;
 
         if (peer_send_buf.h_send_count > 0) {
-            size_t transfer_size = peer_send_buf.h_send_count * sizeof(PackedParticle);
+            if (peer_comm.sph_halo_mode_ != sph_halo_mode_ ||
+                (sph_halo_mode_ && peer_comm.sph_halo_payload_ != sph_halo_payload_))
+                throw std::runtime_error("Mismatched halo formats between GPU peers");
+            size_t transfer_size = static_cast<size_t>(peer_send_buf.h_send_count)
+                * (sph_halo_mode_ ? sph_halo_payload_bytes(sph_halo_payload_)
+                                  : sizeof(PackedParticle));
 
             // P2P transfer: read from peer's send buffer, write to our receive buffer
             copy_peer_payload(
-                my_recv_buf.d_recv_particles,   // Destination: our receive buffer (on device_id_)
+                sph_halo_mode_ ? static_cast<void*>(my_recv_buf.d_recv_sph_halos)
+                               : static_cast<void*>(my_recv_buf.d_recv_particles),
                 device_id_,                      // Destination device: this GPU
-                peer_send_buf.d_send_particles, // Source: peer's send buffer (on peer)
+                sph_halo_mode_ ? static_cast<const void*>(peer_send_buf.d_send_sph_halos)
+                               : static_cast<const void*>(peer_send_buf.d_send_particles),
                 peer,                            // Source device: peer GPU
                 transfer_size,
                 stream
@@ -876,12 +1028,29 @@ void Communicator::unpack_ghost_particles(
 
         int num_blocks = (count_to_unpack + block_size - 1) / block_size;
 
-        unpack_ghost_particles_kernel<<<num_blocks, block_size, 0, stream>>>(
-            buf.d_recv_particles,
-            count_to_unpack,
-            ghost_start + total_received,
-            gpu_state.local_state.particles
-        );
+        if (sph_halo_mode_) {
+            const int32_t start = ghost_start + total_received;
+            switch (sph_halo_payload_) {
+            case SphHaloPayload::Full:
+                unpack_sph_halos_kernel<<<num_blocks, block_size, 0, stream>>>(
+                    buf.d_recv_sph_halos, count_to_unpack, start,
+                    gpu_state.local_state.particles);
+                break;
+            case SphHaloPayload::Thermo:
+                unpack_sph_thermo_refresh_kernel<<<num_blocks, block_size, 0, stream>>>(
+                    reinterpret_cast<const SphThermoRefresh*>(buf.d_recv_sph_halos),
+                    count_to_unpack, start, gpu_state.local_state.particles);
+                break;
+            case SphHaloPayload::Force:
+                unpack_sph_force_refresh_kernel<<<num_blocks, block_size, 0, stream>>>(
+                    reinterpret_cast<const SphForceRefresh*>(buf.d_recv_sph_halos),
+                    count_to_unpack, start, gpu_state.local_state.particles);
+                break;
+            }
+        } else
+            unpack_ghost_particles_kernel<<<num_blocks, block_size, 0, stream>>>(
+                buf.d_recv_particles, count_to_unpack,
+                ghost_start + total_received, gpu_state.local_state.particles);
 
         total_received += count_to_unpack;
     }
@@ -1403,6 +1572,7 @@ void Communicator::shutdown() {
 
     // Free device-side pointer tables before releasing the peer buffers they reference.
     if (d_send_particle_buffers_) { cudaFree(d_send_particle_buffers_); d_send_particle_buffers_ = nullptr; }
+    if (d_send_sph_halo_buffers_) { cudaFree(d_send_sph_halo_buffers_); d_send_sph_halo_buffers_ = nullptr; }
     if (d_send_index_buffers_) { cudaFree(d_send_index_buffers_); d_send_index_buffers_ = nullptr; }
     send_particle_capacity_ = 0;
 
@@ -1412,16 +1582,22 @@ void Communicator::shutdown() {
         if (buf.d_recv_count) cudaFree(buf.d_recv_count);
     }
     if (d_send_particle_arena_) cudaFree(d_send_particle_arena_);
+    if (d_send_sph_halo_arena_) cudaFree(d_send_sph_halo_arena_);
     if (d_send_history_arena_) cudaFree(d_send_history_arena_);
     if (d_send_wall_history_arena_) cudaFree(d_send_wall_history_arena_);
     if (d_send_index_arena_) cudaFree(d_send_index_arena_);
     if (d_recv_particle_arena_) cudaFree(d_recv_particle_arena_);
+    if (d_recv_sph_halo_arena_) cudaFree(d_recv_sph_halo_arena_);
     if (d_recv_history_arena_) cudaFree(d_recv_history_arena_);
     if (d_recv_wall_history_arena_) cudaFree(d_recv_wall_history_arena_);
     d_send_particle_arena_ = nullptr; d_send_history_arena_ = nullptr;
     d_send_wall_history_arena_ = nullptr; d_send_index_arena_ = nullptr;
     d_recv_particle_arena_ = nullptr; d_recv_history_arena_ = nullptr;
+    d_send_sph_halo_arena_ = nullptr; d_recv_sph_halo_arena_ = nullptr;
     d_recv_wall_history_arena_ = nullptr; send_arena_capacity_ = recv_arena_capacity_ = 0;
+    send_sph_halo_capacity_ = recv_sph_halo_capacity_ = send_index_arena_capacity_ = 0;
+    sph_halo_mode_ = false;
+    sph_halo_payload_ = SphHaloPayload::Full;
     buffers_.clear();
 
     // Free halo buffers

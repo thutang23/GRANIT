@@ -626,6 +626,111 @@ __device__ inline PackedParticle make_packed_particle(
     return p;
 }
 
+__device__ inline SphHaloParticle make_sph_halo_particle(
+    int32_t particle_idx, ParticlePackSource source) {
+    SphHaloParticle p{};
+    p.pos_x = source.pos_x[particle_idx];
+    p.pos_y = source.pos_y[particle_idx];
+    p.pos_z = source.pos_z[particle_idx];
+    p.vel_x = source.vel_x[particle_idx];
+    p.vel_y = source.vel_y[particle_idx];
+    p.vel_z = source.vel_z[particle_idx];
+    p.density = source.density[particle_idx];
+    p.radius = source.radius[particle_idx];
+    p.mass = source.mass[particle_idx];
+    p.support_extent = source.support_extent[particle_idx];
+    p.smoothing_length = source.smoothing_length[particle_idx];
+    p.pressure = source.pressure[particle_idx];
+    p.viscosity = source.viscosity[particle_idx];
+    p.c_sound = source.c_sound[particle_idx];
+    p.S_xx = source.S_xx[particle_idx]; p.S_xy = source.S_xy[particle_idx];
+    p.S_xz = source.S_xz[particle_idx]; p.S_yy = source.S_yy[particle_idx];
+    p.S_yz = source.S_yz[particle_idx]; p.S_zz = source.S_zz[particle_idx];
+    p.global_id = source.global_id[particle_idx];
+    p.material_id = source.material_id[particle_idx];
+    p.clump_id = source.clump_id[particle_idx];
+    return p;
+}
+
+__global__ void direct_scatter_sph_halos_kernel(
+    const int32_t* __restrict__ is_halo,
+    const int32_t* __restrict__ halo_dest_mask,
+    SphHaloParticle* const* __restrict__ send_halo_buffers,
+    int32_t* const* __restrict__ send_index_buffers,
+    int32_t* __restrict__ send_counts,
+    int32_t buffer_capacity,
+    ParticlePackSource source,
+    int32_t num_particles,
+    int32_t source_gpu,
+    int32_t num_gpus) {
+    const int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_particles || !is_halo[idx]) return;
+    const int words = (num_gpus + 31) / 32;
+    const auto* destinations = reinterpret_cast<const uint32_t*>(halo_dest_mask)
+        + static_cast<size_t>(idx) * words;
+    const SphHaloParticle particle = make_sph_halo_particle(idx, source);
+    for (int32_t peer = 0; peer < num_gpus; ++peer) {
+        if (peer == source_gpu ||
+            !(destinations[peer / 32] & (uint32_t{1} << (peer % 32)))) continue;
+        const int32_t slot = atomicAdd(send_counts + peer, 1);
+        if (slot < buffer_capacity) {
+            send_index_buffers[peer][slot] = idx;
+            send_halo_buffers[peer][slot] = particle;
+        }
+    }
+}
+
+__global__ void unpack_sph_halos_kernel(
+    const SphHaloParticle* __restrict__ buffer,
+    int32_t num_received,
+    int32_t ghost_start_offset,
+    ParticleSoA particles) {
+    const int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_received) return;
+    const int32_t target = ghost_start_offset + idx;
+    const SphHaloParticle& p = buffer[idx];
+    particles.pos_x[target] = p.pos_x; particles.pos_y[target] = p.pos_y; particles.pos_z[target] = p.pos_z;
+    particles.vel_x[target] = p.vel_x; particles.vel_y[target] = p.vel_y; particles.vel_z[target] = p.vel_z;
+    particles.density[target] = p.density;
+    particles.radius[target] = p.radius; particles.mass[target] = p.mass;
+    particles.support_extent[target] = p.support_extent;
+    particles.smoothing_length[target] = p.smoothing_length;
+    particles.pressure[target] = p.pressure; particles.viscosity[target] = p.viscosity;
+    particles.c_sound[target] = p.c_sound;
+    particles.S_xx[target] = p.S_xx; particles.S_xy[target] = p.S_xy; particles.S_xz[target] = p.S_xz;
+    particles.S_yy[target] = p.S_yy; particles.S_yz[target] = p.S_yz; particles.S_zz[target] = p.S_zz;
+    particles.global_id[target] = p.global_id;
+    particles.material_id[target] = p.material_id;
+    particles.clump_id[target] = p.clump_id;
+}
+
+__global__ void unpack_sph_thermo_refresh_kernel(
+    const SphThermoRefresh* buffer, int32_t count, int32_t ghost_start,
+    ParticleSoA particles) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int32_t target = ghost_start + i;
+    const SphThermoRefresh p = buffer[i];
+    particles.density[target] = p.density;
+    particles.pressure[target] = p.pressure;
+    particles.c_sound[target] = p.c_sound;
+}
+
+__global__ void unpack_sph_force_refresh_kernel(
+    const SphForceRefresh* buffer, int32_t count, int32_t ghost_start,
+    ParticleSoA particles) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int32_t target = ghost_start + i;
+    const SphForceRefresh p = buffer[i];
+    particles.density[target] = p.density;
+    particles.pressure[target] = p.pressure;
+    particles.c_sound[target] = p.c_sound;
+    particles.S_xx[target] = p.S_xx; particles.S_xy[target] = p.S_xy;
+    particles.S_xz[target] = p.S_xz; particles.S_yy[target] = p.S_yy;
+    particles.S_yz[target] = p.S_yz; particles.S_zz[target] = p.S_zz;
+}
+
 __global__ void direct_scatter_halo_particles_kernel(
     const int32_t* __restrict__ is_halo,
     const int32_t* __restrict__ halo_dest_mask,
@@ -934,6 +1039,36 @@ __global__ void repack_halo_particles_kernel(
     ParticlePackSource source, int32_t source_gpu) {
     const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) destination[i] = make_packed_particle(indices[i], source, source_gpu);
+}
+
+__global__ void repack_sph_halos_kernel(
+    SphHaloParticle* destination, const int32_t* indices, int32_t count,
+    ParticlePackSource source) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) destination[i] = make_sph_halo_particle(indices[i], source);
+}
+
+__global__ void repack_sph_thermo_refresh_kernel(
+    SphThermoRefresh* destination, const int32_t* indices, int32_t count,
+    ParticlePackSource source) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int32_t particle = indices[i];
+    destination[i] = {source.density[particle], source.pressure[particle],
+                      source.c_sound[particle]};
+}
+
+__global__ void repack_sph_force_refresh_kernel(
+    SphForceRefresh* destination, const int32_t* indices, int32_t count,
+    ParticlePackSource source) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int32_t particle = indices[i];
+    destination[i] = {
+        source.density[particle], source.pressure[particle], source.c_sound[particle],
+        source.S_xx[particle], source.S_xy[particle], source.S_xz[particle],
+        source.S_yy[particle], source.S_yz[particle], source.S_zz[particle]
+    };
 }
 
 

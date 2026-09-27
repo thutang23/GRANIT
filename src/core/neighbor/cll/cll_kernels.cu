@@ -155,6 +155,13 @@ __global__ void shear_query_kernel(
     }
 }
 
+// Preserve the former cub::Max comparison, including ties and NaNs.
+struct DisplacementMaximum {
+    __host__ __device__ float operator()(float a, float b) const {
+        return b > a ? b : a;
+    }
+};
+
 // =============================================================================
 // Morton Code (Z-Order Curve) Functions
 // =============================================================================
@@ -355,7 +362,7 @@ __global__ void __launch_bounds__(256, 4) check_displacement_kernel(
     // Block-level reduction
     typedef cub::BlockReduce<float, 256> BlockReduceT;
     __shared__ typename BlockReduceT::TempStorage temp_storage;
-    float block_max = BlockReduceT(temp_storage).Reduce(my_disp_sq, cub::Max());
+    float block_max = BlockReduceT(temp_storage).Reduce(my_disp_sq, DisplacementMaximum{});
 
     // Atomic update to global max (only first thread of block)
     if (threadIdx.x == 0) {

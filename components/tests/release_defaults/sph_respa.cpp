@@ -61,6 +61,25 @@ int main() {
     restored_calibration.restore_checkpoint(calibration_input);
     require(restored_calibration.ready()==calibration.ready());
     require(restored_calibration.coefficient(key)==calibration.coefficient(key));
+    // SPH reuses the ContactPair phase with one unit per owner plus each
+    // owned CSR row degree. Zero-degree owners still make a usable sample.
+    RCBWorkCalibrator sph_calibration;
+    const RCBWorkKey sph_key{RCBWorkPhase::ContactPair,
+                             RCBFmmMode::NotApplicable, RCBLinkClass::PCIe};
+    sph_calibration.set_enabled_keys({key, sph_key});
+    RCBActiveSample integration = sample;
+    integration.key = key;
+    integration.epoch = 10;
+    RCBActiveSample sph = integration;
+    sph.key = sph_key;
+    sph.work_units = 0;
+    sph_calibration.observe_global_epoch(10, {integration, sph});
+    require(!sph_calibration.ready() && !sph_calibration.has_coefficient(sph_key));
+    sph.epoch = 11;
+    sph.work_units = 3 + 5 + 0 + 2; // 3 owned rows, directed degrees 5/0/2
+    sph_calibration.observe_global_epoch(11, {sph});
+    require(sph_calibration.ready());
+    require(sph_calibration.coefficient(sph_key) == sph.active_seconds / sph.work_units);
     sample.epoch=2; sample.active_seconds=.03;
     calibration.observe_global_epoch(2,{sample}); restored_calibration.observe_global_epoch(2,{sample});
     require(restored_calibration.coefficient(key)==calibration.coefficient(key));

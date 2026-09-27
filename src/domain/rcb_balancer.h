@@ -60,6 +60,8 @@ struct FMMWorkloadViewInput {
 struct AdaptiveRCBInput {
     int32_t owned_count = 0;
     const ContactPair* contact_pairs = nullptr; int32_t contact_pair_count = 0;
+    const uint64_t* sph_offsets = nullptr;
+    bool sph_mode = false;
     const uint32_t* halo_destination_mask = nullptr; // one bit per peer, indexed only by owned particle
     float halo_peer_cost[RCB_MAX_PEERS]{}; // already link-class calibrated lifecycle costs
     FMMWorkloadViewInput fmm{};

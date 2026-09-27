@@ -3,54 +3,7 @@
 // SPH keeps its gather-style physics kernels. Both backends emit unique pairs,
 // which are expanded once into directed CSR and filtered at every evaluation.
 
-__global__ void sph_find_pairs_kernel(
-    const double* x, const double* y, const double* z, const float* h,
-    const LBVHNode* nodes, const LBVHAABB* boxes, const uint32_t* order,
-    ContactPair* pairs, unsigned long long* count, int32_t capacity,
-    int32_t n, float cutoff, float skin, int32_t* overflow) {
-  const int32_t rank = blockIdx.x * blockDim.x + threadIdx.x;
-  if (rank >= n) return;
-  const uint32_t i = order[rank];
-  const float px = float(x[i]), py = float(y[i]), pz = float(z[i]);
-  // Leaves contain the full k*h extent. A half-support query is sufficient
-  // for k*(hi+hj)/2; use the full support here as a conservative broad phase
-  // independent of the rounded half-sum in the exact SPH predicate.
-  // Fast-math squared distances can flush to zero even for distinct centers.
-  // Cover the same absolute underflow region as the RT proxy bounds.
-  const float r = nextafterf((cutoff * h[i] + skin) * (1.0f + 8.0f * FLT_EPSILON)
-                             + 2.0f * sqrtf(FLT_MIN), CUDART_INF_F);
-  LBVHAABB query;
-  query.lower = make_float4(nextafterf(px-r, -CUDART_INF_F),
-                           nextafterf(py-r, -CUDART_INF_F),
-                           nextafterf(pz-r, -CUDART_INF_F), 0);
-  query.upper = make_float4(nextafterf(px+r, CUDART_INF_F),
-                           nextafterf(py+r, CUDART_INF_F),
-                           nextafterf(pz+r, CUDART_INF_F), 0);
-  uint32_t stack[128];
-  int top = 0;
-  stack[top++] = 0;
-  while (top) {
-    const LBVHNode node = nodes[stack[--top]];
-    const uint32_t children[2] = {node.left_idx, node.right_idx};
-    for (int side = 0; side < 2; ++side) {
-      const uint32_t child = children[side];
-      if (child == 0xFFFFFFFF || !lbvh_intersects(query, boxes[child])) continue;
-      const uint32_t j = nodes[child].object_idx;
-      if (j != 0xFFFFFFFF) {
-        if (j <= i) continue;
-        if (sph_pair_candidate(px-float(x[j]), py-float(y[j]), pz-float(z[j]),
-                               h[i], h[j], cutoff, skin)) {
-          const unsigned long long edge = atomicAdd(count, 1ULL);
-          if (edge < static_cast<unsigned long long>(capacity)) pairs[edge] = ContactPair(i, j);
-        }
-      } else if (top < 128) {
-        stack[top++] = child;
-      } else {
-        atomicExch(overflow, 1);
-      }
-    }
-  }
-}
+#include "lbvh_sph_pair_query.cuh"
 
 __global__ void sph_count_rows_kernel(const ContactPair* pairs, int32_t count,
                                       uint64_t* counts) {
@@ -100,7 +53,7 @@ __global__ void sph_cache_motion_kernel(
   }
   using Reduce = cub::BlockReduce<float, 256>;
   __shared__ typename Reduce::TempStorage storage;
-  const float block_max = Reduce(storage).Reduce(bound_sq, cub::Max());
+  const float block_max = Reduce(storage).Reduce(bound_sq, DisplacementMaximum{});
   if (threadIdx.x == 0) atomicMax(max_motion_bits, __float_as_int(block_max));
 }
 
@@ -129,6 +82,27 @@ static void publish_sph_adjacency(LBVHGPUState& gpu, SimulationState& state) {
   state.neighbor.rebuild_generation = gpu.current_generation;
 }
 
+void LBVHSearchImpl::refresh_sph_bounds(SimulationState& state, cudaStream_t stream) {
+  auto& gpu = get_gpu_state();
+  const int32_t n = state.particles.num_particles;
+  if (n <= 1) return;
+  if (!gpu.initialized || gpu.active_backend != NeighborBackend::CUDA ||
+      state.neighbor.nodes != gpu.nodes || state.neighbor.aabbs != gpu.aabbs ||
+      state.neighbor.sorted_indices != gpu.sorted_indices ||
+      gpu.tracked_num_particles != n)
+    throw std::runtime_error("SPH gravity requires a current CUDA LBVH tree");
+  const int threads = 256;
+  const int blocks = (n + threads - 1) / threads;
+  lbvh_refresh_leaf_aabbs_kernel<<<blocks, threads, 0, stream>>>(
+      state.particles.pos_x, state.particles.pos_y, state.particles.pos_z,
+      state.particles.support_extent, gpu.sorted_indices, gpu.aabbs, n, n-1,
+      0.0f, 0.5f);
+  CUDA_CHECK(cudaMemsetAsync(gpu.atomic_flags, 0, size_t(n-1)*sizeof(int32_t), stream));
+  lbvh_propagate_aabbs_kernel<<<blocks, threads, 0, stream>>>(
+      gpu.nodes, gpu.aabbs, gpu.atomic_flags, n-1, n);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 void LBVHSearchImpl::find_sph_neighbors(SimulationState& state, const SimConfig& config,
                                        cudaStream_t stream) {
   auto& gpu = get_gpu_state();
@@ -138,9 +112,8 @@ void LBVHSearchImpl::find_sph_neighbors(SimulationState& state, const SimConfig&
   if (n < 0 || state.particles.num_local < 0 || state.particles.num_local > n)
     throw std::runtime_error("SPH LBVH invalid particle ownership layout");
   select_backend(gpu, state, config);
-  // Retain the existing distributed/image traversal paths outside phase one.
-  if (config.multigpu.enabled || state.particles.num_local != n ||
-      extract_pbc_config(config).is_enabled() || config.shear_box.enabled) {
+  // Periodic/image adjacency still needs a separate implementation.
+  if (extract_pbc_config(config).is_enabled() || config.shear_box.enabled) {
     rebuild(state, config, stream);
     return;
   }
@@ -162,11 +135,15 @@ void LBVHSearchImpl::find_sph_neighbors(SimulationState& state, const SimConfig&
     gpu.backend_timing_enabled = timing;
   }
   allocate_sph_storage(gpu);
-  const bool layout_changed = gpu.tracked_num_particles != n || gpu.tracked_num_local != n;
+  const bool distributed = config.multigpu.enabled || state.particles.num_local != n;
+  if (distributed) gpu.sph_cache_valid = false;
+  const bool layout_changed = gpu.tracked_num_particles != n ||
+                              gpu.tracked_num_local != state.particles.num_local;
   if (n <= 1) {
     CUDA_CHECK(cudaMemsetAsync(gpu.sph_offsets, 0, (size_t(n)+1)*sizeof(uint64_t), stream));
     gpu.sph_ready = gpu.sph_cache_valid = false;
-    gpu.tracked_num_particles = gpu.tracked_num_local = n;
+    gpu.tracked_num_particles = n;
+    gpu.tracked_num_local = state.particles.num_local;
     gpu.stats.num_contacts_found = 0;
     publish_sph_adjacency(gpu, state);
     return;
@@ -179,7 +156,9 @@ void LBVHSearchImpl::find_sph_neighbors(SimulationState& state, const SimConfig&
   if (!(skin >= 0.0f) || !std::isfinite(skin))
     throw std::runtime_error("SPH Verlet skin must be finite and nonnegative");
   const auto start = std::chrono::steady_clock::now();
-  bool full = !gpu.sph_ready || layout_changed || frequency == 1 ||
+  // Ghost membership and order can change without changing either count.
+  // Rebuild every distributed call; CSR remains valid between stage refreshes.
+  bool full = distributed || !gpu.sph_ready || layout_changed || frequency == 1 ||
               ++gpu.steps_since_rebuild >= frequency;
   // Topology quality may use a current displacement measurement. Bounds are
   // always refreshed before querying, so this threshold never certifies a list.
@@ -195,7 +174,7 @@ void LBVHSearchImpl::find_sph_neighbors(SimulationState& state, const SimConfig&
     CUDA_CHECK(cudaStreamSynchronize(stream));
     full = !std::isfinite(*gpu.h_max_disp_sq) || *gpu.h_max_disp_sq > gpu.rebuild_threshold_sq;
   }
-  bool reuse = !full && gpu.sph_cache_valid && skin > 0.0f &&
+  bool reuse = !distributed && !full && gpu.sph_cache_valid && skin > 0.0f &&
       gpu.sph_cached_skin == skin && gpu.sph_cached_cutoff == config.sph.kernel_cutoff_factor;
   if (reuse) {
     CUDA_CHECK(cudaMemsetAsync(gpu.d_verlet_disp_scaled, 0, sizeof(int32_t), stream));
@@ -241,7 +220,8 @@ void LBVHSearchImpl::find_sph_neighbors(SimulationState& state, const SimConfig&
     } else {
       lbvh_refresh_leaf_aabbs_kernel<<<blocks, threads, 0, stream>>>(
           state.particles.pos_x, state.particles.pos_y, state.particles.pos_z,
-          state.particles.support_extent, gpu.sorted_indices, gpu.aabbs, n, n-1, 0.0f);
+          state.particles.support_extent, gpu.sorted_indices, gpu.aabbs, n, n-1,
+          0.0f, 0.5f);
       CUDA_CHECK(cudaMemsetAsync(gpu.atomic_flags, 0, size_t(n-1)*sizeof(int32_t), stream));
       lbvh_propagate_aabbs_kernel<<<blocks, threads, 0, stream>>>(
           gpu.nodes, gpu.aabbs, gpu.atomic_flags, n-1, n);
@@ -264,7 +244,8 @@ void LBVHSearchImpl::find_sph_neighbors(SimulationState& state, const SimConfig&
           state.particles.pos_x, state.particles.pos_y, state.particles.pos_z,
           state.particles.smoothing_length, gpu.nodes, gpu.aabbs, gpu.sorted_indices,
           gpu.sph_pairs.pairs, gpu.sph_pair_count, gpu.sph_pairs.max_contacts,
-          n, config.sph.kernel_cutoff_factor, skin, gpu.sph_overflow);
+          n, state.particles.num_local, config.sph.kernel_cutoff_factor, skin,
+          gpu.sph_overflow);
       CUDA_CHECK(cudaGetLastError());
       CUDA_CHECK(cudaMemcpyAsync(&count, gpu.sph_pair_count, sizeof(count), cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaMemcpyAsync(&overflow, gpu.sph_overflow, sizeof(overflow), cudaMemcpyDeviceToHost, stream));
@@ -298,7 +279,7 @@ void LBVHSearchImpl::find_sph_neighbors(SimulationState& state, const SimConfig&
       (size_t(n)+1)*sizeof(uint64_t), cudaMemcpyDeviceToDevice, stream));
   if (pairs) sph_fill_rows_kernel<<<pair_blocks, threads, 0, stream>>>(
       gpu.sph_pairs.pairs, pairs, gpu.sph_cursors, gpu.sph_neighbors);
-  if (skin > 0.0f) {
+  if (!distributed && skin > 0.0f) {
     lbvh_capture_cache_particles_kernel<<<blocks, threads, 0, stream>>>(
         state.particles.pos_x, state.particles.pos_y, state.particles.pos_z,
         state.particles.global_id, state.particles.clump_id, state.particles.smoothing_length,

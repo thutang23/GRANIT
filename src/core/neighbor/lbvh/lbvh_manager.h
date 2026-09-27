@@ -41,6 +41,10 @@ public:
     static void find_sph_neighbors(SimulationState& state, const SimConfig& config,
                                    cudaStream_t stream = 0);
 
+    // Refresh the existing SPH tree after h changes, without rebuilding its
+    // topology or enumerating an unused gravity neighbor list.
+    static void refresh_sph_bounds(SimulationState& state, cudaStream_t stream = 0);
+
     // Async monitoring
     static void launch_async_displacement_monitor(
         const SimulationState& state,

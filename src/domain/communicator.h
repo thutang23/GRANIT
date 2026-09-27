@@ -37,9 +37,8 @@ struct PackedParticle {
     float moment_of_inertia;
     float cohesive_strength;
 
-    // SPH state.  The same packet is used for halos and migrants so a
-    // cross-GPU SPH interaction observes exactly the same material state as a
-    // local interaction.
+    // Full SPH state for migration. DEM halos also use this complete record;
+    // SPH halos use the compact SphHaloParticle record below.
     float support_extent;
     double density, rho_rate;
     float pressure, viscosity, c_sound, drhodt;
@@ -68,6 +67,40 @@ struct PackedParticle {
     int32_t wall_payload_offset;      // Active-only transit payload offset
     int64_t winding_x, winding_y, winding_z;
 };
+
+// Fields read from a remote SPH particle by neighbor construction, hydro
+// pairs, and gravity. Migration retains the complete PackedParticle state.
+struct SphHaloParticle {
+    double pos_x, pos_y, pos_z;
+    double vel_x, vel_y, vel_z;
+    double density;
+    float radius, mass, support_extent, smoothing_length;
+    float pressure, viscosity, c_sound;
+    float S_xx, S_xy, S_xz, S_yy, S_yz, S_zz;
+    int32_t global_id, material_id, clump_id;
+};
+static_assert(sizeof(SphHaloParticle) == 120, "SPH halo wire format changed");
+
+// Fixed-membership refreshes retain the full exchange's peer slices and
+// ghost slot order while packing only the changed thermodynamic fields.
+struct SphThermoRefresh { double density; float pressure, c_sound; };
+struct SphForceRefresh {
+    double density;
+    float pressure, c_sound;
+    float S_xx, S_xy, S_xz, S_yy, S_yz, S_zz;
+};
+static_assert(sizeof(SphThermoRefresh) == 16 && sizeof(SphForceRefresh) == 40,
+              "SPH refresh wire format changed");
+
+enum class SphHaloPayload : uint8_t { Full, Thermo, Force };
+constexpr size_t sph_halo_payload_bytes(SphHaloPayload payload) {
+    switch (payload) {
+    case SphHaloPayload::Full: return sizeof(SphHaloParticle);
+    case SphHaloPayload::Thermo: return sizeof(SphThermoRefresh);
+    case SphHaloPayload::Force: return sizeof(SphForceRefresh);
+    }
+    return 0;
+}
 
 // Read-only particle fields consumed by the direct-scatter pack kernels.
 // Passing this descriptor keeps the halo and migration kernels' signatures
@@ -180,6 +213,7 @@ struct WallContactHistoryPacked {
 struct CommBuffer {
     // Send buffers (device memory on source GPU)
     PackedParticle* d_send_particles;
+    SphHaloParticle* d_send_sph_halos;
     ContactHistoryPacked* d_send_history;
     WallContactHistoryPacked* d_send_wall_history;
     int32_t* d_send_indices;     // Indices of particles to send
@@ -187,6 +221,7 @@ struct CommBuffer {
 
     // Receive buffers (device memory on this GPU)
     PackedParticle* d_recv_particles;
+    SphHaloParticle* d_recv_sph_halos;
     ContactHistoryPacked* d_recv_history;
     WallContactHistoryPacked* d_recv_wall_history;
     int32_t* d_recv_count;       // Number of particles received
@@ -207,9 +242,9 @@ struct CommBuffer {
     int32_t wall_history_stride;
 
     CommBuffer()
-        : d_send_particles(nullptr), d_send_history(nullptr), d_send_wall_history(nullptr),
+        : d_send_particles(nullptr), d_send_sph_halos(nullptr), d_send_history(nullptr), d_send_wall_history(nullptr),
           d_send_indices(nullptr), d_send_count(nullptr),
-          d_recv_particles(nullptr), d_recv_history(nullptr), d_recv_wall_history(nullptr),
+          d_recv_particles(nullptr), d_recv_sph_halos(nullptr), d_recv_history(nullptr), d_recv_wall_history(nullptr),
           d_recv_count(nullptr),
           h_send_count(0), h_recv_count(0), h_send_history_count(0), h_send_wall_history_count(0),
           h_recv_history_count(0), h_recv_wall_history_count(0),
@@ -311,6 +346,7 @@ private:
     // Device-side views of each peer's existing send buffers.  The direct
     // scatter kernels index these tables by destination GPU.
     PackedParticle** d_send_particle_buffers_;
+    SphHaloParticle** d_send_sph_halo_buffers_;
     int32_t** d_send_index_buffers_;
     int32_t send_particle_capacity_;
 
@@ -319,6 +355,8 @@ private:
     // every possible GPU pair.
     PackedParticle* d_send_particle_arena_;
     PackedParticle* d_recv_particle_arena_;
+    SphHaloParticle* d_send_sph_halo_arena_;
+    SphHaloParticle* d_recv_sph_halo_arena_;
     ContactHistoryPacked* d_send_history_arena_;
     ContactHistoryPacked* d_recv_history_arena_;
     WallContactHistoryPacked* d_send_wall_history_arena_;
@@ -326,6 +364,11 @@ private:
     int32_t* d_send_index_arena_;
     int32_t send_arena_capacity_;
     int32_t recv_arena_capacity_;
+    int32_t send_sph_halo_capacity_;
+    int32_t recv_sph_halo_capacity_;
+    int32_t send_index_arena_capacity_;
+    bool sph_halo_mode_;
+    SphHaloPayload sph_halo_payload_;
     int32_t send_history_arena_capacity_;
     int32_t send_wall_history_arena_capacity_;
     int32_t recv_history_arena_capacity_;
@@ -354,11 +397,14 @@ public:
           d_send_contact_history_counts_(nullptr), d_send_wall_history_counts_(nullptr),
           d_cub_scan_temp_(nullptr), cub_scan_temp_bytes_(0),
           d_all_send_counts_(nullptr),
-          d_send_particle_buffers_(nullptr), d_send_index_buffers_(nullptr),
+          d_send_particle_buffers_(nullptr), d_send_sph_halo_buffers_(nullptr), d_send_index_buffers_(nullptr),
           send_particle_capacity_(0), d_send_particle_arena_(nullptr), d_recv_particle_arena_(nullptr),
+          d_send_sph_halo_arena_(nullptr), d_recv_sph_halo_arena_(nullptr),
           d_send_history_arena_(nullptr), d_recv_history_arena_(nullptr),
           d_send_wall_history_arena_(nullptr), d_recv_wall_history_arena_(nullptr),
           d_send_index_arena_(nullptr), send_arena_capacity_(0), recv_arena_capacity_(0),
+          send_sph_halo_capacity_(0), recv_sph_halo_capacity_(0), send_index_arena_capacity_(0), sph_halo_mode_(false),
+          sph_halo_payload_(SphHaloPayload::Full),
           send_history_arena_capacity_(0), send_wall_history_arena_capacity_(0),
           recv_history_arena_capacity_(0), recv_wall_history_arena_capacity_(0),
           h_pinned_send_counts_(nullptr), h_pinned_scan_result_(nullptr),
@@ -399,13 +445,15 @@ public:
     // Step 2: Pack halo particles into send buffers
     void pack_halo_particles(
         const GPUDomainState& gpu_state,
-        cudaStream_t stream = nullptr
+        cudaStream_t stream = nullptr,
+        bool sph_halo = false
     );
 
     // Refresh the current halo's payload in the existing slot order. No
     // positions/ownership change: neighbor indices remain valid.
     void repack_halo_particles(const GPUDomainState& gpu_state,
-                               cudaStream_t stream = nullptr);
+                               cudaStream_t stream = nullptr, bool sph_halo = false,
+                               SphHaloPayload payload = SphHaloPayload::Full);
 
     // Step 3: Exchange counts between GPUs (synchronization point)
     void exchange_halo_counts(
@@ -514,8 +562,11 @@ public:
     CommunicationAllocationTelemetry allocation_telemetry() const;
 
 private:
+    void layout_send_indices(const std::vector<int32_t>& counts);
     void layout_send_arena(const std::vector<int32_t>& counts);
     void layout_recv_arena(const std::vector<int32_t>& counts);
+    void layout_sph_send_arena(const std::vector<int32_t>& counts);
+    void layout_sph_recv_arena(const std::vector<int32_t>& counts);
     void layout_send_history_arenas(const std::vector<int32_t>& contact_counts,
                                     const std::vector<int32_t>& wall_counts);
     void layout_recv_history_arenas(const std::vector<int32_t>& contact_counts,
@@ -750,6 +801,33 @@ __global__ void direct_scatter_halo_particles_kernel(
     int32_t num_gpus
 );
 
+__global__ void direct_scatter_sph_halos_kernel(
+    const int32_t* __restrict__ is_halo,
+    const int32_t* __restrict__ halo_dest_mask,
+    SphHaloParticle* const* __restrict__ send_halo_buffers,
+    int32_t* const* __restrict__ send_index_buffers,
+    int32_t* __restrict__ send_counts,
+    int32_t buffer_capacity,
+    ParticlePackSource source,
+    int32_t num_particles,
+    int32_t source_gpu,
+    int32_t num_gpus
+);
+
+__global__ void unpack_sph_halos_kernel(
+    const SphHaloParticle* __restrict__ buffer,
+    int32_t num_received,
+    int32_t ghost_start_offset,
+    ParticleSoA particles
+);
+
+__global__ void unpack_sph_thermo_refresh_kernel(
+    const SphThermoRefresh* buffer, int32_t count, int32_t ghost_start,
+    ParticleSoA particles);
+__global__ void unpack_sph_force_refresh_kernel(
+    const SphForceRefresh* buffer, int32_t count, int32_t ghost_start,
+    ParticleSoA particles);
+
 __global__ void direct_scatter_migrating_particles_kernel(
     const int32_t* __restrict__ is_migrating,
     const int32_t* __restrict__ migrate_dest_gpu,
@@ -827,6 +905,16 @@ __global__ void copy_temp_all_kernel(
 __global__ void repack_halo_particles_kernel(
     PackedParticle* destination, const int32_t* indices, int32_t count,
     ParticlePackSource source, int32_t source_gpu);
+
+__global__ void repack_sph_halos_kernel(
+    SphHaloParticle* destination, const int32_t* indices, int32_t count,
+    ParticlePackSource source);
+__global__ void repack_sph_thermo_refresh_kernel(
+    SphThermoRefresh* destination, const int32_t* indices, int32_t count,
+    ParticlePackSource source);
+__global__ void repack_sph_force_refresh_kernel(
+    SphForceRefresh* destination, const int32_t* indices, int32_t count,
+    ParticlePackSource source);
 
 } // namespace cudadem
 

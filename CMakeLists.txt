@@ -1,9 +1,25 @@
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
-# Set architectures before project() initializes CUDA's compiler default.
+# Load toolchain-file settings before deciding whether GPU targets were supplied.
+project(GRANIT VERSION 1.0.0 LANGUAGES CXX)
+set(_granit_default_cuda_architectures OFF)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
-    set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;87;89;90" CACHE STRING "CUDA architectures")
+    set(_granit_default_cuda_architectures ON)
 endif()
-project(GRANIT VERSION 1.0.0 LANGUAGES CXX CUDA)
+# Let CUDA initialize with its supported compiler default, then choose our
+# portable targets once the compiler version is known.
+enable_language(CUDA)
+
+if(_granit_default_cuda_architectures)
+    set(_granit_cuda_architectures "75;80;86;87;89;90")
+    # CUDA 13 removed Volta code generation; keep it in CUDA 12 builds.
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS "13.0")
+        list(PREPEND _granit_cuda_architectures 70)
+    endif()
+    set(CMAKE_CUDA_ARCHITECTURES "${_granit_cuda_architectures}" CACHE STRING
+        "CUDA architectures" FORCE)
+    unset(_granit_cuda_architectures)
+endif()
+unset(_granit_default_cuda_architectures)
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -159,7 +175,7 @@ endif()
 set(GRANIT_INSTALL_TARGETS granit_dem granit_sph)
 if(GRANIT_BUILD_MULTIGPU)
     find_package(MPI REQUIRED)
-    find_path(NVML_INCLUDE_DIR nvml.h)
+    find_path(NVML_INCLUDE_DIR nvml.h HINTS ${CUDAToolkit_INCLUDE_DIRS})
     find_library(NVML_LIBRARY nvidia-ml)
     add_library(granit_domain ${GRANIT_DOMAIN_SOURCES})
     target_include_directories(granit_domain PRIVATE ${GRANIT_INCLUDE_DIRS})
@@ -207,6 +223,15 @@ if(BUILD_TESTING)
     target_include_directories(granit_sph_respa_test PRIVATE ${GRANIT_INCLUDE_DIRS})
     target_link_libraries(granit_sph_respa_test PRIVATE CUDA::cudart yaml-cpp)
     add_test(NAME sph_respa COMMAND granit_sph_respa_test)
+    add_executable(granit_peer_transport_policy_test
+        components/tests/release_defaults/peer_transport_policy.cpp)
+    target_include_directories(granit_peer_transport_policy_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME peer_transport_policy COMMAND granit_peer_transport_policy_test)
+    # Opt-in GPU payload verification; ordinary CTest remains host-only.
+    add_executable(granit_peer_transfer_gpu_test
+        components/tests/release_defaults/peer_transfer_gpu.cu)
+    target_include_directories(granit_peer_transfer_gpu_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(granit_peer_transfer_gpu_test PRIVATE CUDA::cudart)
     add_executable(granit_g_table_test components/tests/release_defaults/g_table.cpp)
     target_include_directories(granit_g_table_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME g_table COMMAND granit_g_table_test)
@@ -223,16 +248,16 @@ if(BUILD_TESTING)
     target_link_libraries(granit_peer_transfer_host_test PRIVATE Threads::Threads)
     add_test(NAME peer_transfer_host COMMAND granit_peer_transfer_host_test)
 
-    add_executable(granit_peer_transfer_gpu_test
+    add_executable(granit_peer_transfer_routes_gpu_test
         components/tests/unit_test/domain/test_peer_transfer.cu)
     add_executable(granit_lbvh_contact_dedup_test
         components/tests/unit_test/lbvh/contact_dedup.cu)
-    foreach(test_target granit_peer_transfer_gpu_test granit_lbvh_contact_dedup_test)
+    foreach(test_target granit_peer_transfer_routes_gpu_test granit_lbvh_contact_dedup_test)
         target_include_directories(${test_target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
         target_link_libraries(${test_target} PRIVATE CUDA::cudart Threads::Threads)
     endforeach()
     target_link_libraries(granit_lbvh_contact_dedup_test PRIVATE yaml-cpp)
-    add_test(NAME peer_transfer_gpu COMMAND granit_peer_transfer_gpu_test)
+    add_test(NAME peer_transfer_gpu COMMAND granit_peer_transfer_routes_gpu_test)
     add_test(NAME lbvh_contact_dedup COMMAND granit_lbvh_contact_dedup_test)
     granit_solver(granit_cll_shear_contacts_test
         components/tests/unit_test/cll/shear_contacts.cu)
