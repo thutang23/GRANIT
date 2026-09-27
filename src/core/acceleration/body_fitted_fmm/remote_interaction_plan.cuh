@@ -64,6 +64,63 @@ __device__ uint64_t fmm_remote_direct_row(int leaf,const PersistentTreeContext* 
     return count;
 }
 
+// Only the existence of a remote far source is needed to select a target.
+// Keep fmm_remote_far_ref() for the ordered source list and its duplicate-owner
+// check; changing the traversal order here cannot change numerical ownership.
+template<int D>
+__device__ bool fmm_remote_has_far(int target,const UnifiedNode& node,
+    const FMMRemoteView* peers,int ranks) {
+    using T=GroupedStencilTraits<D>;
+    const int q=grouped_target_child<D>(node.compact_morton);
+    for(int peer=0;peer<ranks;++peer) {
+        const FMMRemoteView view=peers[peer];
+        if(!view.count)continue;
+        const auto& work=view.far_routes[target];
+        for(int cross=0;cross<T::CROSS_COUNT;++cross) {
+            const auto route=grouped_cross_route(work,cross);
+            if(grouped_route_valid(route) && !(grouped_route_mask(route)&1u))return true;
+        }
+        for(int block=0;block<T::BLOCK_COUNT;++block) {
+            const auto route=grouped_block_route(work,block);
+            if(!grouped_route_valid(route))continue;
+            uint8_t candidates=static_cast<uint8_t>(T::block(q,block).far_mask &
+                ~grouped_route_mask(route) & ~grouped_block_omit_mask(work,block));
+            while(candidates) {
+                const int child=__ffs(static_cast<int>(candidates))-1;
+                candidates=static_cast<uint8_t>(candidates & (candidates-1));
+                if(grouped_child_node<D>(view.nodes,view.children,
+                    grouped_route_node(route),child)>=0)return true;
+            }
+        }
+    }
+    return false;
+}
+
+#ifdef GRANIT_FMM_TEST_HOOKS
+template<int D> __global__ void fmm_remote_legacy_far_flags_kernel(
+    const UnifiedNode* nodes,const FMMRemoteView* peers,int ranks,int count,int* flags) {
+    const int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=count)return;
+    const auto node=nodes[i];
+    flags[i]=0;
+    if(!node.target_count || node.level<2)return;
+    using T=GroupedStencilTraits<D>;
+    for(int slot=0;slot<T::CROSS_COUNT+T::BLOCK_COUNT*T::CHILD_COUNT;++slot)
+        if(fmm_remote_far_ref<D>(i,slot,nodes,peers,ranks,nullptr).node>=0) {
+            flags[i]=1;break;
+        }
+}
+
+__global__ void fmm_remote_compare_far_flags_kernel(const int* candidate,
+    const int* reference,int count,int* mismatches,int* first_mismatch) {
+    const int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<count && candidate[i]!=reference[i]) {
+        atomicAdd(mismatches,1);
+        atomicMin(first_mismatch,i);
+    }
+}
+#endif
+
 template<int D> __global__ void fmm_remote_list_counts_kernel(
     const PersistentTreeContext* local,const FMMRemoteView* peers,int ranks,int nodes,
     int* indices,int* far_flags,int* near_flags,uint64_t* direct_counts) {
@@ -72,11 +129,7 @@ template<int D> __global__ void fmm_remote_list_counts_kernel(
     indices[i]=i;far_flags[i]=near_flags[i]=0;
     const auto node=local->dd.unified_nodes[i];
     if(!node.target_count || node.level<2)return;
-    using T=GroupedStencilTraits<D>;
-    for(int slot=0;slot<T::CROSS_COUNT+T::BLOCK_COUNT*T::CHILD_COUNT;++slot)
-        if(fmm_remote_far_ref<D>(i,slot,local->dd.unified_nodes,peers,ranks,nullptr).node>=0) {
-            far_flags[i]=1;break;
-        }
+    far_flags[i]=fmm_remote_has_far<D>(i,node,peers,ranks)?1:0;
     if(node.flags&UNIFIED_NODE_FLAG_IS_LEAF) {
         direct_counts[i]=fmm_remote_direct_row<D,false>(i,local,peers,ranks,nullptr);
         near_flags[i]=direct_counts[i]!=0;
@@ -135,6 +188,30 @@ template<int D> inline void fmm_prepare_remote_lists(int gpu,DistributedFMMState
     plan.class_counts.reserve(8);plan.error.reserve(1);
     fmm_remote_list_counts_kernel<D><<<(nodes+256)/256,256,0,stream>>>(runtime->device_context,
         plan.views.data,s.ranks,nodes,plan.indices.data,plan.far_flags.data,plan.near_flags.data,plan.direct_counts.data);
+#ifdef GRANIT_FMM_TEST_HOOKS
+    if(std::getenv("GRANIT_FMM_VERIFY_REMOTE_FAR")) {
+        FMMDeviceBuffer<int> reference_flags;
+        reference_flags.reserve(nodes);
+        CUDA_CHECK(cudaMemsetAsync(plan.error.data,0,sizeof(int),stream));
+        CUDA_CHECK(cudaMemcpyAsync(plan.scalar.data,&nodes,sizeof(int),cudaMemcpyHostToDevice,stream));
+        fmm_remote_legacy_far_flags_kernel<D><<<(nodes+255)/256,256,0,stream>>>(
+            runtime->host_context.dd.unified_nodes,plan.views.data,s.ranks,nodes,reference_flags.data);
+        fmm_remote_compare_far_flags_kernel<<<(nodes+255)/256,256,0,stream>>>(
+            plan.far_flags.data,reference_flags.data,nodes,plan.error.data,plan.scalar.data);
+        int mismatches=0,first=nodes;
+        CUDA_CHECK(cudaMemcpyAsync(&mismatches,plan.error.data,sizeof(int),cudaMemcpyDeviceToHost,stream));
+        CUDA_CHECK(cudaMemcpyAsync(&first,plan.scalar.data,sizeof(int),cudaMemcpyDeviceToHost,stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::printf("[FMM remote-list verify] rank=%d epoch=%llu nodes=%d mismatches=%d first=%d\n",
+            gpu,(unsigned long long)s.epoch,nodes,mismatches,first);
+        if(mismatches) {
+            std::fprintf(stderr,"FMM remote far flags differ: rank=%d epoch=%llu first=%d\n",
+                gpu,(unsigned long long)s.epoch,first);
+            std::fflush(stderr);
+            std::abort(); // End every rank immediately; a local exception can strand collective peers.
+        }
+    }
+#endif
     fmm_cub(plan,[&](void* tmp,size_t& bytes) {return cub::DeviceSelect::Flagged(tmp,bytes,
         plan.indices.data,plan.far_flags.data,plan.far_targets.data,plan.scalar.data,nodes,stream);});
     plan.far_count=fmm_read_scalar(plan.scalar.data,stream);
