@@ -2197,7 +2197,7 @@ public:
                     ? 0.5f * config_.multigpu.halo_width_factor : 1.0f;
                 comm.identify_halo_particles(my_state, domain_params_, halo_width,
                                              stream, sph_mode_, extent_scale);
-                comm.pack_halo_particles(my_state, stream);
+                comm.pack_halo_particles(my_state, stream, sph_mode_);
                 calibration_event(false, timing_slot,
                                   CalibrationSegment::HaloPack, stream);
                 require_phase(
@@ -2462,7 +2462,8 @@ public:
 
                 if (sph_mode_) {
                     auto& local = my_state.local_state;
-                    auto refresh_sph_halos = [&](bool rebuild_support) {
+                    auto refresh_sph_halos = [&](bool rebuild_support,
+                                                 SphHaloPayload payload) {
                         CUDA_CHECK(cudaStreamSynchronize(stream));
                         #pragma omp barrier
                         if (rebuild_support) {
@@ -2470,9 +2471,9 @@ public:
                                 config_.sph.kernel_cutoff_factor * sph_global_h_max_;
                             comm.identify_halo_particles(my_state, domain_params_, reach,
                                 stream, true, 0.5f * config_.multigpu.halo_width_factor);
-                            comm.pack_halo_particles(my_state, stream);
+                            comm.pack_halo_particles(my_state, stream, true);
                         } else {
-                            comm.repack_halo_particles(my_state, stream);
+                            comm.repack_halo_particles(my_state, stream, true, payload);
                         }
                         CUDA_CHECK(cudaStreamSynchronize(stream));
                         #pragma omp barrier
@@ -2500,9 +2501,11 @@ public:
                     }
                     calibration_event(false, timing_slot,
                                       CalibrationSegment::SphDensity, stream);
-                    // Density summation and bootstrap EOS changed owner values.
-                    // All ranks participate, including empty owners.
-                    refresh_sph_halos(false);
+                    // Continuous density is unchanged here on regular steps;
+                    // its full halo from the initial exchange is still current.
+                    // Bootstrap EOS and summation-density steps do update it.
+                    if (force_bootstrap_step || config_.sph.density_update_mode != 1)
+                        refresh_sph_halos(false, SphHaloPayload::Thermo);
                     calibration_event(true, timing_slot,
                                       CalibrationSegment::SphConstitutive, stream);
                     if (num_local > 0) {
@@ -2528,7 +2531,7 @@ public:
                                       CalibrationSegment::SphConstitutive, stream);
                     // Force pairs must consume the same closed pressure/stress
                     // on both endpoints, including current stage overrides.
-                    refresh_sph_halos(false);
+                    refresh_sph_halos(false, SphHaloPayload::Force);
                     calibration_event(true, timing_slot,
                                       CalibrationSegment::SphForceHistory, stream);
                     if (num_local > 0) {
@@ -2557,7 +2560,7 @@ public:
                     #pragma omp barrier
                     set_sph_h_max_global(sph_global_h_max_, stream);
                     if (config_.acceleration.enable_self_gravity)
-                        refresh_sph_halos(true);
+                        refresh_sph_halos(true, SphHaloPayload::Full);
                     local.particles.num_particles = num_total;
                 }
                 latest_contact_counts_[gpu_id] = h_num_contacts;
@@ -2985,7 +2988,16 @@ public:
                         const double base=coefficient(RCBWorkPhase::Integration)+coefficient(RCBWorkPhase::Contacts);
                         const double contacts=coefficient(RCBWorkPhase::ContactPair);
                         const double transfer=coefficient(RCBWorkPhase::LinkTransfer);
-                        const double halo=coefficient(RCBWorkPhase::HaloLifecycle)+sizeof(PackedParticle)*transfer;
+                        const double sph_halo_bytes = sizeof(SphHaloParticle)
+                            + sizeof(SphForceRefresh)
+                            + (config_.sph.density_update_mode == 1 ? 0 : sizeof(SphThermoRefresh))
+                            + (config_.acceleration.enable_self_gravity ? sizeof(SphHaloParticle) : 0);
+                        const int sph_halo_rounds = 2
+                            + (config_.sph.density_update_mode == 1 ? 0 : 1)
+                            + (config_.acceleration.enable_self_gravity ? 1 : 0);
+                        const double halo = (sph_mode_ ? sph_halo_rounds : 1)
+                            * coefficient(RCBWorkPhase::HaloLifecycle)
+                            + (sph_mode_ ? sph_halo_bytes : sizeof(PackedParticle)) * transfer;
                         const double gravity_frequency=1.0/std::max(1,respa_enabled?respa_macro_inner_count:1);
                         morton_balance_.set_local(gpu_id,rows,fmm_work,work_count,common_work_coefficients_.data(),
                             base,contacts,halo,gravity_frequency,stream);
@@ -3171,9 +3183,18 @@ public:
                                             RCBWorkPhase::LinkTransfer, link,
                                             coefficient(RCBWorkPhase::LinkTransfer,
                                                         RCBLinkClass::PCIe));
+                                        const double sph_halo_bytes = sizeof(SphHaloParticle)
+                                            + sizeof(SphForceRefresh)
+                                            + (config_.sph.density_update_mode == 1 ? 0 : sizeof(SphThermoRefresh))
+                                            + (config_.acceleration.enable_self_gravity ? sizeof(SphHaloParticle) : 0);
+                                        const int sph_halo_rounds = 2
+                                            + (config_.sph.density_update_mode == 1 ? 0 : 1)
+                                            + (config_.acceleration.enable_self_gravity ? 1 : 0);
                                         input.halo_peer_cost[peer] = static_cast<float>(
-                                            fast_work_multiplier * (lifecycle + transfer_per_byte
-                                              * sizeof(PackedParticle)));
+                                            fast_work_multiplier * (
+                                                (sph_mode_ ? sph_halo_rounds : 1) * lifecycle
+                                                + transfer_per_byte * (sph_mode_ ? sph_halo_bytes
+                                                                              : sizeof(PackedParticle))));
                                     }
 
                                     if (config_.acceleration.enable_self_gravity &&
