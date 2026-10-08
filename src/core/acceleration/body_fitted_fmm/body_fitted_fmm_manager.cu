@@ -682,6 +682,14 @@ static void preload_post_scheduler_kernels()
     PRELOAD_LET(fmm_remote_far_targets_kernel);
     PRELOAD_LET(fmm_remote_far_sources_kernel<2>);
     PRELOAD_LET(fmm_remote_far_sources_kernel<3>);
+    PRELOAD_LET(fmm_far_cache_source_remap_kernel<2>);
+    PRELOAD_LET(fmm_far_cache_source_remap_kernel<3>);
+    PRELOAD_LET(fmm_remote_far_cached_sources_kernel<2>);
+    PRELOAD_LET(fmm_remote_far_cached_sources_kernel<3>);
+    PRELOAD_LET(fmm_far_cache_target_keys_kernel<2>);
+    PRELOAD_LET(fmm_far_cache_target_keys_kernel<3>);
+    PRELOAD_LET(fmm_far_cache_snapshot_targets_kernel);
+    PRELOAD_LET(fmm_far_cache_snapshot_children_kernel);
     PRELOAD_LET(fmm_remote_direct_sources_kernel<2>);
     PRELOAD_LET(fmm_remote_direct_sources_kernel<3>);
     PRELOAD_LET(fmm_halo_refresh_nodes_kernel);

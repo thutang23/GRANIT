@@ -151,6 +151,12 @@ struct FMMHaloMomentView {
     const FMMSourceReply* values=nullptr;
     int count=0;
 };
+struct FMMFarCachePeerStorage {
+    FMMDeviceBuffer<FMMCellKey> keys;
+    FMMDeviceBuffer<uint8_t> child_masks;
+    FMMDeviceBuffer<int> source_remap;
+    int count=0;
+};
 struct FMMRemoteLists {
     FMMDeviceBuffer<FMMRemoteView> views;
     std::vector<FMMRemoteView> host_views;
@@ -163,6 +169,19 @@ struct FMMRemoteLists {
     uint64_t topology_stamp=~uint64_t{0},local_stamp=~uint64_t{0};
     std::vector<uint64_t> generations;
     bool valid=false;
+    // One previous epoch only. References use a second allocation so producing
+    // the current list cannot overwrite the cache being read on the stream.
+    FMMDeviceBuffer<FMMRemoteRef> cached_far_sources;
+    FMMDeviceBuffer<FMMFarCacheTargetPeer> cache_targets;
+    FMMDeviceBuffer<FMMFarCachePeerView> cache_views;
+    std::vector<FMMFarCachePeerView> cache_host_views;
+    std::vector<std::unique_ptr<FMMFarCachePeerStorage>> cache_peers;
+    FMMDeviceBuffer<uint64_t> cache_keys,cache_unsorted_keys;
+    FMMDeviceBuffer<int> cache_rows,cache_unsorted_rows,cache_statistics;
+    FMMHaloGeometryKey cache_geometry;
+    int cache_count=0,cache_dimension=0,cache_layers_x=0,cache_layers_y=0;
+    double cache_cutoff=0,cache_length_x=0,cache_length_y=0;
+    bool cache_valid=false;
     FMMRemoteM2LList far_view() const {
         FMMRemoteM2LList result{far_targets.data,far_sources.data,views.data,far_count,{}};
         std::copy(class_offsets,class_offsets+9,result.class_offsets);return result;
