@@ -658,6 +658,11 @@ static void preload_post_scheduler_kernels()
     preload((const void*)body_fitted_fmm::fmm_p2p_remote_leaves_kernel<true,double>, "SPH remote acceleration");
     preload((const void*)body_fitted_fmm::fmm_p2p_grouped_leaf_unified<false,double>, "SPH local force");
     preload((const void*)body_fitted_fmm::fmm_p2p_grouped_leaf_unified<true,double>, "SPH local acceleration");
+    preload((const void*)body_fitted_fmm::fmm_p2p_grouped_leaf_unified<false,double,true>, "SPH leaf-only local force");
+    preload((const void*)body_fitted_fmm::fmm_p2p_grouped_leaf_unified<true,double,true>, "SPH leaf-only local acceleration");
+    preload((const void*)body_fitted_fmm::fmm_p2p_grouped_leaf_unified<false,body_fitted_fmm::p2p_compute_t,true>, "DEM leaf-only local force");
+    preload((const void*)body_fitted_fmm::fmm_p2p_grouped_leaf_unified<true,body_fitted_fmm::p2p_compute_t,true>, "DEM leaf-only local acceleration");
+    PRELOAD_LET(fmm_verify_leaf_only_kernel);
     PRELOAD_LET(fmm_halo_decode_kernel<2>);
     PRELOAD_LET(fmm_halo_decode_kernel<3>);
     PRELOAD_LET(fmm_halo_nodes_kernel<2>);
@@ -2730,7 +2735,10 @@ static void run_p2p_inner(int gpu_id, ::cudadem::SimulationState& state,
         state.particles.pos_y,
         state.particles.pos_z,
         state.particles.mass, state.particles.force_x, state.particles.force_y,
-        state.particles.force_z, G, softening, stream);
+        state.particles.force_z, G, softening, stream, persistent_tree_runtime_[gpu_id].device_context,
+        body_fitted_fmm::grouped_p2p_leaf_only_allowed(
+            persistent_tree_runtime_[gpu_id].host_context.command.disable_direct_fallback,
+            persistent_tree_runtime_[gpu_id].host_context.command.cutoff_radius));
     if (distributed.evaluating) body_fitted_fmm::launch_p2p_remote_leaves<false>(
         distributed.remote_lists.near_view(),dd,
         &persistent_tree_runtime_[gpu_id].device_context->metadata,
@@ -2764,7 +2772,10 @@ static void run_p2p_outer(int gpu_id, ::cudadem::SimulationState& state,
         state.particles.pos_z,
         state.particles.mass, state.particles.gravity_force_x,
         state.particles.gravity_force_y, state.particles.gravity_force_z,
-        G, softening, stream);
+        G, softening, stream, persistent_tree_runtime_[gpu_id].device_context,
+        body_fitted_fmm::grouped_p2p_leaf_only_allowed(
+            persistent_tree_runtime_[gpu_id].host_context.command.disable_direct_fallback,
+            persistent_tree_runtime_[gpu_id].host_context.command.cutoff_radius));
     if (distributed.evaluating) body_fitted_fmm::launch_p2p_remote_leaves<true>(
         distributed.remote_lists.near_view(),dd,
         &persistent_tree_runtime_[gpu_id].device_context->metadata,

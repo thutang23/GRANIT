@@ -455,7 +455,65 @@ struct GroupedParticleSources {
     bool remote;
 };
 
-template<int D, bool OUTER, class Compute = p2p_compute_t>
+__host__ __device__ __forceinline__ bool grouped_p2p_leaf_only_allowed(
+    int disable_direct_fallback,double cutoff) {
+    return disable_direct_fallback && cutoff<=0.0;
+}
+__host__ __device__ __forceinline__ bool grouped_p2p_leaf_eligible(const UnifiedNode& node) {
+    return (node.flags&UNIFIED_NODE_FLAG_VALID) && (node.flags&UNIFIED_NODE_FLAG_IS_LEAF) &&
+        node.level>=2 && node.target_count!=0;
+}
+template<bool LeafOnly> __device__ __forceinline__ int grouped_p2p_leaf_work_count(
+    const PersistentTreeMetadata* metadata,const PersistentTreeContext* context,int actual_nodes) {
+    if constexpr(LeafOnly)return context->dd.level_count[metadata->evaluation_depth];
+    else return actual_nodes;
+}
+template<bool LeafOnly> __device__ __forceinline__ int grouped_p2p_leaf_work_node(int work,
+    const PersistentTreeMetadata* metadata,const PersistentTreeContext* context) {
+    if constexpr(LeafOnly)return context->dd.level_list[context->dd.level_start[metadata->evaluation_depth]+work];
+    else return work;
+}
+template<int D> __device__ bool grouped_p2p_leaf_only_routes_valid(
+    const UnifiedNode& node,const GroupedTargetInteractions& work) {
+    if(!(node.flags&UNIFIED_NODE_FLAG_VALID) || !node.target_count || node.level<2)return true;
+    using T=GroupedStencilTraits<D>;
+    if(work.cross_direct_bits)return false;
+    const bool leaf=node.flags&UNIFIED_NODE_FLAG_IS_LEAF;
+    const int q=grouped_target_child<D>(node.compact_morton);
+    for(int block=0;block<T::BLOCK_COUNT;++block) {
+        const uint8_t allowed=leaf?T::block(q,block).near_mask:0;
+        if(work.block_direct_mask[block]&uint8_t(~allowed))return false;
+    }
+    return true;
+}
+__global__ void fmm_verify_leaf_only_kernel(const PersistentTreeContext* context) {
+    if(!grouped_p2p_leaf_only_allowed(context->command.disable_direct_fallback,context->command.cutoff_radius) ||
+        !(context->metadata.cutoff_radius<=0.0)) {
+        if(blockIdx.x==0 && threadIdx.x==0)printf("BF-FMM leaf-only P2P oracle invalid routing guard\n");
+        __trap();return;
+    }
+    const int depth=context->metadata.evaluation_depth;
+    if(depth<2 || depth>=fmm::FMM_MAX_LEVELS ||
+        context->dd.level_count[depth]!=context->metadata.num_unique_cells) {
+        if(blockIdx.x==0 && threadIdx.x==0)printf("BF-FMM leaf-only P2P oracle invalid deepest-level leaf count\n");
+        __trap();return;
+    }
+    for(int target=blockIdx.x*blockDim.x+threadIdx.x;target<context->metadata.num_nodes;
+        target+=gridDim.x*blockDim.x) {
+        const auto node=context->dd.unified_nodes[target];
+        if(!(node.flags&UNIFIED_NODE_FLAG_VALID) || !node.target_count || node.level<2)continue;
+        const auto& work=context->arena.d_targets[target];
+        const bool valid=context->metadata.active_tree==2
+            ?grouped_p2p_leaf_only_routes_valid<2>(node,work)
+            :grouped_p2p_leaf_only_routes_valid<3>(node,work);
+        if(!valid || ((node.flags&UNIFIED_NODE_FLAG_IS_LEAF) && node.level!=depth)) {
+            printf("BF-FMM leaf-only P2P oracle forbidden direct route or shallow leaf: target=%d level=%d\n",target,int(node.level));
+            __trap();return;
+        }
+    }
+}
+
+template<int D, bool OUTER, class Compute = p2p_compute_t, bool LeafOnly = false>
 __device__ __forceinline__ void grouped_p2p_leaf_routes(
     int leaf, int num_nodes, bool target_active, unsigned int target_mask, int orig_i,
     double xi, double yi, double zi, Compute mi,
@@ -489,16 +547,18 @@ __device__ __forceinline__ void grouped_p2p_leaf_routes(
         }
         if (level == 1) break;
         const GroupedTargetInteractions& work = arena.d_targets[target];
-        #pragma unroll
-        for (int i = 0; i < T::CROSS_COUNT; ++i) {
-            const GroupedSourceRoute route = grouped_cross_route(work, i);
-            if (!grouped_route_valid(route) || !(grouped_route_mask(route) & 1u))
-                continue;
-            grouped_p2p_source_warp<OUTER>(
-                grouped_route_node(route), target_active, target_mask, orig_i, xi, yi, zi,
-                mi, ax, ay, az, source_nodes, pos_x, pos_y, pos_z, mass,
-                sorted_indices, lane, sh_pos_x, sh_pos_y, sh_pos_z, sh_mass,
-                G, softening_sq, cutoff_sq);
+        if constexpr(!LeafOnly) {
+            #pragma unroll
+            for (int i = 0; i < T::CROSS_COUNT; ++i) {
+                const GroupedSourceRoute route = grouped_cross_route(work, i);
+                if (!grouped_route_valid(route) || !(grouped_route_mask(route) & 1u))
+                    continue;
+                grouped_p2p_source_warp<OUTER>(
+                    grouped_route_node(route), target_active, target_mask, orig_i, xi, yi, zi,
+                    mi, ax, ay, az, source_nodes, pos_x, pos_y, pos_z, mass,
+                    sorted_indices, lane, sh_pos_x, sh_pos_y, sh_pos_z, sh_mass,
+                    G, softening_sq, cutoff_sq);
+            }
         }
         #pragma unroll
         for (int block = 0; block < T::BLOCK_COUNT; ++block) {
@@ -519,11 +579,14 @@ __device__ __forceinline__ void grouped_p2p_leaf_routes(
                     G, softening_sq, cutoff_sq);
             }
         }
+        // With fixed distributed routing and no cutoff, ancestors contain
+        // only far work. This compile-time break removes their walk entirely.
+        if constexpr(LeafOnly)break;
         target = work.target_parent;
     }
 }
 
-template<bool OUTER, class Compute = p2p_compute_t>
+template<bool OUTER, class Compute = p2p_compute_t, bool LeafOnly = false>
 __device__ __forceinline__ void fmm_p2p_grouped_leaf_body(
     const GroupedInteractionArena arena,
     const PersistentTreeMetadata* __restrict__ metadata,
@@ -533,8 +596,16 @@ __device__ __forceinline__ void fmm_p2p_grouped_leaf_body(
     const double* __restrict__ pos_z, const float* __restrict__ mass,
     double* __restrict__ out_x, double* __restrict__ out_y,
     double* __restrict__ out_z, const int* __restrict__ sorted_indices,
-    Compute G, Compute softening, GroupedParticleSources sources)
+    Compute G, Compute softening, GroupedParticleSources sources,
+    const PersistentTreeContext* context=nullptr)
 {
+    if constexpr(LeafOnly) {
+        if(!context || !grouped_p2p_leaf_only_allowed(context->command.disable_direct_fallback,context->command.cutoff_radius) ||
+            !(metadata->cutoff_radius<=0.0) || metadata->evaluation_depth<2 || metadata->evaluation_depth>=fmm::FMM_MAX_LEVELS) {
+            if(blockIdx.x==0 && threadIdx.x==0)printf("BF-FMM leaf-only P2P launched with invalid routing guard\n");
+            __trap();return;
+        }
+    }
     constexpr int WARPS_PER_BLOCK = 4;
     __shared__ double sh_pos_x[WARPS_PER_BLOCK][32];
     __shared__ double sh_pos_y[WARPS_PER_BLOCK][32];
@@ -551,12 +622,13 @@ __device__ __forceinline__ void fmm_p2p_grouped_leaf_body(
     const int warp = threadIdx.x >> 5;
     const int first_leaf = blockIdx.x * WARPS_PER_BLOCK + warp;
     const int leaf_stride = gridDim.x * WARPS_PER_BLOCK;
-    for (int leaf = first_leaf; leaf < actual_nodes; leaf += leaf_stride) {
+    // Karras emits interleaved edge paths, so native leaf IDs are not a tail
+    // range. Its existing deepest-level list covers every occupied leaf.
+    const int work_count=grouped_p2p_leaf_work_count<LeafOnly>(metadata,context,actual_nodes);
+    for (int work = first_leaf; work < work_count; work += leaf_stride) {
+        const int leaf=grouped_p2p_leaf_work_node<LeafOnly>(work,metadata,context);
         const UnifiedNode& leaf_node = target_nodes[leaf];
-        if (!(leaf_node.flags & UNIFIED_NODE_FLAG_VALID) ||
-            !(leaf_node.flags & UNIFIED_NODE_FLAG_IS_LEAF) ||
-            leaf_node.level < 2 || leaf_node.target_count == 0)
-            continue;
+        if (!grouped_p2p_leaf_eligible(leaf_node))continue;
         // Image-only leaves are sources, not destinations: the stencil never
         // initializes their grouped records. Mixed leaves still need every
         // lane for cooperative source loads, including inactive target lanes.
@@ -582,13 +654,13 @@ __device__ __forceinline__ void fmm_p2p_grouped_leaf_body(
             }
             Compute ax = 0, ay = 0, az = 0;
             if (metadata->active_tree == 2) {
-                grouped_p2p_leaf_routes<2, OUTER>(
+                grouped_p2p_leaf_routes<2, OUTER, Compute, LeafOnly>(
                     leaf, actual_nodes, active, target_mask, sources.remote ? -1 : orig_i, xi, yi, zi, mi, ax, ay, az, arena,
                     nodes, sources.nodes, sources.children, sources.x, sources.y, sources.z, sources.mass, sources.order,
                     lane, sh_pos_x[warp], sh_pos_y[warp], sh_pos_z[warp],
                     sh_mass[warp], G, softening_sq, cutoff_sq);
             } else {
-                grouped_p2p_leaf_routes<3, OUTER>(
+                grouped_p2p_leaf_routes<3, OUTER, Compute, LeafOnly>(
                     leaf, actual_nodes, active, target_mask, sources.remote ? -1 : orig_i, xi, yi, zi, mi, ax, ay, az, arena,
                     nodes, sources.nodes, sources.children, sources.x, sources.y, sources.z, sources.mass, sources.order,
                     lane, sh_pos_x[warp], sh_pos_y[warp], sh_pos_z[warp],
@@ -603,7 +675,7 @@ __device__ __forceinline__ void fmm_p2p_grouped_leaf_body(
     }
 }
 
-template<bool OUTER, class Compute = p2p_compute_t>
+template<bool OUTER, class Compute = p2p_compute_t, bool LeafOnly = false>
 __global__ void fmm_p2p_grouped_leaf_unified(
     const GroupedInteractionArena arena,
     const PersistentTreeMetadata* __restrict__ metadata,
@@ -613,35 +685,52 @@ __global__ void fmm_p2p_grouped_leaf_unified(
     const double* __restrict__ pos_z, const float* __restrict__ mass,
     double* __restrict__ out_x, double* __restrict__ out_y,
     double* __restrict__ out_z, const int* __restrict__ sorted_indices,
-    Compute G, Compute softening)
+    Compute G, Compute softening,const PersistentTreeContext* context=nullptr)
 {
     const GroupedParticleSources sources{nodes,children,pos_x,pos_y,pos_z,mass,sorted_indices,false};
-    fmm_p2p_grouped_leaf_body<OUTER>(
+    fmm_p2p_grouped_leaf_body<OUTER, Compute, LeafOnly>(
         arena,metadata,nodes,children,node_capacity,pos_x,pos_y,pos_z,mass,
-        out_x,out_y,out_z,sorted_indices,G,softening,sources);
+        out_x,out_y,out_z,sorted_indices,G,softening,sources,context);
 }
 
+template<bool OUTER,class Compute,bool LeafOnly>
+void launch_p2p_grouped_leaf_mode(
+    const fmm::FMMDeviceData& dd,const GroupedInteractionArena& arena,
+    const PersistentTreeMetadata* metadata,int node_capacity,
+    const double* pos_x,const double* pos_y,const double* pos_z,const float* mass,
+    double* out_x,double* out_y,double* out_z,double G,double softening,cudaStream_t stream,
+    const PersistentTreeContext* context) {
+    constexpr int grid=2048;
+    fmm_p2p_grouped_leaf_unified<OUTER,Compute,LeafOnly><<<grid,128,0,stream>>>(
+        arena,metadata,dd.unified_nodes,dd.children_compact,node_capacity,
+        pos_x,pos_y,pos_z,mass,out_x,out_y,out_z,dd.sorted_to_original,
+        static_cast<Compute>(G),static_cast<Compute>(softening),context);
+}
 template<bool OUTER>
 void launch_p2p_grouped_leaves(
     const fmm::FMMDeviceData& dd, const GroupedInteractionArena& arena,
     const PersistentTreeMetadata* metadata, int node_capacity,
     const double* pos_x, const double* pos_y, const double* pos_z,
     const float* mass, double* out_x, double* out_y, double* out_z,
-    double G, double softening, cudaStream_t stream)
+    double G, double softening, cudaStream_t stream,
+    const PersistentTreeContext* context=nullptr,bool leaf_only=false)
 {
-    constexpr int grid = 2048;
-    if (softening < 0) {
-    fmm_p2p_grouped_leaf_unified<OUTER, double><<<grid, 128, 0, stream>>>(
-        arena, metadata, dd.unified_nodes, dd.children_compact, node_capacity,
-        pos_x, pos_y, pos_z, mass, out_x, out_y, out_z,
-        dd.sorted_to_original, static_cast<double>(G),
-        static_cast<double>(softening));
+    const bool verify=leaf_only && std::getenv("GRANIT_FMM_VERIFY_LEAF_ONLY");
+    if(verify)fmm_verify_leaf_only_kernel<<<2048,256,0,stream>>>(context);
+    if(std::getenv("GRANIT_DISTRIBUTED_FMM_DIAGNOSTICS") || std::getenv("GRANIT_FMM_VERIFY_LEAF_ONLY")) {
+        int gpu=0;CUDA_CHECK(cudaGetDevice(&gpu));
+        std::printf("[FMM local P2P] rank=%d outer=%d leaf_only=%d verify=%d\n",gpu,int(OUTER),int(leaf_only),int(verify));
+    }
+    if(softening<0) {
+        if(leaf_only)launch_p2p_grouped_leaf_mode<OUTER,double,true>(dd,arena,metadata,node_capacity,
+            pos_x,pos_y,pos_z,mass,out_x,out_y,out_z,G,softening,stream,context);
+        else launch_p2p_grouped_leaf_mode<OUTER,double,false>(dd,arena,metadata,node_capacity,
+            pos_x,pos_y,pos_z,mass,out_x,out_y,out_z,G,softening,stream,context);
     } else {
-    fmm_p2p_grouped_leaf_unified<OUTER><<<grid, 128, 0, stream>>>(
-        arena, metadata, dd.unified_nodes, dd.children_compact, node_capacity,
-        pos_x, pos_y, pos_z, mass, out_x, out_y, out_z,
-        dd.sorted_to_original, static_cast<p2p_compute_t>(G),
-        static_cast<p2p_compute_t>(softening));
+        if(leaf_only)launch_p2p_grouped_leaf_mode<OUTER,p2p_compute_t,true>(dd,arena,metadata,node_capacity,
+            pos_x,pos_y,pos_z,mass,out_x,out_y,out_z,G,softening,stream,context);
+        else launch_p2p_grouped_leaf_mode<OUTER,p2p_compute_t,false>(dd,arena,metadata,node_capacity,
+            pos_x,pos_y,pos_z,mass,out_x,out_y,out_z,G,softening,stream,context);
     }
     CUDA_CHECK(cudaGetLastError());
 }
