@@ -51,6 +51,9 @@ struct FMMRemoteView {
     const UnifiedNode* nodes=nullptr; const int* children=nullptr;
     const GroupedTargetInteractions* far_routes=nullptr; int count=0;
 };
+// This predicate fixture retains the supported dense-view convention.
+// Compact mappings and absent rows are covered by test_compact_halo_routes.py.
+inline int fmm_remote_route_row(const FMMRemoteView&,int target){return target;}
 inline GroupedSourceRoute grouped_cross_route(const GroupedTargetInteractions& x,int i){return x.cross[i];}
 inline GroupedSourceRoute grouped_block_route(const GroupedTargetInteractions& x,int i){return x.block[i];}
 inline bool grouped_route_valid(GroupedSourceRoute x){return x.node!=UINT32_MAX;}

@@ -9,7 +9,8 @@ __device__ FMMRemoteRef fmm_remote_far_ref(int target,int slot,
     const int q=grouped_target_child<D>(targets[target].compact_morton);
     for(int peer=0;peer<ranks;++peer) {
         const auto view=peers[peer];if(!view.count)continue;
-        const auto work=view.far_routes[target];int source=-1;
+        const int row=fmm_remote_route_row(view,target);if(row<0)continue;
+        const auto work=view.far_routes[row];int source=-1;
         if(slot<T::CROSS_COUNT) {
             const auto route=grouped_cross_route(work,slot);
             if(grouped_route_valid(route) && !(grouped_route_mask(route)&1u))source=grouped_route_node(route);
@@ -43,7 +44,9 @@ __device__ uint64_t fmm_remote_direct_row(int leaf,const PersistentTreeContext* 
                 printf("BF-FMM invalid remote direct target chain: leaf=%d target=%d level=%d\n",leaf,target,level);
                 __trap();return 0;
             }
-            const auto work=view.direct_routes[target];
+            const int row=fmm_remote_route_row(view,target);
+            if(row<0) {target=local->arena.d_targets[target].target_parent;continue;}
+            const auto work=view.direct_routes[row];
             for(int c=0;c<T::CROSS_COUNT;++c) {
                 const auto route=grouped_cross_route(work,c);
                 if(grouped_route_valid(route) && (grouped_route_mask(route)&1u)) {
@@ -75,7 +78,8 @@ __device__ bool fmm_remote_has_far(int target,const UnifiedNode& node,
     for(int peer=0;peer<ranks;++peer) {
         const FMMRemoteView view=peers[peer];
         if(!view.count)continue;
-        const auto& work=view.far_routes[target];
+        const int row=fmm_remote_route_row(view,target);if(row<0)continue;
+        const auto& work=view.far_routes[row];
         for(int cross=0;cross<T::CROSS_COUNT;++cross) {
             const auto route=grouped_cross_route(work,cross);
             if(grouped_route_valid(route) && !(grouped_route_mask(route)&1u))return true;
@@ -175,7 +179,7 @@ template<int D> inline void fmm_prepare_remote_lists(int gpu,DistributedFMMState
         if(!q.request_count)continue;
         plan.host_views[peer]={q.halo_nodes.data,q.halo_children.data,q.halo_multipoles.data,
             q.moment_routes.data,q.halo_routes.data,q.halo_x.data,q.halo_y.data,q.halo_z.data,
-            q.halo_mass.data,q.halo_order.data,q.request_count};
+            q.halo_mass.data,q.halo_order.data,q.request_count,q.route_index.data};
     }
     plan.views.reserve(s.ranks);
     CUDA_CHECK(cudaMemcpyAsync(plan.views.data,plan.host_views.data(),s.ranks*sizeof(FMMRemoteView),cudaMemcpyHostToDevice,stream));

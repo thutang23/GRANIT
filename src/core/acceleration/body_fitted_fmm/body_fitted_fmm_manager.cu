@@ -664,6 +664,8 @@ static void preload_post_scheduler_kernels()
     PRELOAD_LET(fmm_halo_nodes_kernel<3>);
     PRELOAD_LET(fmm_halo_inverse_routes_kernel<2>);
     PRELOAD_LET(fmm_halo_inverse_routes_kernel<3>);
+    preload((const void*)body_fitted_fmm::fmm_halo_inverse_routes_kernel<2,true>, "halo mark compact targets 2");
+    preload((const void*)body_fitted_fmm::fmm_halo_inverse_routes_kernel<3,true>, "halo mark compact targets 3");
     PRELOAD_LET(fmm_plan_identity_kernel<2>);
     PRELOAD_LET(fmm_plan_identity_kernel<3>);
     PRELOAD_LET(fmm_halo_select_kernel);
@@ -2018,9 +2020,9 @@ const DistributedFMMParticleWork* UnifiedFMMDispatcher::distributed_particle_wor
         if((peer==gpu&&!state.routing.enabled)||(state.local_only&&peer!=gpu))continue;
         const auto& q=*state.peers[peer];if(!q.request_count)continue;
         if(state.grid.dimension==2)fmm_owned_node_work_kernel<2><<<(nodes+255)/256,256,0,stream>>>(ctx,nodes,0,0,
-            state.node_work.data,state.routing,gpu,q.halo_nodes.data,q.halo_children.data,q.moment_routes.data,peer!=gpu);
+            state.node_work.data,state.routing,gpu,q.halo_nodes.data,q.halo_children.data,q.moment_routes.data,peer!=gpu,q.route_index.data);
         else fmm_owned_node_work_kernel<3><<<(nodes+255)/256,256,0,stream>>>(ctx,nodes,0,0,
-            state.node_work.data,state.routing,gpu,q.halo_nodes.data,q.halo_children.data,q.moment_routes.data,peer!=gpu);
+            state.node_work.data,state.routing,gpu,q.halo_nodes.data,q.halo_children.data,q.moment_routes.data,peer!=gpu,q.route_index.data);
     }
     CUDA_CHECK(cudaMemsetAsync(p.work_difference.data,0,(sources+1)*sizeof(double4),stream));
     CUDA_CHECK(cudaMemsetAsync(p.particle_work.data,0,n*sizeof(DistributedFMMParticleWork),stream));

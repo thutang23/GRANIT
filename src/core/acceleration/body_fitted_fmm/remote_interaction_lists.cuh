@@ -22,7 +22,11 @@ struct FMMRemoteView {
     const float* mass = nullptr;
     const int* order = nullptr;
     int count = 0;
+    const int* route_index = nullptr; // local target -> compact row; -1 means absent
 };
+__host__ __device__ __forceinline__ int fmm_remote_route_row(const FMMRemoteView& view,int target) {
+    return view.route_index?view.route_index[target]:target;
+}
 struct FMMRemoteM2LList {
     const int* targets = nullptr; // child-class sorted active target indices
     const FMMRemoteRef* sources = nullptr; // [stencil slot][active target]
