@@ -93,7 +93,7 @@ and long physical trajectories were not exercised by this DEM campaign.
 
 The local campaign directory is benchmarks/shear_let_optimization_20261008.
 Raw particle outputs and binaries are retained locally, not committed. Its
-[final audit](../benchmarks/shear_let_optimization_20261008/campaign_audit_final.json)
+local final audit, `benchmarks/shear_let_optimization_20261008/campaign_audit_final.json`,
 binds configurations, input/material hashes, executable hashes, timing windows,
 and validation reports. The directory also contains per-attempt logs, receipts,
 telemetry, frozen executables, phase_summary.json, and toolchain_note.json.
