@@ -1109,6 +1109,10 @@ void submit_persistent_tree_runtime(
         runtime.pending_presorted = PresortedMortonInput{};
     }
 
+    // Host P2P dispatch uses the exact policy submitted for this evaluation;
+    // no duplicate reconstruction of distributed/shear conditions or readback.
+    runtime.host_context.command.disable_direct_fallback=command.disable_direct_fallback;
+    runtime.host_context.command.cutoff_radius=command.cutoff_radius;
     PersistentTreeMetadata metadata_patch{};
     metadata_patch.target_particle_count = target_particle_count;
     metadata_patch.cutoff_radius = cutoff_radius;

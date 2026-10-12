@@ -658,12 +658,19 @@ static void preload_post_scheduler_kernels()
     preload((const void*)body_fitted_fmm::fmm_p2p_remote_leaves_kernel<true,double>, "SPH remote acceleration");
     preload((const void*)body_fitted_fmm::fmm_p2p_grouped_leaf_unified<false,double>, "SPH local force");
     preload((const void*)body_fitted_fmm::fmm_p2p_grouped_leaf_unified<true,double>, "SPH local acceleration");
+    preload((const void*)body_fitted_fmm::fmm_p2p_grouped_leaf_unified<false,double,true>, "SPH leaf-only local force");
+    preload((const void*)body_fitted_fmm::fmm_p2p_grouped_leaf_unified<true,double,true>, "SPH leaf-only local acceleration");
+    preload((const void*)body_fitted_fmm::fmm_p2p_grouped_leaf_unified<false,body_fitted_fmm::p2p_compute_t,true>, "DEM leaf-only local force");
+    preload((const void*)body_fitted_fmm::fmm_p2p_grouped_leaf_unified<true,body_fitted_fmm::p2p_compute_t,true>, "DEM leaf-only local acceleration");
+    PRELOAD_LET(fmm_verify_leaf_only_kernel);
     PRELOAD_LET(fmm_halo_decode_kernel<2>);
     PRELOAD_LET(fmm_halo_decode_kernel<3>);
     PRELOAD_LET(fmm_halo_nodes_kernel<2>);
     PRELOAD_LET(fmm_halo_nodes_kernel<3>);
     PRELOAD_LET(fmm_halo_inverse_routes_kernel<2>);
     PRELOAD_LET(fmm_halo_inverse_routes_kernel<3>);
+    preload((const void*)body_fitted_fmm::fmm_halo_inverse_routes_kernel<2,true>, "halo mark compact targets 2");
+    preload((const void*)body_fitted_fmm::fmm_halo_inverse_routes_kernel<3,true>, "halo mark compact targets 3");
     PRELOAD_LET(fmm_plan_identity_kernel<2>);
     PRELOAD_LET(fmm_plan_identity_kernel<3>);
     PRELOAD_LET(fmm_halo_select_kernel);
@@ -680,6 +687,14 @@ static void preload_post_scheduler_kernels()
     PRELOAD_LET(fmm_remote_far_targets_kernel);
     PRELOAD_LET(fmm_remote_far_sources_kernel<2>);
     PRELOAD_LET(fmm_remote_far_sources_kernel<3>);
+    PRELOAD_LET(fmm_far_cache_source_remap_kernel<2>);
+    PRELOAD_LET(fmm_far_cache_source_remap_kernel<3>);
+    PRELOAD_LET(fmm_remote_far_cached_sources_kernel<2>);
+    PRELOAD_LET(fmm_remote_far_cached_sources_kernel<3>);
+    PRELOAD_LET(fmm_far_cache_target_keys_kernel<2>);
+    PRELOAD_LET(fmm_far_cache_target_keys_kernel<3>);
+    PRELOAD_LET(fmm_far_cache_snapshot_targets_kernel);
+    PRELOAD_LET(fmm_far_cache_snapshot_children_kernel);
     PRELOAD_LET(fmm_remote_direct_sources_kernel<2>);
     PRELOAD_LET(fmm_remote_direct_sources_kernel<3>);
     PRELOAD_LET(fmm_halo_refresh_nodes_kernel);
@@ -2018,9 +2033,9 @@ const DistributedFMMParticleWork* UnifiedFMMDispatcher::distributed_particle_wor
         if((peer==gpu&&!state.routing.enabled)||(state.local_only&&peer!=gpu))continue;
         const auto& q=*state.peers[peer];if(!q.request_count)continue;
         if(state.grid.dimension==2)fmm_owned_node_work_kernel<2><<<(nodes+255)/256,256,0,stream>>>(ctx,nodes,0,0,
-            state.node_work.data,state.routing,gpu,q.halo_nodes.data,q.halo_children.data,q.moment_routes.data,peer!=gpu);
+            state.node_work.data,state.routing,gpu,q.halo_nodes.data,q.halo_children.data,q.moment_routes.data,peer!=gpu,q.route_index.data);
         else fmm_owned_node_work_kernel<3><<<(nodes+255)/256,256,0,stream>>>(ctx,nodes,0,0,
-            state.node_work.data,state.routing,gpu,q.halo_nodes.data,q.halo_children.data,q.moment_routes.data,peer!=gpu);
+            state.node_work.data,state.routing,gpu,q.halo_nodes.data,q.halo_children.data,q.moment_routes.data,peer!=gpu,q.route_index.data);
     }
     CUDA_CHECK(cudaMemsetAsync(p.work_difference.data,0,(sources+1)*sizeof(double4),stream));
     CUDA_CHECK(cudaMemsetAsync(p.particle_work.data,0,n*sizeof(DistributedFMMParticleWork),stream));
@@ -2720,7 +2735,10 @@ static void run_p2p_inner(int gpu_id, ::cudadem::SimulationState& state,
         state.particles.pos_y,
         state.particles.pos_z,
         state.particles.mass, state.particles.force_x, state.particles.force_y,
-        state.particles.force_z, G, softening, stream);
+        state.particles.force_z, G, softening, stream, persistent_tree_runtime_[gpu_id].device_context,
+        body_fitted_fmm::grouped_p2p_leaf_only_allowed(
+            persistent_tree_runtime_[gpu_id].host_context.command.disable_direct_fallback,
+            persistent_tree_runtime_[gpu_id].host_context.command.cutoff_radius));
     if (distributed.evaluating) body_fitted_fmm::launch_p2p_remote_leaves<false>(
         distributed.remote_lists.near_view(),dd,
         &persistent_tree_runtime_[gpu_id].device_context->metadata,
@@ -2754,7 +2772,10 @@ static void run_p2p_outer(int gpu_id, ::cudadem::SimulationState& state,
         state.particles.pos_z,
         state.particles.mass, state.particles.gravity_force_x,
         state.particles.gravity_force_y, state.particles.gravity_force_z,
-        G, softening, stream);
+        G, softening, stream, persistent_tree_runtime_[gpu_id].device_context,
+        body_fitted_fmm::grouped_p2p_leaf_only_allowed(
+            persistent_tree_runtime_[gpu_id].host_context.command.disable_direct_fallback,
+            persistent_tree_runtime_[gpu_id].host_context.command.cutoff_radius));
     if (distributed.evaluating) body_fitted_fmm::launch_p2p_remote_leaves<true>(
         distributed.remote_lists.near_view(),dd,
         &persistent_tree_runtime_[gpu_id].device_context->metadata,

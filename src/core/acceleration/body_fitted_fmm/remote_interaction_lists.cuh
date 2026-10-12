@@ -22,7 +22,23 @@ struct FMMRemoteView {
     const float* mass = nullptr;
     const int* order = nullptr;
     int count = 0;
+    const int* route_index = nullptr; // local target -> compact row; -1 means absent
 };
+__host__ __device__ __forceinline__ int fmm_remote_route_row(const FMMRemoteView& view,int target) {
+    return view.route_index?view.route_index[target]:target;
+}
+// Previous-epoch far schedules contain no live coefficients or populations.
+// Source references are rebound to current receive-buffer indexes before use.
+struct FMMFarCachePeerView {
+    const int* source_remap = nullptr;
+    const uint8_t* child_masks = nullptr;
+    int count = 0;
+};
+struct FMMFarCacheTargetPeer {
+    GroupedTargetInteractions routes{};
+    bool present = false;
+};
+
 struct FMMRemoteM2LList {
     const int* targets = nullptr; // child-class sorted active target indices
     const FMMRemoteRef* sources = nullptr; // [stencil slot][active target]
