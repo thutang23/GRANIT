@@ -106,6 +106,10 @@ struct FMMQueryPeer {
     FMMDeviceBuffer<UnifiedNode> halo_nodes;
     FMMDeviceBuffer<int> halo_children, halo_order, route_counts;
     FMMDeviceBuffer<fmm::MultipoleExpansion> halo_multipoles;
+    // Only inverse-stencil targets own the large route planes. A dense int map
+    // preserves O(1) lookup for ordered far slots and ancestor direct routes.
+    FMMDeviceBuffer<int> route_targets, route_index;
+    int route_target_count=0;
     FMMDeviceBuffer<GroupedTargetInteractions> halo_routes, moment_routes;
     FMMDeviceBuffer<int> moment_slots, moment_owner;
     FMMDeviceBuffer<double> halo_x, halo_y, halo_z;
@@ -147,6 +151,12 @@ struct FMMHaloMomentView {
     const FMMSourceReply* values=nullptr;
     int count=0;
 };
+struct FMMFarCachePeerStorage {
+    FMMDeviceBuffer<FMMCellKey> keys;
+    FMMDeviceBuffer<uint8_t> child_masks;
+    FMMDeviceBuffer<int> source_remap;
+    int count=0;
+};
 struct FMMRemoteLists {
     FMMDeviceBuffer<FMMRemoteView> views;
     std::vector<FMMRemoteView> host_views;
@@ -159,6 +169,19 @@ struct FMMRemoteLists {
     uint64_t topology_stamp=~uint64_t{0},local_stamp=~uint64_t{0};
     std::vector<uint64_t> generations;
     bool valid=false;
+    // One previous epoch only. References use a second allocation so producing
+    // the current list cannot overwrite the cache being read on the stream.
+    FMMDeviceBuffer<FMMRemoteRef> cached_far_sources;
+    FMMDeviceBuffer<FMMFarCacheTargetPeer> cache_targets;
+    FMMDeviceBuffer<FMMFarCachePeerView> cache_views;
+    std::vector<FMMFarCachePeerView> cache_host_views;
+    std::vector<std::unique_ptr<FMMFarCachePeerStorage>> cache_peers;
+    FMMDeviceBuffer<uint64_t> cache_keys,cache_unsorted_keys;
+    FMMDeviceBuffer<int> cache_rows,cache_unsorted_rows,cache_statistics;
+    FMMHaloGeometryKey cache_geometry;
+    int cache_count=0,cache_dimension=0,cache_layers_x=0,cache_layers_y=0;
+    double cache_cutoff=0,cache_length_x=0,cache_length_y=0;
+    bool cache_valid=false;
     FMMRemoteM2LList far_view() const {
         FMMRemoteM2LList result{far_targets.data,far_sources.data,views.data,far_count,{}};
         std::copy(class_offsets,class_offsets+9,result.class_offsets);return result;
@@ -254,13 +277,16 @@ template<int D> __global__ void fmm_owned_node_work_kernel(
     const PersistentTreeContext* ctx,int owned_nodes,uint64_t own_begin,uint64_t own_end,double4* output,
     ::cudadem::ShearSourceRouting routing,int gpu,
     const UnifiedNode* remote_nodes=nullptr,const int* remote_children=nullptr,
-    const GroupedTargetInteractions* remote_routes=nullptr,bool remote_wire=false) {
+    const GroupedTargetInteractions* remote_routes=nullptr,bool remote_wire=false,
+    const int* remote_route_index=nullptr) {
     const int target=blockIdx.x*blockDim.x+threadIdx.x;if(target>=owned_nodes)return;
     const auto& node=ctx->dd.unified_nodes[target];double far=0,near=0,communication=0;
     const auto* nodes=remote_nodes?remote_nodes:ctx->dd.unified_nodes;
     const auto* children=remote_children?remote_children:ctx->dd.children_compact;
-    if(node.level>=2 && node.target_count){
-        using T=GroupedStencilTraits<D>;const auto work=remote_routes?remote_routes[target]:ctx->arena.d_targets[target];
+    if(node.level>=2 && node.target_count &&
+        (!remote_nodes || !remote_route_index || remote_route_index[target]>=0)){
+        const int row=remote_route_index?remote_route_index[target]:target;
+        using T=GroupedStencilTraits<D>;const auto work=remote_routes?remote_routes[row]:ctx->arena.d_targets[target];
         const int q=grouped_target_child<D>(node.compact_morton);
         for(int i=0;i<T::CROSS_COUNT;++i){const auto route=grouped_cross_route(work,i);
             if(!grouped_route_valid(route))continue;

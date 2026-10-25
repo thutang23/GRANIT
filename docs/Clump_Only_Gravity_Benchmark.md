@@ -1,9 +1,11 @@
 # Clump-only gravity benchmarks and depth-12 diagnosis
 
-Follow-up to the 2026-10-25 staged implementation. Production code is unchanged
-from `b9179d28f88da79104cac93a6202b25392ff7073`; this follow-up adds test geometry,
+Follow-up to the 2026-10-25 staged implementation. In this campaign, production
+code was unchanged from `b9179d28f88da79104cac93a6202b25392ff7073`; the follow-up adds test geometry,
 force distributions, an independent analytic replay, and reporting corrections.
 Evidence is local under `runs/clump_gravity_campaign/followup-clump-only/`.
+Later checks after merging main are recorded in the
+[integration report](Clump_Gravity_Validation.md#integration-with-current-main).
 
 ## What the previous benchmark measured
 

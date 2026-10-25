@@ -16,6 +16,7 @@
 #include <thrust/execution_policy.h>
 #include <thrust/functional.h>
 #include <thrust/tuple.h>
+#include <thrust/iterator/zip_iterator.h>
 #include <iostream>
 #include <cmath>
 #include <cfloat>

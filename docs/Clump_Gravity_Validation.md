@@ -383,3 +383,45 @@ common-harness build and hashes of every frozen production object.
 the bounded-grid fixture correction. Earlier failures and build diagnostics remain
 preserved. `manifest.json` records final source/binary hashes and report status;
 `scripts/` contains campaign reproduction drivers.
+
+## Integration with current main
+
+The PR branch incorporates main at
+`8fb82530233f317c95ba724ffc66b8a32666fd0e`, including compact LET routes,
+far-row caching, and guarded leaf-only P2P. The shared P2P merge forwards clump
+IDs through both traversal modes and retains canonical target mapping for
+aligned cross-context work. Cross-context traversal uses the general path.
+The stage-2 and clump-only tables above remain pinned to their original campaign
+binaries; integration evidence is stored separately under `pr-integration/`.
+
+All four imported host checks pass. The leaf-only test preserves its frozen
+source-helper arithmetic/order hash after removing exactly the three intended
+clump-filter additions, then executes 48 scalar cases covering null/default IDs,
+same/different positive IDs, zero IDs, and self pairs in sparse/dense branches,
+float/double arithmetic, and force/acceleration modes.
+
+Both standard clump CTest contracts pass in each precision build. Unfiltered
+Compute Sanitizer overlap checks with 33 members per large clump report zero
+errors in both precisions. The 1024-member near-only FP64 case also passes.
+For the 512-clump raw fixture, every saved member force, body force, body torque,
+reference value, and force-distribution field is exactly equal to the pre-merge
+JSON in both DIRECT and FMM. The original maximum-accuracy failure remains
+recorded with exit code 1; numerical gates were not changed.
+The rebuilt DEM solver also passes all four large-clump uninterrupted/resumed
+comparisons: DIRECT and FMM, each at gravity update rates 1 and 2.
+
+The FP64 DEM/SPH targets and both precision harnesses build successfully.
+After compilation finished, the same GPU and benchmark settings gave:
+
+| Workload | Member DIRECT | Member FMM / aligned | Ratio | Reference coverage |
+|---|---:|---:|---:|---|
+| 2,048 small clumps / 8,192 spheres | 5.203 ms | 1.377 ms | 3.78× | Full direct oracle |
+| 32,768 small clumps / 131,072 spheres | 197.689 ms | 20.699 ms | 9.55× | Timing only |
+| 32,768 rows, one 1,024-member large clump | — | 12.824 ms | — | Timing only |
+
+The last row uses the earlier raw aligned benchmark settings; its pre-merge
+aligned median was 12.782 ms. These reruns retain populated FMM routes and the
+intended clump classifications. SPH was build-checked only.
+
+These integration checks exercise single-GPU clump gravity and host routing
+proofs. They do not constitute a fresh distributed-GPU performance campaign.

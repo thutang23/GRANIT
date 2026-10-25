@@ -187,24 +187,28 @@ template<int D> __global__ void fmm_halo_nodes_kernel(const FMMCellKey* keys,
     nodes[i]=node;
 }
 __global__ void fmm_halo_initialize_routes_kernel(const PersistentTreeContext* target,int n,
-    GroupedTargetInteractions* routes,int* flags,int sources) {
+    GroupedTargetInteractions* routes,int* flags,int sources,
+    const int* target_ids=nullptr,int* route_index=nullptr) {
     const int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i<sources)flags[i]=0;
     if(i>=n)return;
     GroupedTargetInteractions out{};
     for(int j=0;j<GROUPED_MAX_CROSS_COUNT;++j)out.cross_node[j]=GROUPED_ROUTE_INVALID_NODE;
     for(int j=0;j<GROUPED_MAX_BLOCK_COUNT;++j)out.block_parent[j]=GROUPED_ROUTE_INVALID_NODE;
-    const auto node=target->dd.unified_nodes[i];
-    out.target_parent=node.target_count && node.level>=2?target->arena.d_targets[i].target_parent:-1;
+    const int id=target_ids?target_ids[i]:i;
+    const auto node=target->dd.unified_nodes[id];
+    out.target_parent=node.target_count && node.level>=2?target->arena.d_targets[id].target_parent:-1;
     routes[i]=out;
+    if(route_index)route_index[id]=i;
 }
 
 template<int D> __global__ void fmm_halo_count_routes_kernel(const PersistentTreeContext* local,
     const UnifiedNode* sources,const int* children,const GroupedTargetInteractions* routes,
-    int targets,int* counts,bool local_sources) {
-    const int target=blockIdx.x*blockDim.x+threadIdx.x;if(target>=targets)return;
+    int targets,int* counts,bool local_sources,const int* target_ids=nullptr) {
+    const int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=targets)return;
+    const int target=target_ids?target_ids[row]:row;
     const auto node=local->dd.unified_nodes[target];if(!node.target_count || node.level<2)return;
-    using T=GroupedStencilTraits<D>;const auto work=routes[target];
+    using T=GroupedStencilTraits<D>;const auto work=routes[row];
     int result[4]{};const int q=grouped_target_child<D>(node.compact_morton);
     for(int b=0;b<T::CROSS_COUNT;++b) {const auto r=grouped_cross_route(work,b);
         if(grouped_route_valid(r))++result[(grouped_route_mask(r)&1u)?2:1];}
@@ -230,9 +234,9 @@ __global__ void fmm_halo_publish_counts_kernel(PersistentTreeContext* local,
 // One source parent owns each (target, stencil-slot) write. Different source
 // parents may touch one target record, hence only its packed CROSS bits need
 // atomic OR. Numerical output remains exclusively target-owned.
-template<int D> __global__ void fmm_halo_inverse_routes_kernel(
+template<int D,bool MarkOnly=false> __global__ void fmm_halo_inverse_routes_kernel(
     const PersistentTreeContext* local,const UnifiedNode* sources,const int* children,
-    const FMMCellKey* keys,int source_count,int depth,bool disable_fallback,GroupedTargetInteractions* routes,int* needed) {
+    const FMMCellKey* keys,int source_count,int depth,bool disable_fallback,GroupedTargetInteractions* routes,int* needed,int* route_index=nullptr) {
     using T=GroupedStencilTraits<D>;
     const int task=blockIdx.x*blockDim.x+threadIdx.x;
     const int source=task/T::CHILD_COUNT,q=task%T::CHILD_COUNT;
@@ -249,10 +253,14 @@ template<int D> __global__ void fmm_halo_inverse_routes_kernel(
         const int target=persistent_coordinate_lookup<D>(local,level,pos[0],pos[1],pos[2]);
         if(target<0)continue;
         const auto t=local->dd.unified_nodes[target];if(!t.target_count)continue;
+        // The mark pass deliberately includes cutoff-rejected/empty rows: it
+        // is a topology-only superset, so population masks can refresh safely.
+        if constexpr(MarkOnly) {atomicExch(route_index+target,1);continue;}
         uint32_t target_population=t.count;
         if(!disable_fallback) {const int at=fmm_halo_lookup<D>(keys,source_count,{t.compact_morton,t.level});
             if(at>=0)target_population=sources[at].global_count;}
-        auto& out=routes[target];const bool leaf=t.flags&UNIFIED_NODE_FLAG_IS_LEAF;
+        const int row=route_index?route_index[target]:target;
+        auto& out=routes[row];const bool leaf=t.flags&UNIFIED_NODE_FLAG_IS_LEAF;
         if(cross) {
             const auto relation=persistent_cutoff_relation(t,parent,local->command.cutoff_radius,local->metadata.root_cell_size);
             if(relation==CutoffRelation::Outside)continue;
@@ -342,10 +350,6 @@ __global__ void fmm_halo_identity_order_kernel(int* order,int count) {
     const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<count)order[i]=i;
 }
 
-inline GroupedInteractionArena fmm_halo_arena(FMMQueryPeer& q,int targets) {
-    GroupedInteractionArena arena{};arena.d_targets=q.halo_routes.data;arena.node_capacity=targets;return arena;
-}
-
 template<int D> inline void fmm_receive_halo(int gpu,int peer,DistributedFMMState& s,
     PersistentTreeRuntime* runtime,cudaStream_t stream,bool collective) {
     auto& producer=distributed_fmm_[peer];auto& h=producer.halo;auto& q=*s.peers[peer];
@@ -365,13 +369,13 @@ template<int D> inline void fmm_receive_halo(int gpu,int peer,DistributedFMMStat
         q.source_generation=h.generation;++s.let_schedule_lookups;
     } else ++s.let_schedule_reuses;
     const int n=q.request_count;
-    if(!n) {q.particle_count=0;CUDA_CHECK(cudaSetDevice(gpu));return;}
+    if(!n) {q.particle_count=0;q.route_target_count=0;CUDA_CHECK(cudaSetDevice(gpu));return;}
     q.keys.reserve(n);q.replies.reserve(n);
     fmm_halo_gather_kernel<<<(n+255)/256,256,0,q.stream>>>(q.selected.data,n,h.table.keys.data,values,q.keys.data,q.replies.data);
     CUDA_CHECK(cudaEventRecord(q.end,q.stream));
     CUDA_CHECK(cudaSetDevice(gpu));
     q.remote_keys.reserve(n);q.remote_values.reserve(n);q.halo_nodes.reserve(n);q.halo_children.reserve(size_t(n)*8);
-    q.halo_multipoles.reserve(n);q.direct_flags.reserve(n);q.halo_routes.reserve(s.gpu_plan.owned_nodes);q.route_counts.reserve(4);
+    q.halo_multipoles.reserve(n);q.direct_flags.reserve(n);q.route_counts.reserve(4);
     const bool population_dependent=!collective; // single-device thresholds use live full counts
     const bool rebuild=selection_changed || q.route_generation!=s.publication_generation || population_dependent;
     CUDA_CHECK(cudaStreamWaitEvent(stream,q.end,0));
@@ -390,13 +394,33 @@ template<int D> inline void fmm_receive_halo(int gpu,int peer,DistributedFMMStat
     if(rebuild) {
         fmm_halo_nodes_kernel<D><<<(n+255)/256,256,0,stream>>>(q.remote_keys.data,q.remote_values.data,n,s.gpu_plan.depth,
             s.grid,runtime->device_context,q.halo_nodes.data,q.halo_children.data);
-        fmm_halo_initialize_routes_kernel<<<(std::max(n,s.gpu_plan.owned_nodes)+255)/256,256,0,stream>>>(runtime->device_context,
-            s.gpu_plan.owned_nodes,q.halo_routes.data,q.direct_flags.data,n);
+        const int owned=s.gpu_plan.owned_nodes;
+        q.route_index.reserve(owned);q.route_targets.reserve(owned);
+        CUDA_CHECK(cudaMemsetAsync(q.route_index.data,0,owned*sizeof(int),stream));
+        fmm_halo_inverse_routes_kernel<D,true><<<(n*(1<<D)+255)/256,256,0,stream>>>(runtime->device_context,
+            q.halo_nodes.data,q.halo_children.data,q.remote_keys.data,n,s.gpu_plan.depth,collective,
+            nullptr,nullptr,q.route_index.data);
+        const thrust::counting_iterator<int> ids(0);
+        // q.scratch belongs to the producer device (source selection/packing).
+        // Compact-row selection uses this consumer's plan scratch instead.
+        fmm_cub(s.gpu_plan,[&](void* tmp,size_t& bytes){return cub::DeviceSelect::Flagged(tmp,bytes,
+            ids,q.route_index.data,q.route_targets.data,q.route_counts.data,owned,stream);});
+        q.route_target_count=fmm_read_scalar(q.route_counts.data,stream);
+        q.halo_routes.reserve(q.route_target_count);
+        if(std::getenv("GRANIT_DISTRIBUTED_FMM_DIAGNOSTICS"))
+            std::printf("[FMM compact routes] rank=%d epoch=%llu peer=%d targets=%d owned=%d route_bytes=%zu dense_route_bytes=%zu index_bytes=%zu\n",
+                gpu,(unsigned long long)s.epoch,peer,q.route_target_count,owned,
+                size_t(q.route_target_count)*2*sizeof(GroupedTargetInteractions),
+                size_t(owned)*2*sizeof(GroupedTargetInteractions),
+                size_t(owned)*sizeof(int)+size_t(q.route_target_count)*sizeof(int));
+        CUDA_CHECK(cudaMemsetAsync(q.route_index.data,0xff,owned*sizeof(int),stream));
+        fmm_halo_initialize_routes_kernel<<<(std::max(n,q.route_target_count)+255)/256,256,0,stream>>>(runtime->device_context,
+            q.route_target_count,q.halo_routes.data,q.direct_flags.data,n,q.route_targets.data,q.route_index.data);
         fmm_halo_inverse_routes_kernel<D><<<(n*(1<<D)+255)/256,256,0,stream>>>(runtime->device_context,q.halo_nodes.data,
-            q.halo_children.data,q.remote_keys.data,n,s.gpu_plan.depth,collective,q.halo_routes.data,q.direct_flags.data);
+            q.halo_children.data,q.remote_keys.data,n,s.gpu_plan.depth,collective,q.halo_routes.data,q.direct_flags.data,q.route_index.data);
         CUDA_CHECK(cudaMemsetAsync(q.route_counts.data,0,4*sizeof(int),stream));
-        fmm_halo_count_routes_kernel<D><<<(s.gpu_plan.owned_nodes+255)/256,256,0,stream>>>(runtime->device_context,
-            q.halo_nodes.data,q.halo_children.data,q.halo_routes.data,s.gpu_plan.owned_nodes,q.route_counts.data,false);
+        if(q.route_target_count)fmm_halo_count_routes_kernel<D><<<(q.route_target_count+255)/256,256,0,stream>>>(runtime->device_context,
+            q.halo_nodes.data,q.halo_children.data,q.halo_routes.data,q.route_target_count,q.route_counts.data,false,q.route_targets.data);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaSetDevice(peer));q.direct_on_producer.reserve(n);
         ::cudadem::copy_peer_payload(q.direct_on_producer.data,peer,q.direct_flags.data,gpu,n*sizeof(int),q.stream);
@@ -478,9 +502,10 @@ __global__ void fmm_halo_moment_reduce_kernel(const FMMHaloMomentView* views,int
 template<int D> __global__ void fmm_halo_moment_routes_kernel(
     const PersistentTreeContext* local,const UnifiedNode* sources,const int* children,
     const GroupedTargetInteractions* routes,GroupedTargetInteractions* output,
-    int targets,int peer,int peers,const int* slots,const int* owners) {
-    const int target=blockIdx.x*blockDim.x+threadIdx.x;if(target>=targets)return;
-    auto route=routes[target];const auto node=local->dd.unified_nodes[target];
+    int targets,int peer,int peers,const int* slots,const int* owners,const int* target_ids=nullptr) {
+    const int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=targets)return;
+    const int target=target_ids?target_ids[row]:row;
+    auto route=routes[row];const auto node=local->dd.unified_nodes[target];
     if(node.target_count && node.level>=2) {
         using T=GroupedStencilTraits<D>;const int q=grouped_target_child<D>(node.compact_morton);
         for(int b=0;b<T::CROSS_COUNT;++b) {
@@ -498,7 +523,7 @@ template<int D> __global__ void fmm_halo_moment_routes_kernel(
             }
         }
     }
-    output[target]=route;
+    output[row]=route;
 }
 
 template<int D> inline void fmm_prepare_halo_moments(int gpu,DistributedFMMState& s,
@@ -529,13 +554,13 @@ template<int D> inline void fmm_prepare_halo_moments(int gpu,DistributedFMMState
                 s.moment_views.data,s.ranks,peer,q.moment_slots.data,q.moment_owner.data);
         }
         if(route_rebuild) {
-            q.moment_routes.reserve(targets);
-            fmm_halo_moment_routes_kernel<D><<<(targets+255)/256,256,0,stream>>>(runtime->device_context,
+            q.moment_routes.reserve(q.route_target_count);
+            if(q.route_target_count)fmm_halo_moment_routes_kernel<D><<<(q.route_target_count+255)/256,256,0,stream>>>(runtime->device_context,
                 q.halo_nodes.data,q.halo_children.data,q.halo_routes.data,q.moment_routes.data,
-                targets,peer,s.ranks,q.moment_slots.data,q.moment_owner.data);
+                q.route_target_count,peer,s.ranks,q.moment_slots.data,q.moment_owner.data,q.route_targets.data);
             CUDA_CHECK(cudaMemsetAsync(q.route_counts.data,0,4*sizeof(int),stream));
-            fmm_halo_count_routes_kernel<D><<<(targets+255)/256,256,0,stream>>>(runtime->device_context,
-                q.halo_nodes.data,q.halo_children.data,q.moment_routes.data,targets,q.route_counts.data,false);
+            if(q.route_target_count)fmm_halo_count_routes_kernel<D><<<(q.route_target_count+255)/256,256,0,stream>>>(runtime->device_context,
+                q.halo_nodes.data,q.halo_children.data,q.moment_routes.data,q.route_target_count,q.route_counts.data,false,q.route_targets.data);
         }
         fmm_halo_moment_reduce_kernel<<<(n+7)/8,256,0,stream>>>(s.moment_views.data,s.ranks,peer,
             q.moment_slots.data,q.moment_owner.data,dd->multipoles,s.moment_overlay.data,q.halo_multipoles.data);
