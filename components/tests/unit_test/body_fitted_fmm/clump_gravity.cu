@@ -45,8 +45,17 @@ void ck(cudaError_t e){if(e!=cudaSuccess)throw std::runtime_error(cudaGetErrorSt
 template<class T> void upload(T* p,const std::vector<T>& v){if(!v.empty())ck(cudaMemcpy(p,v.data(),v.size()*sizeof(T),cudaMemcpyHostToDevice));}
 template<class T> std::vector<T> download(const T* p,int n){std::vector<T> v(n);if(n)ck(cudaMemcpy(v.data(),p,n*sizeof(T),cudaMemcpyDeviceToHost));return v;}
 struct Row {V p; float mass=1;int id=0;bool dead=false;};
-struct Geometry {std::string name;std::vector<Row> rows;int normals=0,clumps=0,live=0;bool near=false;bool aligned_fixture=false,require_far=false,isolated=false;int expected_large_count=-1;};
-struct Options {std::string name="all",method="both",json;int size=128,clumps=2,depth=5,warmup=3,repeats=10,threshold_leaf=-1,threshold_internal=-1,large_clumps=1,members_per_large=64,small_clumps=1;bool benchmark=false,verify=true,baseline=false,project=false,plain_control=false,worst_body=false,implementation_check=false,clump_diagnostics=false,near_primitive_control=false;};
+struct Geometry {std::string name;std::vector<Row> rows;int normals=0,clumps=0,live=0;bool near=false;bool aligned_fixture=false,require_far=false,isolated=false;int expected_large_count=-1;float member_radius=.001f;};
+struct Options {std::string name="all",method="both",json;int size=128,clumps=2,depth=5,warmup=3,repeats=10,threshold_leaf=-1,threshold_internal=-1,large_clumps=1,members_per_large=64,small_clumps=1,geometry_depth=-1;double softening_factor=-1;bool benchmark=false,verify=true,baseline=false,project=false,plain_control=false,worst_body=false,implementation_check=false,clump_diagnostics=false,near_primitive_control=false,force_diagnostics=false;};
+// FNV-1a over canonical uploaded row tuples (native host bytes):
+// float64 x/y/z, float32 mass, int32 clump ID, float32 radius, uint8 dead.
+// Baseline/current campaign comparisons run on the same little-endian host.
+std::string geometry_fingerprint(const Geometry& g){
+    uint64_t hash=14695981039346656037ull;
+    auto append=[&](const auto& value){const auto* bytes=reinterpret_cast<const unsigned char*>(&value);for(size_t i=0;i<sizeof(value);++i){hash^=bytes[i];hash*=1099511628211ull;}};
+    for(const auto& row:g.rows){const double x=row.p.x,y=row.p.y,z=row.p.z;const int32_t id=row.id;const uint8_t life=row.dead?1:0;append(x);append(y);append(z);append(row.mass);append(id);append(g.member_radius);append(life);}
+    std::ostringstream text;text<<std::hex<<std::setfill('0')<<std::setw(16)<<hash;return text.str();
+}
 bool periodic_case(const std::string& name){return name=="periodic"||name=="differing_g_periodic";}
 bool direct_fallback_case(const std::string& name){return name=="threshold_above"||name=="differing_g_fallback";}
 bool differing_g_case(const std::string& name){return name=="differing_g"||name=="differing_g_fallback"||name=="differing_g_periodic";}
@@ -63,6 +72,22 @@ Geometry make_geometry(const std::string& name,int size,int clumps,int depth){
         auto g=make_geometry(geometry_name,size,clumps,depth);g.name=name;return g;
     }
     Geometry g;g.name=name;
+    if(name=="clump_only"){
+        if(int64_t(clumps)*4!=size)throw std::runtime_error("clump_only requires --size == 4*--clumps");
+        g.member_radius=.06f;g.normals=0;g.clumps=clumps;g.live=size;g.near=false;
+        std::vector<std::array<int,4>> sites;
+        for(int bound=1;;bound*=2){if(bound>128)throw std::runtime_error("clump_only lattice exceeds bounded test generator");sites.clear();for(int x=-bound;x<=bound;++x)for(int y=-bound;y<=bound;++y)for(int z=-bound;z<=bound;++z)sites.push_back({x*x+y*y+z*z,x,y,z});std::sort(sites.begin(),sites.end());if(sites.size()>=(size_t)clumps&&sites[clumps-1][0]<(bound+1)*(bound+1))break;}
+        const long double pi=std::acos(-1.L);const std::array<V,4> tetra={V{.04L,.04L,.04L},V{.04L,-.04L,-.04L},V{-.04L,.04L,-.04L},V{-.04L,-.04L,.04L}};
+        g.rows.reserve(size);
+        for(int c=0;c<clumps;++c){
+            const auto site=sites[c];const V center={site[1]*.30L,site[2]*.30L,site[3]*.30L};
+            const long double yaw=2*pi*std::fmod((c+1)*.618033988749894848L,1.L),pitch=2*pi*std::fmod((c+1)*.414213562373095049L,1.L),roll=2*pi*std::fmod((c+1)*.732050807568877294L,1.L);
+            const long double cy=std::cos(yaw),sy=std::sin(yaw),cp=std::cos(pitch),sp=std::sin(pitch),cr=std::cos(roll),sr=std::sin(roll);
+            const float mass=.75f+float((c*7)%17)*.03125f;
+            for(V r:tetra){const V z={cy*r.x-sy*r.y,sy*r.x+cy*r.y,r.z};const V y={cp*z.x+sp*z.z,z.y,-sp*z.x+cp*z.z};r={y.x,cr*y.y-sr*y.z,sr*y.y+cr*y.z};const V p=center+r;g.rows.push_back({{(double)p.x,(double)p.y,(double)p.z},mass,c+1,false});}
+        }
+        return g;
+    }
     if(name=="tidal"){
         const double h=(32.+2.*(32.*.01))/4.;const V target={-16.-32.*.01+h*.5,-16.-32.*.01+h*.5,-16.-32.*.01+h*.5};
         g.rows.push_back({{-16,-16,-16},0.f,0});g.rows.push_back({{16,16,16},0.f,0});
@@ -204,7 +229,7 @@ struct DeviceCase {
         const int n=g.rows.size(),k=g.clumps;
         allocate_particle_soa(state.particles,n);state.particles.num_local=n;state.particles.num_ghost=0;
         auto& p=state.particles;
-        std::vector<double>x(n),y(n),z(n);std::vector<float>m(n),r(n,.001f),ox(n),oy(n),oz(n),h(n,0.f);std::vector<int32_t>id(n);std::vector<uint8_t>dead(n);
+        std::vector<double>x(n),y(n),z(n);std::vector<float>m(n),r(n,g.member_radius),ox(n),oy(n),oz(n),h(n,0.f);std::vector<int32_t>id(n);std::vector<uint8_t>dead(n);
         com.assign(k,{});masses.assign(k,0);
         for(const auto& row:g.rows)if(row.id>0&&!row.dead){com[row.id-1]=com[row.id-1]+row.p*row.mass;masses[row.id-1]+=row.mass;}
         for(int c=0;c<k;++c){com[c]=com[c]*(1/masses[c]);com[c]={(double)com[c].x,(double)com[c].y,(double)com[c].z};}
@@ -289,14 +314,14 @@ WorstBody worst_force(const Result& value,const Result& reference,const Geometry
         if(worst.index<0||relative>worst.normalized){worst.index=i;worst.reference=reference.f[i];worst.actual=value.f[i];worst.position=i<(size_t)g.normals?g.rows[i].p:d.com[i-g.normals];worst.normalized=relative;worst.absolute=absolute;}}
     return worst;
 }
-struct Metrics {long double force_p50=0,force_p90=0,force_p99=0,force_rms=0,force_max_body=0,force_max_clump=0,torque_max_clump=0,force=0,torque=0,resultant_torque=0,force_abs=0,torque_abs=0,balance=0,angular_balance=0;bool finite=true;};
+struct Metrics {long double force_mean=0,force_p50=0,force_p90=0,force_p99=0,force_rms=0,force_max_body=0,force_max_clump=0,torque_max_clump=0,force=0,torque=0,resultant_torque=0,force_abs=0,torque_abs=0,balance=0,angular_balance=0;bool finite=true;};
 Metrics compare(const Result& value,const Result& ref,const Geometry& g,const DeviceCase& d){
     Metrics m;std::vector<long double> normalized_force_errors;normalized_force_errors.reserve(value.f.size());long double force_scale=0,moment_scale=0,total_force_error=0,total_torque_error=0,torque_resultant=0,angular_scale=0;V force,angular;
     for(size_t i=0;i<value.f.size();++i){const long double fe=norm(value.f[i]-ref.f[i]),te=norm(value.t[i]-ref.t[i]);
         m.finite=m.finite&&std::isfinite(fe)&&std::isfinite(te);m.force_abs=std::max(m.force_abs,fe);m.torque_abs=std::max(m.torque_abs,te);
         const long double fs=ref.fs.empty()?norm(ref.f[i]):ref.fs[i],ts=ref.ts.empty()?norm(ref.t[i]):ref.ts[i];
         const long double fn=fe/std::max(fs,1.e-28L),tn=te/std::max(ts,1.e-28L);
-        normalized_force_errors.push_back(fn);m.force_rms+=fn*fn;m.force_max_body=std::max(m.force_max_body,fn);
+        normalized_force_errors.push_back(fn);m.force_mean+=fn;m.force_rms+=fn*fn;m.force_max_body=std::max(m.force_max_body,fn);
         if(i>=(size_t)g.normals){m.force_max_clump=std::max(m.force_max_clump,fn);m.torque_max_clump=std::max(m.torque_max_clump,tn);}
         force_scale+=fs;moment_scale+=ts;total_force_error+=fe;total_torque_error+=te;torque_resultant+=norm(ref.t[i]);
         force=force+value.f[i];const V pos=i<(size_t)g.normals?g.rows[i].p:d.com[i-g.normals];angular=angular+cross(pos,value.f[i])+value.t[i];angular_scale+=norm(pos)*norm(ref.f[i])+norm(ref.t[i]);}
@@ -305,7 +330,7 @@ Metrics compare(const Result& value,const Result& ref,const Geometry& g,const De
     // arithmetic avoids floating-point ambiguity at exact percentile ranks.
     std::sort(normalized_force_errors.begin(),normalized_force_errors.end());
     if(!normalized_force_errors.empty()){auto quantile=[&](size_t percent){const size_t rank=(percent*normalized_force_errors.size()+99)/100;return normalized_force_errors[rank-1];};m.force_p50=quantile(50);m.force_p90=quantile(90);m.force_p99=quantile(99);}
-    const long double floor=1.e-28L;m.force=total_force_error/std::max(force_scale,floor);m.torque=total_torque_error/std::max(moment_scale,floor);m.resultant_torque=total_torque_error/std::max(torque_resultant,floor);m.balance=norm(force)/std::max(force_scale,floor);m.angular_balance=norm(angular)/std::max(angular_scale,floor);m.force_rms=std::sqrt(m.force_rms/std::max((size_t)1,value.f.size()));return m;
+    const long double floor=1.e-28L;m.force=total_force_error/std::max(force_scale,floor);m.torque=total_torque_error/std::max(moment_scale,floor);m.resultant_torque=total_torque_error/std::max(torque_resultant,floor);m.balance=norm(force)/std::max(force_scale,floor);m.angular_balance=norm(angular)/std::max(angular_scale,floor);m.force_mean/=std::max((size_t)1,value.f.size());m.force_rms=std::sqrt(m.force_rms/std::max((size_t)1,value.f.size()));return m;
 }
 struct Workload {
     bool valid=false,metadata_read=false,all_clumps_small=true;
@@ -333,7 +358,7 @@ Workload workload(const Geometry& g,const DeviceCase& d,int requested_depth){
     out.green_members=g.normals;std::vector<int> member_counts(g.clumps,0);std::vector<bool> large(g.clumps,false);
     std::vector<double> radii(g.clumps,0.);
     for(int i=g.normals;i<g.live;++i){const auto& row=g.rows[i];const auto center=d.com[row.id-1];const double dx=(double)row.p.x-(double)center.x,dy=(double)row.p.y-(double)center.y,dz=(double)row.p.z-(double)center.z;
-        ++member_counts[row.id-1];radii[row.id-1]=std::max(radii[row.id-1],std::sqrt(dx*dx+dy*dy+dz*dz)+(double).001f);}
+        ++member_counts[row.id-1];radii[row.id-1]=std::max(radii[row.id-1],std::sqrt(dx*dx+dy*dy+dz*dz)+(double)g.member_radius);}
     for(int c=0;c<g.clumps;++c){const double radius=radii[c];out.max_diameter_to_leaf=std::max(out.max_diameter_to_leaf,2.*radius/out.independent_leaf_width);if(!(2.*radius<out.independent_leaf_width*(1.-64.*std::numeric_limits<double>::epsilon()))){out.all_clumps_small=false;++out.large_count;large[c]=true;}else{++out.small_count;out.green_members+=member_counts[c];}}
     if(g.aligned_fixture){std::map<std::array<int,3>,std::set<int>> cells;for(int i=g.normals;i<g.live;++i)if(large[g.rows[i].id-1]){const auto p=g.rows[i].p;const std::array<int,3> cell={(int)std::floor(((double)p.x-out.independent_domain_min[0])/out.independent_leaf_width),(int)std::floor(((double)p.y-out.independent_domain_min[1])/out.independent_leaf_width),(int)std::floor(((double)p.z-out.independent_domain_min[2])/out.independent_leaf_width)};cells[cell].insert(g.rows[i].id);}for(const auto& item:cells)if(item.second.size()>1)++out.shared_large_leaf_count;}
     return out;
@@ -494,7 +519,44 @@ void worst_json(std::ostream& s,const WorstBody& w,const Geometry& g){
     s<<",\"clump_id\":"<<(w.index<g.normals?0:w.index-g.normals+1)<<",\"position\":";vector_json(s,w.position);s<<",\"reference_force\":";vector_json(s,w.reference);s<<",\"actual_force\":";vector_json(s,w.actual);
     s<<",\"absolute_error\":";number(s,w.absolute);s<<",\"normalized_error\":";number(s,w.normalized);s<<'}';
 }
-void metric_json(std::ostream& s,const Metrics& m){s<<"{\"force_body_quantile_method\":\"nearest_rank\",\"force_body_p50_normalized\":";number(s,m.force_p50);s<<",\"force_body_p90_normalized\":";number(s,m.force_p90);s<<",\"force_body_p99_normalized\":";number(s,m.force_p99);s<<",\"force_body_rms_normalized\":";number(s,m.force_rms);s<<",\"force_body_max_normalized\":";number(s,m.force_max_body);s<<",\"force_clump_max_normalized\":";number(s,m.force_max_clump);s<<",\"torque_clump_max_moment_normalized\":";number(s,m.torque_max_clump);s<<",\"force_normalized\":";number(s,m.force);s<<",\"torque_moment_normalized\":";number(s,m.torque);s<<",\"torque_resultant_relative\":";number(s,m.resultant_torque);s<<",\"force_max_abs\":";number(s,m.force_abs);s<<",\"torque_max_abs\":";number(s,m.torque_abs);s<<",\"net_force_normalized\":";number(s,m.balance);s<<",\"net_angular_momentum_rate_normalized\":";number(s,m.angular_balance);s<<",\"finite\":"<<(m.finite?"true":"false")<<"}";}
+void metric_json(std::ostream& s,const Metrics& m){s<<"{\"force_body_normalization\":\"norm(error)/max(reference_force_scale,1e-28)\",\"force_body_mean_normalized\":";number(s,m.force_mean);s<<",\"force_body_quantile_method\":\"nearest_rank\",\"force_body_p50_normalized\":";number(s,m.force_p50);s<<",\"force_body_p90_normalized\":";number(s,m.force_p90);s<<",\"force_body_p99_normalized\":";number(s,m.force_p99);s<<",\"force_body_rms_normalized\":";number(s,m.force_rms);s<<",\"force_body_max_normalized\":";number(s,m.force_max_body);s<<",\"force_clump_max_normalized\":";number(s,m.force_max_clump);s<<",\"torque_clump_max_moment_normalized\":";number(s,m.torque_max_clump);s<<",\"force_normalized\":";number(s,m.force);s<<",\"torque_moment_normalized\":";number(s,m.torque);s<<",\"torque_resultant_relative\":";number(s,m.resultant_torque);s<<",\"force_max_abs\":";number(s,m.force_abs);s<<",\"torque_max_abs\":";number(s,m.torque_abs);s<<",\"net_force_normalized\":";number(s,m.balance);s<<",\"net_angular_momentum_rate_normalized\":";number(s,m.angular_balance);s<<",\"finite\":"<<(m.finite?"true":"false")<<"}";}
+// Force dumps retain the registered INNER snapshot before any diagnostic
+// dispatcher call. All-small canonical rows are a separately identified repeat
+// of the same filtered dispatcher, because that path exposes only body wrenches.
+struct ForceDiagnostics {
+    Result reference,actual;std::vector<V> member_reference,member_actual;
+    Workload root;std::string member_source="unavailable_public_api";
+    bool checked=false,member_workload_matches=false;
+};
+void distribution_json(std::ostream& s,std::vector<long double> values){
+    s<<"{\"count\":"<<values.size()<<",\"quantile_method\":\"nearest_rank\"";
+    if(values.empty()){s<<",\"finite\":true,\"mean\":null,\"rms\":null,\"max\":null,\"p50\":null,\"p90\":null,\"p99\":null}";return;}
+    bool finite=true;long double sum=0,squares=0;for(auto value:values){finite=finite&&std::isfinite(value);sum+=value;squares+=value*value;}
+    s<<",\"finite\":"<<(finite?"true":"false")<<",\"mean\":";number(s,sum/values.size());s<<",\"rms\":";number(s,std::sqrt(squares/values.size()));
+    if(!finite){s<<",\"max\":null,\"p50\":null,\"p90\":null,\"p99\":null}";return;}
+    std::sort(values.begin(),values.end());s<<",\"max\":";number(s,values.back());for(const int percentile:{50,90,99}){s<<",\"p"<<percentile<<"\":";number(s,values[(percentile*values.size()+99)/100-1]);}s<<'}';
+}
+void force_diagnostics_json(std::ostream& s,const ForceDiagnostics& f,const Geometry& g,const DeviceCase& d){
+    s<<"{\"checked\":"<<(f.checked?"true":"false");if(!f.checked){s<<'}';return;}
+    const bool member_available=f.member_actual.size()==(size_t)g.live;
+    s<<",\"body_force_source\":\"registered_inner_snapshot\",\"member_force_source\":\""<<f.member_source<<"\",\"member_actual_available\":"<<(member_available?"true":"false")<<",\"member_workload_matches_candidate\":"<<(f.member_workload_matches?"true":"false")<<",\"normalization_floor\":1e-28,\"root\":";
+    if(f.root.valid&&f.root.metadata_read){s<<"{\"root_min\":["<<f.root.domain_min[0]<<','<<f.root.domain_min[1]<<','<<f.root.domain_min[2]<<"],\"root_size\":"<<f.root.root_size<<",\"depth\":"<<f.root.depth<<'}';}else s<<"null";
+    std::vector<long double> body_relative,clump_relative;
+    s<<",\"bodies\":[";
+    for(size_t b=0;b<f.reference.f.size();++b){if(b)s<<',';const bool clump=b>=(size_t)g.normals;const int id=clump?b-g.normals+1:0;
+        const long double relative=norm(f.actual.f[b]-f.reference.f[b])/std::max(norm(f.reference.f[b]),1.e-28L);body_relative.push_back(relative);if(clump)clump_relative.push_back(relative);
+        s<<"{\"body_index\":"<<b<<",\"clump_id\":"<<id<<",\"position\":";vector_json(s,clump?d.com[id-1]:g.rows[b].p);
+        s<<",\"reference_force\":";vector_json(s,f.reference.f[b]);s<<",\"actual_force\":";vector_json(s,f.actual.f[b]);s<<",\"force_scale\":";number(s,f.reference.fs[b]);s<<",\"reference_torque\":";vector_json(s,f.reference.t[b]);s<<",\"actual_torque\":";vector_json(s,f.actual.t[b]);s<<",\"moment_scale\":";number(s,f.reference.ts[b]);s<<",\"force_resultant_relative_error\":";number(s,relative);s<<'}';
+    }
+    s<<"],\"body_resultant_relative_force_statistics\":";distribution_json(s,body_relative);s<<",\"clump_resultant_relative_force_statistics\":";distribution_json(s,clump_relative);
+    std::vector<long double> all_errors,normal_errors,clumped_errors;std::vector<std::vector<long double>> by_clump(g.clumps);
+    s<<",\"members\":[";
+    for(int i=0;i<g.live;++i){if(i)s<<',';const auto& row=g.rows[i];s<<"{\"particle_index\":"<<i<<",\"position\":";vector_json(s,row.p);s<<",\"mass\":"<<row.mass<<",\"clump_id\":"<<row.id<<",\"radius\":"<<g.member_radius<<",\"reference_force\":";vector_json(s,f.member_reference[i]);s<<",\"actual_force\":";
+        if(member_available){vector_json(s,f.member_actual[i]);const long double error=norm(f.member_actual[i]-f.member_reference[i])/std::max(norm(f.member_reference[i]),1.e-28L);all_errors.push_back(error);if(row.id>0){clumped_errors.push_back(error);by_clump[row.id-1].push_back(error);}else normal_errors.push_back(error);}else s<<"null";s<<'}';
+    }
+    s<<"],\"member_statistics\":{\"normalization\":\"norm(actual-reference)/max(norm(reference),1e-28)\",\"all\":";distribution_json(s,all_errors);s<<",\"normal\":";distribution_json(s,normal_errors);s<<",\"clumped\":";distribution_json(s,clumped_errors);s<<",\"per_clump\":[";
+    for(int c=0;c<g.clumps;++c){if(c)s<<',';s<<"{\"clump_id\":"<<c+1<<",\"statistics\":";distribution_json(s,by_clump[c]);s<<'}';}s<<"]}}";
+}
 void aligned_json(std::ostream& s,const AlignedSnapshot& a){
     s<<"{\"supported\":"<<(a.supported?"true":"false")<<",\"used\":"<<(a.used?"true":"false")<<",\"epoch\":"<<a.epoch<<",\"component_count\":"<<a.component_count<<",\"large_count\":"<<a.large_count<<",\"green_members\":"<<a.green_members<<",\"live_members\":"<<a.live_members<<",\"root_min\":["<<a.root_min_x<<','<<a.root_min_y<<','<<a.root_min_z<<"],\"root_size\":"<<a.root_size<<",\"depth\":"<<a.depth;
     s<<",\"target_node_count\":"<<a.target_node_count<<",\"source_node_count\":"<<a.source_node_count<<",\"m2l_route_count\":"<<a.m2l_route_count<<",\"p2p_route_count\":"<<a.p2p_route_count<<",\"alignment_checked_count\":"<<a.alignment_checked_count<<",\"alignment_violation_count\":"<<a.alignment_violation_count<<",\"self_exclusion_checked_count\":"<<a.self_exclusion_checked_count<<",\"self_source_route_count\":"<<a.self_source_route_count<<",\"context_remap_count\":"<<a.context_remap_count<<",\"index_remap_checked_count\":"<<a.index_remap_checked_count<<",\"self_source_coefficient_violations\":"<<a.self_source_coefficient_violations<<",\"member_force_count\":"<<a.member_force_count<<",\"reserved_bytes\":"<<a.reserved_bytes<<'}';
@@ -509,11 +571,11 @@ void clump_diagnostics_json(std::ostream& s,const ClumpDiagnostics& diagnostic,c
     s<<"{\"checked\":"<<(diagnostic.checked?"true":"false");if(!diagnostic.checked){s<<'}';return;}
     s<<",\"workload_matches_candidate\":"<<(diagnostic.workload_matches?"true":"false")<<",\"clumps\":[";
     for(int c=0;c<g.clumps;++c){if(c)s<<',';const int b=g.normals+c;std::set<Cell> cells;long double radius=0;
-        for(int i=g.normals;i<g.live;++i)if(g.rows[i].id==c+1){cells.insert(member_cell(g.rows[i].p,diagnostic.work));radius=std::max(radius,norm(g.rows[i].p-d.com[c])+(long double).001f);}
+        for(int i=g.normals;i<g.live;++i)if(g.rows[i].id==c+1){cells.insert(member_cell(g.rows[i].p,diagnostic.work));radius=std::max(radius,norm(g.rows[i].p-d.com[c])+(long double)g.member_radius);}
         s<<"{\"clump_id\":"<<c+1<<",\"com\":";vector_json(s,d.com[c]);s<<",\"bounding_radius\":";number(s,radius);s<<",\"distinct_leaf_count\":"<<cells.size()<<",\"force_normalization_scale\":";number(s,direct.fs[b]);s<<",\"moment_normalization_scale\":";number(s,direct.ts[b]);
         s<<",\"reference_force\":";vector_json(s,direct.f[b]);s<<",\"actual_force\":";vector_json(s,candidate.f[b]);s<<",\"reference_torque\":";vector_json(s,direct.t[b]);s<<",\"actual_torque\":";vector_json(s,candidate.t[b]);s<<",\"production_error\":";wrench_error_json(s,candidate.f[b],candidate.t[b],direct.f[b],direct.t[b],direct.fs[b],direct.ts[b]);
         s<<",\"force_from_filtered_members\":";vector_json(s,diagnostic.aggregate.f[b]);s<<",\"torque_from_filtered_members\":";vector_json(s,diagnostic.aggregate.t[b]);s<<",\"member_aggregation_minus_production\":";wrench_error_json(s,diagnostic.aggregate.f[b],diagnostic.aggregate.t[b],candidate.f[b],candidate.t[b],direct.fs[b],direct.ts[b]);
-        s<<",\"members\":[";bool first=true;for(int i=g.normals;i<g.live;++i)if(g.rows[i].id==c+1){if(!first)s<<',';first=false;s<<"{\"particle_index\":"<<i<<",\"mass\":"<<g.rows[i].mass<<",\"sphere_radius\":"<<(double).001f<<",\"position\":";vector_json(s,g.rows[i].p);s<<",\"cell\":";cell_json(s,member_cell(g.rows[i].p,diagnostic.work));s<<",\"reference_force\":";vector_json(s,diagnostic.reference[i]);s<<",\"actual_force\":";vector_json(s,diagnostic.actual[i]);s<<",\"force_error\":";vector_json(s,diagnostic.actual[i]-diagnostic.reference[i]);s<<",\"force_normalized_error\":";number(s,norm(diagnostic.actual[i]-diagnostic.reference[i])/std::max(norm(diagnostic.reference[i]),1.e-28L));if(tidal.checked){s<<",\"analytic_p4_force\":";vector_json(s,tidal.p4_member_force[i]);}s<<'}';}s<<"]}";
+        s<<",\"members\":[";bool first=true;for(int i=g.normals;i<g.live;++i)if(g.rows[i].id==c+1){if(!first)s<<',';first=false;s<<"{\"particle_index\":"<<i<<",\"mass\":"<<g.rows[i].mass<<",\"sphere_radius\":"<<(double)g.member_radius<<",\"position\":";vector_json(s,g.rows[i].p);s<<",\"cell\":";cell_json(s,member_cell(g.rows[i].p,diagnostic.work));s<<",\"reference_force\":";vector_json(s,diagnostic.reference[i]);s<<",\"actual_force\":";vector_json(s,diagnostic.actual[i]);s<<",\"force_error\":";vector_json(s,diagnostic.actual[i]-diagnostic.reference[i]);s<<",\"force_normalized_error\":";number(s,norm(diagnostic.actual[i]-diagnostic.reference[i])/std::max(norm(diagnostic.reference[i]),1.e-28L));if(tidal.checked){s<<",\"analytic_p4_force\":";vector_json(s,tidal.p4_member_force[i]);}s<<'}';}s<<"]}";
     }s<<"]}";
 }
 void tidal_json(std::ostream& s,const TidalDiagnostic& t){
@@ -618,7 +680,7 @@ bool run(const Geometry& g,const Options& o,SelfGravityMethod method,std::ostrea
     if(differing_g_case(g.name)){config.acceleration.direct_gravity.gravitational_constant=2.;f.gravitational_constant=3.;}
     const double oracle_G=fmm?f.gravitational_constant:config.acceleration.direct_gravity.gravitational_constant;
     // Reproduce the float configuration product before promoting epsilon.
-    config.particle.radius_min=.001f;f.softening_factor=.001f;f.direct_threshold_leaf=g.near?100000000:0;f.direct_threshold_internal=g.near?100000000:0;
+    config.particle.radius_min=g.member_radius;f.softening_factor=o.softening_factor>=0?static_cast<float>(o.softening_factor):.001f;f.direct_threshold_leaf=g.near?100000000:0;f.direct_threshold_internal=g.near?100000000:0;
     if(!g.near){if(o.threshold_leaf>=0)f.direct_threshold_leaf=o.threshold_leaf;if(o.threshold_internal>=0)f.direct_threshold_internal=o.threshold_internal;}
     if(g.name=="tidal"){f.softening_factor=0.f;f.direct_threshold_leaf=0;f.direct_threshold_internal=0;f.enable_global_projection=false;}
     // Force a finite far interaction population for the dedicated FMM cases.
@@ -630,7 +692,7 @@ bool run(const Geometry& g,const Options& o,SelfGravityMethod method,std::ostrea
     auto compute=[&](bool outer){if(outer)AccelerationManager::compute_outer_gravity(d.state,config,0);else AccelerationManager::compute_self_gravity(d.state,config,0);ck(cudaGetLastError());};
     const auto first=Clock::now();compute(false);ck(cudaDeviceSynchronize());const double first_ms=ms(first,Clock::now());
     const auto work=workload(g,d,o.depth);const auto aligned_inner=aligned_snapshot(o.verify&&g.live<=8192);AlignedSnapshot aligned_outer;Workload work_outer;ReclassificationReport reclassification;NearPrimitiveControl near_control;bool structure_pass=true,structure_checked=false;
-    ClumpDiagnostics clump_details;TidalDiagnostic tidal;Result diagnostic_candidate,diagnostic_reference;
+    ClumpDiagnostics clump_details;TidalDiagnostic tidal;Result diagnostic_candidate,diagnostic_reference;ForceDiagnostics force_details;
     CancellationFreeControl independent_control;MemberGate member_gate;bool implementation_pass=false,numeric_gate_pass=false,fallback_exact_pass=false;
     Metrics inner,outer,equivalence,control_accuracy,control_difference;Workload control_work;bool control_checked=false;long double max_normal_control_difference=0;WorstBody worst_inner,worst_outer,worst_control;bool pass=true;double dead_max_abs=0;
     bool helper_checked=false,normal_force_unchanged=true;long double helper_force_error=0,helper_torque_error=0;
@@ -641,6 +703,16 @@ bool run(const Geometry& g,const Options& o,SelfGravityMethod method,std::ostrea
     if(reference){const long double eps=!fmm&&!g.clumps?0.L:(double)(config.particle.radius_min*f.softening_factor);
         const auto expected=oracle(g,d,eps,oracle_G);const auto inside=snapshot(g,d,false);inner=compare(inside,expected,g,d);dead_max_abs=dead_residual(false);
         if(o.worst_body||o.plain_control)worst_inner=worst_force(inside,expected,g,d);
+        if(o.force_diagnostics){
+            force_details.checked=true;force_details.reference=expected;force_details.actual=inside;force_details.member_reference=member_oracle(g,eps,oracle_G);force_details.root=aligned_inner.used?aligned_root_workload(aligned_inner):work;
+            if(aligned_inner.used&&aligned_inner.member_forces.size()==(size_t)g.live){force_details.member_actual=aligned_inner.member_forces;force_details.member_source="registered_aligned_inner_preprojection_snapshot";force_details.member_workload_matches=true;}
+            else if(g.clumps==0){force_details.member_actual=particle_force_rows(g,d,false);force_details.member_source="registered_inner_particle_rows";force_details.member_workload_matches=true;}
+#ifdef GRANIT_CLUMP_MEMBER_TEST
+            else if(fmm&&work.all_clumps_small&&work.valid&&!periodic_case(g.name)){
+                clump_details=collect_clump_diagnostics(g,d,config,eps,o.depth);clump_details.workload_matches=same_workload(work,clump_details.work);force_details.member_actual=clump_details.actual;force_details.member_source="recomputed_same_filtered_inner_dispatcher";force_details.member_workload_matches=clump_details.workload_matches;
+            }
+#endif
+        }
 #ifdef GRANIT_CLUMP_ALIGNED_TEST
         if(o.near_primitive_control&&fmm&&g.near&&aligned_inner.used)near_control=near_primitive_control(g,d,config,aligned_inner,o.depth);
 #endif
@@ -668,7 +740,7 @@ bool run(const Geometry& g,const Options& o,SelfGravityMethod method,std::ostrea
         }
 #endif
 #ifdef GRANIT_CLUMP_MEMBER_TEST
-        if((o.clump_diagnostics||g.name=="tidal")&&fmm&&g.clumps>0&&work.all_clumps_small&&work.valid&&!periodic_case(g.name)&&!o.project){clump_details=collect_clump_diagnostics(g,d,config,eps,o.depth);clump_details.workload_matches=same_workload(work,clump_details.work);diagnostic_candidate=inside;diagnostic_reference=expected;}
+        if((o.clump_diagnostics||g.name=="tidal")&&fmm&&g.clumps>0&&work.all_clumps_small&&work.valid&&!periodic_case(g.name)&&!o.project){if(!clump_details.checked)clump_details=collect_clump_diagnostics(g,d,config,eps,o.depth);clump_details.workload_matches=same_workload(work,clump_details.work);diagnostic_candidate=inside;diagnostic_reference=expected;}
 #endif
         if(g.name=="tidal")tidal=tidal_diagnostic(g,d,work,inside,expected);
         d.clear();compute(true);ck(cudaDeviceSynchronize());aligned_outer=aligned_snapshot(o.verify&&g.live<=8192);work_outer=workload(g,d,o.depth);const auto outside=snapshot(g,d,true);outer=compare(outside,expected,g,d);if(o.worst_body||o.plain_control)worst_outer=worst_force(outside,expected,g,d);equivalence=compare(outside,inside,g,d);dead_max_abs=std::max(dead_max_abs,dead_residual(true));
@@ -712,7 +784,7 @@ bool run(const Geometry& g,const Options& o,SelfGravityMethod method,std::ostrea
 #endif
     }
     if(reference)numeric_gate_pass=pass;
-    if((reference||g.aligned_fixture)&&!o.baseline&&fmm){
+    if((reference||g.aligned_fixture||g.name=="clump_only")&&!o.baseline&&fmm){
         const bool unsupported_periodic=periodic_case(g.name);
         const bool expect_small_route=g.clumps>0&&work.all_clumps_small&&!unsupported_periodic;
         const bool expect_large_route=g.clumps>0&&!work.all_clumps_small&&!unsupported_periodic;
@@ -731,6 +803,12 @@ bool run(const Geometry& g,const Options& o,SelfGravityMethod method,std::ostrea
         if(g.aligned_fixture&&g.expected_large_count>=0)structure_pass=structure_pass&&work.large_count==g.expected_large_count;
         if(g.name=="aligned_benchmark")structure_pass=structure_pass&&g.live==o.size&&g.clumps==o.small_clumps+o.large_clumps;
         if(g.name=="tidal")structure_pass=structure_pass&&tidal.geometry_gate;
+        pass=pass&&structure_pass;
+    }
+    if(g.name=="clump_only"){
+        structure_checked=true;
+        structure_pass=structure_pass&&g.normals==0&&g.live==o.size&&g.rows.size()==(size_t)o.size&&g.clumps==o.clumps&&int64_t(g.clumps)*4==g.live&&work.all_clumps_small&&work.small_count==g.clumps;
+        if(fmm&&!o.baseline)structure_pass=structure_pass&&work.valid&&work.metadata_read&&work.view_particles==g.live&&work.num_nodes>0&&(work.tasks[0]>0||work.tasks[1]>0)&&!aligned_inner.used;
         pass=pass&&structure_pass;
     }
     if(o.implementation_check){
@@ -753,7 +831,7 @@ bool run(const Geometry& g,const Options& o,SelfGravityMethod method,std::ostrea
         for(int i=0;i<o.repeats;++i){d.clear();ck(cudaDeviceSynchronize());const auto before=Clock::now();ck(cudaEventRecord(begin));compute(false);ck(cudaEventRecord(end));ck(cudaEventSynchronize(end));float elapsed;ck(cudaEventElapsedTime(&elapsed,begin,end));event_samples.push_back(elapsed);wall_samples.push_back(ms(before,Clock::now()));}
         ck(cudaEventDestroy(begin));ck(cudaEventDestroy(end));
     }
-    json<<std::setprecision(17)<<"{\"case\":\""<<g.name<<"\",\"method\":\""<<(fmm?"bffmm":"direct")<<"\",\"live_rows\":"<<g.live<<",\"normal_rows\":"<<g.normals<<",\"clumps\":"<<g.clumps<<",\"dead_rows\":"<<g.rows.size()-g.live<<",\"direct_gravitational_constant\":"<<config.acceleration.direct_gravity.gravitational_constant<<",\"fmm_gravitational_constant\":"<<f.gravitational_constant<<",\"oracle_gravitational_constant\":"<<oracle_G<<",\"direct_threshold_leaf\":"<<f.direct_threshold_leaf<<",\"direct_threshold_internal\":"<<f.direct_threshold_internal<<",\"depth\":"<<o.depth<<",\"project_requested\":"<<(o.project?"true":"false")<<",\"baseline_observation\":"<<(o.baseline?"true":"false")<<",\"reference_verified\":"<<(reference?"true":"false")<<",\"gate_pass\":"<<(reference?(pass?"true":"false"):"null")<<",\"checkpoint_helper_checked\":"<<(helper_checked?"true":"false")<<",\"retained_normal_force_bytes_unchanged\":"<<(normal_force_unchanged?"true":"false")<<",\"checkpoint_helper_force_max_abs\":"<<(double)helper_force_error<<",\"checkpoint_helper_torque_max_abs\":"<<(double)helper_torque_error<<",\"dead_output_max_abs\":"<<dead_max_abs<<",\"initialize_host_ms\":"<<init_ms<<",\"first_public_api_host_ms\":"<<first_ms<<",\"inner_outer_force_tolerance\":"<<equivalence_force_tolerance<<",\"inner_outer_force_tolerance_reason\":\""<<equivalence_tolerance_reason<<"\"";
+    json<<std::setprecision(17)<<"{\"case\":\""<<g.name<<"\",\"method\":\""<<(fmm?"bffmm":"direct")<<"\",\"live_rows\":"<<g.live<<",\"normal_rows\":"<<g.normals<<",\"clumps\":"<<g.clumps<<",\"dead_rows\":"<<g.rows.size()-g.live<<",\"direct_gravitational_constant\":"<<config.acceleration.direct_gravity.gravitational_constant<<",\"fmm_gravitational_constant\":"<<f.gravitational_constant<<",\"oracle_gravitational_constant\":"<<oracle_G<<",\"direct_threshold_leaf\":"<<f.direct_threshold_leaf<<",\"direct_threshold_internal\":"<<f.direct_threshold_internal<<",\"member_radius\":"<<g.member_radius<<",\"softening_factor\":"<<f.softening_factor<<",\"geometry_depth\":"<<(o.geometry_depth>=0?o.geometry_depth:o.depth)<<",\"geometry_fingerprint_fnv1a64\":\""<<geometry_fingerprint(g)<<"\",\"depth\":"<<o.depth<<",\"project_requested\":"<<(o.project?"true":"false")<<",\"baseline_observation\":"<<(o.baseline?"true":"false")<<",\"reference_verified\":"<<(reference?"true":"false")<<",\"gate_pass\":"<<(reference?(pass?"true":"false"):"null")<<",\"checkpoint_helper_checked\":"<<(helper_checked?"true":"false")<<",\"retained_normal_force_bytes_unchanged\":"<<(normal_force_unchanged?"true":"false")<<",\"checkpoint_helper_force_max_abs\":"<<(double)helper_force_error<<",\"checkpoint_helper_torque_max_abs\":"<<(double)helper_torque_error<<",\"dead_output_max_abs\":"<<dead_max_abs<<",\"initialize_host_ms\":"<<init_ms<<",\"first_public_api_host_ms\":"<<first_ms<<",\"inner_outer_force_tolerance\":"<<equivalence_force_tolerance<<",\"inner_outer_force_tolerance_reason\":\""<<equivalence_tolerance_reason<<"\"";
     json<<",\"workload_structure_gate_applied\":"<<(structure_checked?"true":"false")<<",\"workload_structure_gate_pass\":"<<(structure_checked?(structure_pass?"true":"false"):"null")<<",\"workload\":";workload_json(json,work);
     json<<",\"aligned_inner\":";aligned_json(json,aligned_inner);json<<",\"aligned_outer\":";aligned_json(json,aligned_outer);
     if(g.aligned_fixture)json<<",\"requested_large_clumps\":"<<o.large_clumps<<",\"members_per_large\":"<<o.members_per_large<<",\"requested_small_clumps\":"<<o.small_clumps;
@@ -768,13 +846,14 @@ bool run(const Geometry& g,const Options& o,SelfGravityMethod method,std::ostrea
     if(o.implementation_check){json<<",\"implementation_comparison_tolerance\":"<<(double)implementation_tolerance()<<",\"cancellation_free_control\":{\"checked\":"<<(independent_control.checked?"true":"false");
         if(independent_control.checked){json<<",\"aligned_union_control\":"<<(independent_control.aligned_union_control?"true":"false")<<",\"normal_control_api\":\"inner\",\"clump_control_api\":\"outer_original_target_mass\",\"gate_pass\":"<<(independent_control.gate_pass?"true":"false")<<",\"canonical_member_comparison_checked\":"<<(independent_control.member_comparison_checked?"true":"false")<<",\"canonical_member_comparison_pass\":"<<(independent_control.member_comparison_pass?"true":"false")<<",\"canonical_member_max_normalized\":"<<(double)independent_control.member_max_normalized<<",\"canonical_member_max_abs\":"<<(double)independent_control.member_max_abs<<",\"workloads_match\":"<<(independent_control.workloads_match?"true":"false")<<",\"masses_restored\":"<<(independent_control.masses_restored?"true":"false")<<",\"accuracy\":";metric_json(json,independent_control.accuracy);json<<",\"minus_candidate\":";metric_json(json,independent_control.difference);json<<",\"workloads\":[";for(size_t i=0;i<independent_control.runs.size();++i){if(i)json<<',';workload_json(json,independent_control.runs[i]);}json<<']';}json<<'}';
         json<<",\"filtered_member_gate\":{\"checked\":"<<(member_gate.checked?"true":"false");if(member_gate.checked){json<<",\"gate_applied\":"<<(member_gate.enforced?"true":"false")<<",\"gate_pass\":"<<(member_gate.gate_pass?"true":"false")<<",\"finite\":"<<(member_gate.finite?"true":"false")<<",\"inner_max_normalized\":";number(json,member_gate.inner_max);json<<",\"outer_max_normalized\":";number(json,member_gate.outer_max);json<<",\"inner_outer_max_normalized\":";number(json,member_gate.equivalence_max);json<<",\"inner_max_abs\":";number(json,member_gate.inner_abs);json<<",\"outer_max_abs\":";number(json,member_gate.outer_abs);json<<",\"worst_inner_particle\":"<<member_gate.worst_inner<<",\"worst_outer_particle\":"<<member_gate.worst_outer;}json<<'}';}
+    if(o.force_diagnostics){json<<",\"force_diagnostics\":";force_diagnostics_json(json,force_details,g,d);}
     if(o.near_primitive_control){json<<",\"near_same_primitive_control\":";near_primitive_json(json,near_control);}
     if(g.name=="aligned_reclassify"){json<<",\"reclassification\":";reclassification_json(json,reclassification);}
     if(o.benchmark){json<<",\"warmup\":"<<o.warmup<<",\"repeats\":"<<o.repeats<<",\"host_median_ms\":"<<median(wall_samples)<<",\"cuda_event_median_ms\":"<<median(event_samples)<<",\"host_samples_ms\":[";for(size_t i=0;i<wall_samples.size();++i){if(i)json<<',';json<<wall_samples[i];}json<<"],\"cuda_event_samples_ms\":[";for(size_t i=0;i<event_samples.size();++i){if(i)json<<',';json<<event_samples[i];}json<<']';}
-    json<<"}\n";json.flush();if(g.aligned_fixture&&structure_checked&&!structure_pass)return false;return o.implementation_check?implementation_pass:(pass||o.baseline||!reference);
+    json<<"}\n";json.flush();if((g.aligned_fixture||g.name=="clump_only")&&structure_checked&&!structure_pass)return false;return o.implementation_check?implementation_pass:(pass||o.baseline||!reference);
 }
 Options parse(int argc,char** argv){Options o;for(int i=1;i<argc;++i){const std::string a=argv[i];auto value=[&](){if(++i>=argc)throw std::runtime_error("missing value for "+a);return std::string(argv[i]);};
-    if(a=="--case")o.name=value();else if(a=="--method")o.method=value();else if(a=="--size")o.size=std::stoi(value());else if(a=="--clumps")o.clumps=std::stoi(value());else if(a=="--large-clumps")o.large_clumps=std::stoi(value());else if(a=="--members-per-large")o.members_per_large=std::stoi(value());else if(a=="--small-clumps")o.small_clumps=std::stoi(value());else if(a=="--depth")o.depth=std::stoi(value());else if(a=="--direct-threshold-leaf")o.threshold_leaf=std::stoi(value());else if(a=="--direct-threshold-internal")o.threshold_internal=std::stoi(value());else if(a=="--warmup")o.warmup=std::stoi(value());else if(a=="--repeats")o.repeats=std::stoi(value());else if(a=="--json")o.json=value();else if(a=="--benchmark")o.benchmark=true;else if(a=="--baseline")o.baseline=true;else if(a=="--no-verify")o.verify=false;else if(a=="--project")o.project=true;else if(a=="--plain-fmm-control")o.plain_control=true;else if(a=="--worst-body")o.worst_body=true;else if(a=="--implementation-check")o.implementation_check=true;else if(a=="--clump-diagnostics")o.clump_diagnostics=true;else if(a=="--near-primitive-control")o.near_primitive_control=true;else if(a=="--help"){std::cout<<"--case all|small|internal|face|edge|corner|translated|rotated|normals|dead|periodic|fmm|large|benchmark|threshold_below|threshold_above|checkpoint|tidal|differing_g|differing_g_fallback|differing_g_periodic|aligned_isolated|aligned_mixed|aligned_overlap|aligned_shared_cells|aligned_near|aligned_many|aligned_dead|aligned_threshold|aligned_threshold_below|aligned_benchmark|aligned_reclassify --method direct|bffmm|both --depth 5 --benchmark --size 128 --clumps 2 --large-clumps 1 --members-per-large 64 --small-clumps 1 --warmup 3 --repeats 10 --json results.jsonl --baseline --project --no-verify --plain-fmm-control --worst-body --implementation-check --clump-diagnostics --near-primitive-control --direct-threshold-leaf 0 --direct-threshold-internal 0\n";std::exit(0);}else throw std::runtime_error("unknown option "+a);}
+    if(a=="--case")o.name=value();else if(a=="--method")o.method=value();else if(a=="--size")o.size=std::stoi(value());else if(a=="--clumps")o.clumps=std::stoi(value());else if(a=="--large-clumps")o.large_clumps=std::stoi(value());else if(a=="--members-per-large")o.members_per_large=std::stoi(value());else if(a=="--small-clumps")o.small_clumps=std::stoi(value());else if(a=="--depth")o.depth=std::stoi(value());else if(a=="--geometry-depth")o.geometry_depth=std::stoi(value());else if(a=="--softening-factor")o.softening_factor=std::stod(value());else if(a=="--direct-threshold-leaf")o.threshold_leaf=std::stoi(value());else if(a=="--direct-threshold-internal")o.threshold_internal=std::stoi(value());else if(a=="--warmup")o.warmup=std::stoi(value());else if(a=="--repeats")o.repeats=std::stoi(value());else if(a=="--json")o.json=value();else if(a=="--benchmark")o.benchmark=true;else if(a=="--baseline")o.baseline=true;else if(a=="--no-verify")o.verify=false;else if(a=="--project")o.project=true;else if(a=="--plain-fmm-control")o.plain_control=true;else if(a=="--worst-body")o.worst_body=true;else if(a=="--implementation-check")o.implementation_check=true;else if(a=="--clump-diagnostics")o.clump_diagnostics=true;else if(a=="--near-primitive-control")o.near_primitive_control=true;else if(a=="--force-diagnostics")o.force_diagnostics=true;else if(a=="--help"){std::cout<<"--case all|small|internal|face|edge|corner|translated|rotated|normals|dead|periodic|fmm|large|benchmark|clump_only|threshold_below|threshold_above|checkpoint|tidal|differing_g|differing_g_fallback|differing_g_periodic|aligned_isolated|aligned_mixed|aligned_overlap|aligned_shared_cells|aligned_near|aligned_many|aligned_dead|aligned_threshold|aligned_threshold_below|aligned_benchmark|aligned_reclassify --method direct|bffmm|both --depth 5 --benchmark --size 128 --clumps 2 --large-clumps 1 --members-per-large 64 --small-clumps 1 --warmup 3 --repeats 10 --json results.jsonl --baseline --project --no-verify --plain-fmm-control --worst-body --implementation-check --clump-diagnostics --force-diagnostics --near-primitive-control --geometry-depth 5 --softening-factor .001 --direct-threshold-leaf 0 --direct-threshold-internal 0\n";std::exit(0);}else throw std::runtime_error("unknown option "+a);}
     if(o.name=="aligned_reclassify")o.depth=5;
     if(o.name=="tidal"){if(o.project||!o.verify)throw std::runtime_error("tidal requires verified raw projectionfalse");o.depth=2;}
     if(o.clump_diagnostics&&(!o.verify||o.project||o.method=="direct"))throw std::runtime_error("--clump-diagnostics requires verified raw all-small FMM cases");
@@ -788,6 +867,8 @@ Options parse(int argc,char** argv){Options o;for(int i=1;i<argc;++i){const std:
     if(o.implementation_check&&(!o.verify||o.project))throw std::runtime_error("--implementation-check initially requires verified raw cases");
     if(o.plain_control&&(!o.verify||o.project||o.method=="direct"||(o.name!="all"&&o.name!="fmm"&&o.name!="benchmark")))throw std::runtime_error("--plain-fmm-control requires verified raw FMM all/fmm/benchmark case");
     if(o.threshold_leaf < -1 || o.threshold_internal < -1)throw std::runtime_error("direct thresholds must be nonnegative");
+    if(o.force_diagnostics&&(!o.verify||o.project))throw std::runtime_error("--force-diagnostics requires verified raw cases");
+    if(o.geometry_depth < -1 || o.geometry_depth>12 || (o.geometry_depth>=0&&o.geometry_depth<2) || !std::isfinite(o.softening_factor) || (o.softening_factor<0&&o.softening_factor!=-1)||o.softening_factor>std::numeric_limits<float>::max())throw std::runtime_error("invalid geometry depth or softening factor");
     if(o.large_clumps<1||o.members_per_large<4||o.small_clumps<0)throw std::runtime_error("large count/membership and small count are invalid");
     if(o.depth<2||o.depth>12||o.size<8||o.clumps<1||o.repeats<1||o.warmup<0)throw std::runtime_error("invalid depth, size, or timing count");if(o.method!="both"&&o.method!="direct"&&o.method!="bffmm")throw std::runtime_error("invalid method");return o;
 }
@@ -801,8 +882,8 @@ int main(int argc,char** argv){try{const auto o=parse(argc,argv);int count=0;con
 #else
     if(o.name=="checkpoint")throw std::runtime_error("checkpoint helper case requires GRANIT_CLUMP_MEMBER_TEST");
 #endif
-    const std::vector<std::string> known={"small","internal","face","edge","corner","translated","rotated","normals","dead","periodic","fmm","large","benchmark","threshold_below","threshold_above","checkpoint","tidal","differing_g","differing_g_fallback","differing_g_periodic","aligned_isolated","aligned_mixed","aligned_overlap","aligned_shared_cells","aligned_near","aligned_many","aligned_dead","aligned_threshold","aligned_threshold_below","aligned_reclassify","aligned_benchmark"};bool pass=true;
-    for(const auto& name:cases){if(std::find(known.begin(),known.end(),name)==known.end())throw std::runtime_error("unknown case "+name);Options current=o;if(name=="aligned_reclassify")current.depth=5;const auto geometry=is_aligned_fixture(name)?make_aligned_geometry(current,name):make_geometry(name,current.size,current.clumps,current.depth);
+    const std::vector<std::string> known={"small","internal","face","edge","corner","translated","rotated","normals","dead","periodic","fmm","large","benchmark","clump_only","threshold_below","threshold_above","checkpoint","tidal","differing_g","differing_g_fallback","differing_g_periodic","aligned_isolated","aligned_mixed","aligned_overlap","aligned_shared_cells","aligned_near","aligned_many","aligned_dead","aligned_threshold","aligned_threshold_below","aligned_reclassify","aligned_benchmark"};bool pass=true;
+    for(const auto& name:cases){if(std::find(known.begin(),known.end(),name)==known.end())throw std::runtime_error("unknown case "+name);Options current=o;if(name=="aligned_reclassify")current.depth=5;Options physical=current;if(current.geometry_depth>=0)physical.depth=current.geometry_depth;auto geometry=is_aligned_fixture(name)?make_aligned_geometry(physical,name):make_geometry(name,physical.size,physical.clumps,physical.depth);if(current.geometry_depth>=0&&is_aligned_fixture(name)&&name!="aligned_reclassify")geometry.expected_large_count=-1;
         // Zero smoothing length makes normals-only DIRECT exactly Newtonian;
         // registered clumps and BFFMM use the configured Plummer epsilon.
         if(current.method!="bffmm")pass=run(geometry,current,SelfGravityMethod::DIRECT,out)&&pass;

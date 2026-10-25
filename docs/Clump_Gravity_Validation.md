@@ -267,10 +267,14 @@ The expanded default-precision suite has **retained failures** at the original
 
 No threshold was relaxed and the production precision defaults were unchanged.
 Original CPU-reference FMM accuracy targets also remain failed where reported.
-The expanded depth-12 mixed fixture reaches **12.52% worst body/member force
-error** against direct gravity, while matching the ordinary FMM control within
-`1.96e-16`. The percent-level benchmark errors below are geometry-specific, not
-a uniform bound over the validation matrix.
+The expanded depth-12 mixed fixture reaches **12.52% worst individual member
+force error** inside the large clump, while matching the ordinary FMM control
+within `1.96e-16`. Its body-force maximum is **2.53%**, body-force RMS is
+**0.821%**, and worst clump resultant force error is **0.425%** under the
+normalization above. This fixture uses forced-M2L thresholds 0/0. The earlier
+report incorrectly labeled the member maximum as a body/member maximum. The
+percent-level benchmark errors below are geometry-specific, not a uniform bound
+over the validation matrix.
 
 Compute Sanitizer memcheck reports **zero errors** for 33-member, three-clump
 overlap tests in both precisions, and FP64 reclassification. Checks use padding
@@ -327,7 +331,11 @@ worst moment-normalized torque error. The stage-1 discussion of cancellation and
 resultant torque remains applicable; these fixtures do not guarantee accuracy
 for arbitrary clump geometry.
 
-All-small paired medians preserve the existing path:
+All-small paired medians preserve the existing path. Here every clump is small,
+but only 12.5% (2048/8192 rows) or 25% (32768 rows) of particles belong to clumps;
+the rest are ordinary particles. See the [clump-only follow-up](Clump_Only_Gravity_Benchmark.md)
+for a spherical aggregate containing only clump constituents, and for the
+corrected depth-12 error distributions.
 
 | Rows / small clumps | Frozen stage 1 | Stage 2 |
 |---:|---:|---:|
