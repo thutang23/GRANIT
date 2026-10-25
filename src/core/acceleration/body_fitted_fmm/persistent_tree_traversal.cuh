@@ -493,6 +493,10 @@ int fixed_depth_node_upper_bound(int particle_capacity, int tree_depth,
 void switch_persistent_tree_depth(PersistentTreeRuntime& runtime, int depth,
                                   int tree_dimension);
 
+void rebuild_cross_context_stencil(PersistentTreeRuntime& target,
+                                   const PersistentTreeRuntime& source,
+                                   cudaStream_t stream);
+
 void initialize_persistent_tree_runtime(
     PersistentTreeRuntime& runtime,
     fmm::FMMDeviceData& dd,

@@ -136,14 +136,75 @@ requires both inertia and multipole overrides. The multipole monopole must
 equal the derived member mass and its three dipole coefficients must be zero.
 The six inertia values and all multipole coefficients are body-frame values.
 
-For self-gravity, the compact body list contains ordinary live particles plus
-one CoM entry per clump; member and dead rows never enter Karras. DIRECT uses
-the conservative p0..p3 pair energy for every body pair. BFFMM retains its
-hierarchy for normal-normal interactions and evaluates every pair involving a
-clump with that same p3 conservative kernel, including body torque. Clump
-BFFMM runs therefore require `unified_fmm.enable_global_projection: true`
-(the default). A `gravity_update_rate` greater than one uses RESPA bracketing
-impulses and a separate cached clump gravity wrench.
+Self-gravity uses the actual member masses and positions. DIRECT sums normal
+and member point masses with DEM Plummer softening, excluding every same-clump
+pair. DIRECT uses `self_gravity.direct.gravitational_constant`; BFFMM and its
+direct fallbacks use `self_gravity.unified_fmm.gravitational_constant`.
+Registered clump gravity uses `eps = radius_min * unified_fmm.softening_factor`
+for both methods; `direct.sph_softening_mode` applies only to SPH. Member forces reduce to the rigid body's total force and torque about
+its CoM; they remain separate from contact-force rows. Self-gravitating inputs
+with a multipole override must match the member-derived p3 moments (a relative
+coefficient-scale tolerance of `1e-9`); inconsistent overrides are rejected.
+Checkpoint comparisons additionally allow the FP32 body-offset quantization
+bound `8*r*epsilon_float*M*R^r` for moment rank `r > 0`.
+
+The small-clump BFFMM path places all live members and normal particles in the
+ordinary global Karras tree when every clump satisfies `2R < h_leaf`, with a
+floating-point margin. Here `R` bounds member spheres about their clump CoM,
+and `h_leaf` uses the exact current dynamic root extent and configured depth.
+This condition allows a small clump to cross leaf boundaries; all same-clump
+pairs remain in near routes and are filtered there. Distant interactions still
+use M2L. Its far kernel remains the existing Newtonian FMM approximation;
+nonzero Plummer softening applies in P2P.
+
+If any clump fails the size condition, BFFMM builds independent globally
+aligned Karras contexts: one green population containing ordinary particles
+and certified small-clump members, and one blue population for each large
+clump. Each context has its own upward moments and target local expansions,
+using the same current padded root and configured depth. An additional union
+geometry provides the source-cell topology and canonical particle ordering.
+Component moments merge by `(level, Morton)` at every common cell, including
+coarse ancestors. There is no second M2M after this addition.
+
+Green targets use all components. Each blue target uses a freshly cleared
+source workspace summed from green and every other blue component; its entire
+own component is omitted before M2L. This constructs the external field without
+subtracting a large self-field. Cross-context P2P uses original canonical
+particle indices and excludes same-clump pairs. Near rows remain P2P even when
+green and blue occupy the same spatial cells. Large-body force and torque
+reduction runs cooperatively on the GPU.
+
+Tree contexts, maps, workspaces and operators are cached per GPU. A conservative
+memory preflight includes retained capacities and rejects oversized requests
+explicitly. Target populations are evaluated sequentially; the cost grows with
+the number of large clumps. This implementation targets the case where large
+clumps are uncommon. The read-only aligned diagnostics report actual context
+alignment, remaps, interaction counts and excluded-source coefficient audits.
+The reserve report includes generic workspace estimates and headroom, rather
+than measured VRAM. Admission is a heuristic memory screen; checked CUDA
+allocations remain authoritative. Cached aligned trees persist during subsequent
+all-small evaluations until shutdown.
+
+Periodic runs retain direct member gravity with minimum-image displacement
+and no global projection, because periodic pair forces need not have zero
+Euclidean-cell orbital torque. 2D trees also retain the direct fallback.
+Adaptive depth and shear boxes remain unsupported for clumps. Set
+`GRANIT_CLUMP_GRAVITY_DIAGNOSTICS=1` to print the selected evaluation path.
+
+Both BFFMM paths retain the existing p4 approximation and shipped theta=0.8
+operators. Member-force and torque reduction correctness does not establish a
+uniform force or resultant-torque accuracy target: force errors of order one
+percent and larger conditioned torque errors occur in the recorded validation
+cases. Inspect raw per-body errors and torque conditioning for the intended
+configuration.
+
+`unified_fmm.enable_global_projection` controls the final body-level force
+projection for nonperiodic BFFMM evaluations; its default remains true, and
+false exposes raw force and torque residuals. DIRECT remains unprojected. A `gravity_update_rate` greater than
+one uses RESPA bracketing impulses and a separate cached clump gravity wrench.
+On a checkpoint restart, fast member forces are reconstructed first; the same
+configured member-gravity pipeline restores the missing clump gravity wrench
+before the first kick, without adding normal gravity twice.
 
 For SPH, the same unified-v3 storage field has a different meaning: it is the
 exact SPHSOL Part ID. Active IDs are dense `0..K`; `-1` is inactive/dead. A

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Host replay of local P2P route order against a frozen general walker.
 
-Only the source-warp callback is replaced: it records source and particle visit
-order. This checks routing semantics and leaf selection, not GPU arithmetic.
+The route replay replaces the source-warp callback to record visitation order.
+A separate scalar replay checks the actual source helper's clump filters for
+one-source tiles. Neither replay checks GPU warp synchronization or arithmetic.
 """
 from pathlib import Path
 import argparse
@@ -189,13 +190,86 @@ if 'LeafOnly' not in current:
 helper_names = ('grouped_p2p_leaf_only_allowed', 'grouped_p2p_leaf_eligible', 'grouped_p2p_leaf_work_count',
                 'grouped_p2p_leaf_work_node', 'grouped_p2p_leaf_only_routes_valid', 'fmm_verify_leaf_only_kernel')
 helpers = '\n'.join(function(p2p, name) for name in helper_names)
-assert hashlib.sha256(function(p2p, 'grouped_p2p_source_warp').encode()).hexdigest() == \
+source_helper = function(p2p, 'grouped_p2p_source_warp')
+# Frozen main's arithmetic and visitation order remain byte-for-byte pinned.
+# Normalize ONLY the three explicit stage-1 clump-filter additions; requiring
+# each exact fragment once prevents this exception from hiding other changes.
+normalized_helper = source_helper
+clump_additions = (
+    ('Compute G, Compute softening_sq, double cutoff_sq,\n'
+     '    const int* gravity_clump_ids = nullptr)',
+     'Compute G, Compute softening_sq, double cutoff_sq)'),
+    ('contributes = target_orig != orig_j &&\n'
+     '                        !(gravity_clump_ids && gravity_clump_ids[target_orig] > 0 &&\n'
+     '                          gravity_clump_ids[target_orig] == gravity_clump_ids[orig_j]);',
+     'contributes = target_orig != orig_j;'),
+    ('if (orig_i == orig_j ||\n'
+     '                    (gravity_clump_ids && gravity_clump_ids[orig_i] > 0 &&\n'
+     '                     gravity_clump_ids[orig_i] == gravity_clump_ids[orig_j])) continue;',
+     'if (orig_i == orig_j) continue;'),
+)
+for addition, original in clump_additions:
+    assert normalized_helper.count(addition) == 1, 'Documented clump-filter addition changed'
+    normalized_helper = normalized_helper.replace(addition, original)
+assert hashlib.sha256(normalized_helper.encode()).hexdigest() == \
     '879bd6434401a6fd755c26bc180f6093a43b3c8b3cd93b26193abdc6701f4092', 'Particle arithmetic/source callback changed from frozen baseline'
 cpp = prelude + arena + types + traits + '\nnamespace body_fitted_fmm {\n' + callback + helpers + current + reference + '\n}\n' + cases
+
+# Execute the unchanged production filter expressions in both occupancy paths.
+# One source in lane zero makes scalar shuffle/ballot shims sufficient; the
+# force primitive is a marker, so this verifies filtering and mass placement,
+# while the frozen hash above still pins the real arithmetic callback/order.
+source_shims = r'''
+using namespace body_fitted_fmm;
+using std::min;
+inline int __popc(unsigned value){return __builtin_popcount(value);}
+inline void __syncwarp(){}
+template<class T> T __shfl_sync(unsigned,T value,int){return value;}
+inline unsigned __ballot_sync(unsigned,bool value){return value?1u:0u;}
+using p2p_compute_t=float;
+static int primitive_calls=0;
+template<class T> void compute_gravitational_acceleration_from_delta_unified(
+    T,T,T,T,T,T,T& x,T& y,T& z){++primitive_calls;x=T(2);y=T(3);z=T(5);}
+'''
+source_cases = r'''
+template<bool OUTER,class Compute> void check_source_filters(){
+    UnifiedNode node{};node.begin=0;node.count=1;
+    int order[1]={7},ids[8]{};double pos[8]{},sx[32]{},sy[32]{},sz[32]{};
+    float mass[8]{};mass[7]=1;Compute sm[32]{};
+    for(unsigned mask:{1u,31u})for(int scenario=0;scenario<6;++scenario){
+        // IDs are canonical (target 2, source 7), unrelated to tile lane 0.
+        std::fill(ids,ids+8,0);ids[2]=ids[7]=11;order[0]=7;
+        const int* filter=ids;bool included=true;
+        if(scenario==0)filter=nullptr;                 // explicit null API
+        if(scenario==1)included=false;                // same positive clump
+        if(scenario==2)ids[7]=12;                     // different clumps
+        if(scenario==3)ids[2]=ids[7]=0;               // ordinary zero IDs
+        if(scenario==4){order[0]=2;filter=nullptr;included=false;}    // exact self, no filter
+        if(scenario==5)filter=nullptr;                // omitted default API
+        Compute x=0,y=0,z=0;primitive_calls=0;
+        if(scenario==5)grouped_p2p_source_warp<OUTER,Compute>(0,true,mask,2,
+            0.,0.,0.,Compute(2),x,y,z,&node,pos,pos,pos,mass,order,0,
+            sx,sy,sz,sm,Compute(1),Compute(0),0.);
+        else grouped_p2p_source_warp<OUTER,Compute>(0,true,mask,2,
+            0.,0.,0.,Compute(2),x,y,z,&node,pos,pos,pos,mass,order,0,
+            sx,sy,sz,sm,Compute(1),Compute(0),0.,filter);
+        const Compute multiplier=included?Compute(OUTER?1:2):Compute(0);
+        if(primitive_calls!=int(included)||x!=2*multiplier||y!=3*multiplier||z!=5*multiplier)
+            throw std::runtime_error("production source helper clump/null/self filter regression");
+    }
+}
+int main(){check_source_filters<false,float>();check_source_filters<true,float>();
+    check_source_filters<false,double>();check_source_filters<true,double>();
+    std::puts("Production P2P source filters PASS cases=48 (sparse/dense, force/acceleration, float/double)");}
+'''
+source_cpp = prelude + arena + types + source_shims + source_helper + source_cases
 if args.emit:
     args.emit.write_text(cpp)
 with tempfile.TemporaryDirectory(prefix='granit-leaf-only-') as tmp:
     source, binary = Path(tmp) / 'replay.cpp', Path(tmp) / 'replay'
     source.write_text(cpp)
+    subprocess.run(['g++', '-std=c++17', '-O2', '-I', str(SRC), str(source), '-o', str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
+    source.write_text(source_cpp)
     subprocess.run(['g++', '-std=c++17', '-O2', '-I', str(SRC), str(source), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

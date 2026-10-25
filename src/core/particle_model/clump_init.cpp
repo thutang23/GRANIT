@@ -4,7 +4,6 @@
 
 #include "clump.h"
 #include "cuda_utils.h"
-#include "../acceleration/body_fitted_fmm/clump_p3_gravity.cuh"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -162,30 +161,47 @@ void initialize_clumps(const SimConfig& config,
         else omega_world=minimum_norm_solve(A,rhs);
         Vec3 omega_body=inverse_rotate(q,omega_world);owx[c]=omega_body[0];owy[c]=omega_body[1];owz[c]=omega_body[2];
         if(tmpl&&tmpl->has_inertia){ixx[c]=tmpl->inertia[0];iyy[c]=tmpl->inertia[1];izz[c]=tmpl->inertia[2];ixy[c]=tmpl->inertia[3];ixz[c]=tmpl->inertia[4];iyz[c]=tmpl->inertia[5];}
-        if(tmpl&&tmpl->has_multipole){const double mtol=1e-10*std::max(M[c],1.0),dtol=1e-10*std::max(M[c]*std::max(extent,1.0),1.0);if(std::fabs(tmpl->multipole_p3[0]-M[c])>mtol)throw std::runtime_error("clump multipole monopole must equal derived mass");for(int k=1;k<=3;++k)if(std::fabs(tmpl->multipole_p3[k])>dtol)throw std::runtime_error("clump multipole dipole must vanish about its CoM");for(int k=0;k<19;++k)p3[k][c]=tmpl->multipole_p3[k];}else for(int k=0;k<19;++k)p3[k][c]=local_p3[k];
-    }
-
-    // A velocity-Verlet restart must retain the force used by the next first
-    // half-kick. Member checkpoint forces reconstruct contact/wall/external
-    // wrench above; clump self-gravity is body-level and therefore has to be
-    // re-evaluated from the same conservative p3 energy here.
-    if(checkpoint && config.acceleration.enable_self_gravity &&
-       config.acceleration.gravity_update_rate <= 1) {
-        using namespace body_fitted_fmm;
-        bool periodic[3]={false,false,false}; double length[3]={0,0,0};
-        for(int w=0;w<config.num_walls;++w) if(config.walls[w].enabled&&config.walls[w].type==WallType::PERIODICAL&&config.walls[w].axis<3){const int a=config.walls[w].axis;periodic[a]=true;length[a]=config.walls[w].bound_max-config.walls[w].bound_min;}
-        auto minimum_image=[&](ClumpVec3 r){if(periodic[0]&&length[0]>0){const double h=.5*length[0];if(r.x>h)r.x-=length[0];else if(r.x<-h)r.x+=length[0];}if(periodic[1]&&length[1]>0){const double h=.5*length[1];if(r.y>h)r.y-=length[1];else if(r.y<-h)r.y+=length[1];}if(periodic[2]&&length[2]>0){const double h=.5*length[2];if(r.z>h)r.z-=length[2];else if(r.z<-h)r.z+=length[2];}return r;};
-        const double G=config.acceleration.unified_fmm.gravitational_constant;
-        float min_radius=std::numeric_limits<float>::infinity();for(int i=0;i<member_end;++i)min_radius=std::min(min_radius,radii[i]);
-        const double eps=static_cast<double>(min_radius)*config.acceleration.unified_fmm.softening_factor;
-        std::vector<ClumpP3> world(max_id);
-        for(int c=0;c<max_id;++c){ClumpP3 body;for(int k=0;k<19;++k)body.c[k]=p3[k][c];body.c[0]=M[c];world[c]=clump_p3_rotate_body_to_world(body,qw[c],qx[c],qy[c],qz[c]);}
-        for(int c=0;c<max_id;++c){
-            const ClumpVec3 xc{cx[c],cy[c],cz[c]};
-            for(int i=0;i<normal_end;++i){ClumpP3 point;point.c[0]=masses[i];const ClumpVec3 r=minimum_image({px[i]-xc.x,py[i]-xc.y,pz[i]-xc.z});ClumpVec3 fc{},fp{};clump_p3_pair_force(world[c],point,r,G,eps,fc,fp);const ClumpVec3 tc=clump_p3_pair_torque(world[c],point,r,G,eps,true);nfx[c]+=fc.x;nfy[c]+=fc.y;nfz[c]+=fc.z;ntx[c]+=tc.x;nty[c]+=tc.y;ntz[c]+=tc.z;}
-            for(int d=c+1;d<max_id;++d){const ClumpVec3 r=minimum_image({cx[d]-xc.x,cy[d]-xc.y,cz[d]-xc.z});ClumpVec3 fc{},fd{};clump_p3_pair_force(world[c],world[d],r,G,eps,fc,fd);const ClumpVec3 tc=clump_p3_pair_torque(world[c],world[d],r,G,eps,true),td=clump_p3_pair_torque(world[c],world[d],r,G,eps,false);nfx[c]+=fc.x;nfy[c]+=fc.y;nfz[c]+=fc.z;ntx[c]+=tc.x;nty[c]+=tc.y;ntz[c]+=tc.z;nfx[d]+=fd.x;nfy[d]+=fd.y;nfz[d]+=fd.z;ntx[d]+=td.x;nty[d]+=td.y;ntz[d]+=td.z;}
+        if (tmpl && tmpl->has_multipole) {
+            const double mtol = 1e-10 * std::max(M[c], 1.0);
+            const double dtol = 1e-10 * std::max(M[c] * std::max(extent, 1.0), 1.0);
+            if (std::fabs(tmpl->multipole_p3[0] - M[c]) > mtol)
+                throw std::runtime_error("clump multipole monopole must equal derived mass");
+            for (int k = 1; k <= 3; ++k) {
+                if (std::fabs(tmpl->multipole_p3[k]) > dtol)
+                    throw std::runtime_error("clump multipole dipole must vanish about its CoM");
+            }
+            if (config.acceleration.enable_self_gravity) {
+                for (int k = 0; k < 19; ++k) {
+                    const int order = k == 0 ? 0 : (k <= 3 ? 1 : (k <= 8 ? 2 : 3));
+                    const double scale = M[c] * std::pow(std::max(extent, 1e-30), order);
+                    double tol = 1e-9 * std::max({std::fabs(local_p3[k]), scale, 1e-30});
+                    if (checkpoint && order > 0) {
+                        // Checkpoint body offsets are FP32. Every degree-r
+                        // coefficient polynomial has absolute monomial-weight
+                        // sum <= 8, so offset rounding changes its moment by
+                        // <= 8*r*epsilon_float*M*R^r. This bound also covers
+                        // reversing FP32 rounding relative to the stored R.
+                        tol += 8.0 * order * std::numeric_limits<float>::epsilon() * scale;
+                    }
+                    if (std::fabs(tmpl->multipole_p3[k] - local_p3[k]) > tol) {
+                        throw std::runtime_error(
+                            "self-gravitating clump multipole override disagrees with "
+                            "member-derived moments; member masses and positions define gravity");
+                    }
+                }
+            }
+            for (int k = 0; k < 19; ++k) {
+                p3[k][c] = config.acceleration.enable_self_gravity
+                    ? local_p3[k] : tmpl->multipole_p3[k];
+            }
+        } else {
+            for (int k = 0; k < 19; ++k) p3[k][c] = local_p3[k];
         }
     }
+
+    // Checkpoint member forces reconstruct the retained fast wrench above.
+    // Gravity remains separate and is restored through AccelerationManager's
+    // current member-gravity pipeline before the first resumed half-kick.
 
     auto h2d=[&](double* d,const std::vector<double>& v){CUDA_CHECK(cudaMemcpy(d,v.data(),max_id*sizeof(double),cudaMemcpyHostToDevice));};
     h2d(cs.mass,M);h2d(cs.com_x,cx);h2d(cs.com_y,cy);h2d(cs.com_z,cz);h2d(cs.vel_x,cvx);h2d(cs.vel_y,cvy);h2d(cs.vel_z,cvz);h2d(cs.omega_x,owx);h2d(cs.omega_y,owy);h2d(cs.omega_z,owz);h2d(cs.quat_w,qw);h2d(cs.quat_x,qx);h2d(cs.quat_y,qy);h2d(cs.quat_z,qz);h2d(cs.inertia_xx,ixx);h2d(cs.inertia_yy,iyy);h2d(cs.inertia_zz,izz);h2d(cs.inertia_xy,ixy);h2d(cs.inertia_xz,ixz);h2d(cs.inertia_yz,iyz);for(int k=0;k<19;++k)h2d(cs.multipole_p3[k],p3[k]);h2d(cs.net_force_x,nfx);h2d(cs.net_force_y,nfy);h2d(cs.net_force_z,nfz);h2d(cs.net_torque_x,ntx);h2d(cs.net_torque_y,nty);h2d(cs.net_torque_z,ntz);

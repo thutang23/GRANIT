@@ -1351,6 +1351,13 @@ public:
                          /*force_only=*/true);
         }
 
+        if(resumed && clump_state_.num_clumps>0 &&
+           config_.acceleration.enable_self_gravity && !respa_enabled){
+            AccelerationManager::restore_checkpoint_clump_gravity(
+                state_,config_,state_.current_time,compute_stream_);
+            ++self_gravity_evaluations_;
+        }
+
         if (respa_enabled) {
             // Bootstrap the outer force at the current configuration. The
             // cached normal acceleration and clump gravity wrench remain

@@ -688,14 +688,17 @@ void run_m2l_grouped_targets(
     const float* d_G_full,
     fmm::LocalExpansion* local_expansions,
     cudaStream_t stream,
-    const UnifiedNode* source_nodes = nullptr)
+    const UnifiedNode* source_nodes = nullptr,
+    const int* source_children = nullptr)
 {
     if (!source_nodes) source_nodes = nodes;
+    // Target ancestry belongs to L2L; grouped M2L child routes index sources.
+    if (!source_children) source_children = children;
     constexpr int block =
         FMM_M2L_MODE == FMM_M2L_MODE_TF32_TC ? 256 : 128;
     constexpr int grid = 2048;
     m2l_grouped_target_kernel<<<grid, block, 0, stream>>>(
-        arena, metadata, nodes, source_nodes, children, node_capacity, multipoles, d_G_full,
+        arena, metadata, nodes, source_nodes, source_children, node_capacity, multipoles, d_G_full,
         local_expansions);
     CUDA_CHECK(cudaGetLastError());
 }

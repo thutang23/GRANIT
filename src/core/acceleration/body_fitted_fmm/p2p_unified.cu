@@ -351,7 +351,8 @@ __device__ __forceinline__ void grouped_p2p_source_warp(
     const int* __restrict__ sorted_indices, int lane,
     double* sh_pos_x, double* sh_pos_y, double* sh_pos_z,
     Compute* sh_mass,
-    Compute G, Compute softening_sq, double cutoff_sq)
+    Compute G, Compute softening_sq, double cutoff_sq,
+    const int* gravity_clump_ids = nullptr)
 {
     const UnifiedNode& source_node = nodes[source];
     const int source_begin = static_cast<int>(source_node.begin);
@@ -384,7 +385,9 @@ __device__ __forceinline__ void grouped_p2p_source_warp(
                 bool contributes = lane < tile_size;
                 if (contributes) {
                     const int orig_j = sorted_indices[source_begin + tile + lane];
-                    contributes = target_orig != orig_j;
+                    contributes = target_orig != orig_j &&
+                        !(gravity_clump_ids && gravity_clump_ids[target_orig] > 0 &&
+                          gravity_clump_ids[target_orig] == gravity_clump_ids[orig_j]);
                     if (contributes) {
                         const double rdx = (sh_pos_x[lane] - target_x);
                         const double rdy = (sh_pos_y[lane] - target_y);
@@ -421,7 +424,9 @@ __device__ __forceinline__ void grouped_p2p_source_warp(
         } else if (target_active) {
             for (int j = 0; j < tile_size; ++j) {
                 const int orig_j = sorted_indices[source_begin + tile + j];
-                if (orig_i == orig_j) continue;
+                if (orig_i == orig_j ||
+                    (gravity_clump_ids && gravity_clump_ids[orig_i] > 0 &&
+                     gravity_clump_ids[orig_i] == gravity_clump_ids[orig_j])) continue;
                 const double rdx = (sh_pos_x[j] - xi);
                 const double rdy = (sh_pos_y[j] - yi);
                 const double rdz = (sh_pos_z[j] - zi);
@@ -453,6 +458,7 @@ struct GroupedParticleSources {
     const float* mass;
     const int* order;
     bool remote;
+    const int* target_canonical = nullptr;
 };
 
 __host__ __device__ __forceinline__ bool grouped_p2p_leaf_only_allowed(
@@ -526,7 +532,8 @@ __device__ __forceinline__ void grouped_p2p_leaf_routes(
     const int* __restrict__ sorted_indices, int lane,
     double* sh_pos_x, double* sh_pos_y, double* sh_pos_z,
     Compute* sh_mass,
-    Compute G, Compute softening_sq, double cutoff_sq)
+    Compute G, Compute softening_sq, double cutoff_sq,
+    const int* gravity_clump_ids = nullptr)
 {
     using T = GroupedStencilTraits<D>;
     int target = leaf;
@@ -557,7 +564,7 @@ __device__ __forceinline__ void grouped_p2p_leaf_routes(
                     grouped_route_node(route), target_active, target_mask, orig_i, xi, yi, zi,
                     mi, ax, ay, az, source_nodes, pos_x, pos_y, pos_z, mass,
                     sorted_indices, lane, sh_pos_x, sh_pos_y, sh_pos_z, sh_mass,
-                    G, softening_sq, cutoff_sq);
+                    G, softening_sq, cutoff_sq, gravity_clump_ids);
             }
         }
         #pragma unroll
@@ -576,7 +583,7 @@ __device__ __forceinline__ void grouped_p2p_leaf_routes(
                     source, target_active, target_mask, orig_i, xi, yi, zi, mi,
                     ax, ay, az, source_nodes, pos_x, pos_y, pos_z, mass,
                     sorted_indices, lane, sh_pos_x, sh_pos_y, sh_pos_z, sh_mass,
-                    G, softening_sq, cutoff_sq);
+                    G, softening_sq, cutoff_sq, gravity_clump_ids);
             }
         }
         // With fixed distributed routing and no cutoff, ancestors contain
@@ -597,7 +604,8 @@ __device__ __forceinline__ void fmm_p2p_grouped_leaf_body(
     double* __restrict__ out_x, double* __restrict__ out_y,
     double* __restrict__ out_z, const int* __restrict__ sorted_indices,
     Compute G, Compute softening, GroupedParticleSources sources,
-    const PersistentTreeContext* context=nullptr)
+    const int* gravity_clump_ids = nullptr,
+    const PersistentTreeContext* context = nullptr)
 {
     if constexpr(LeafOnly) {
         if(!context || !grouped_p2p_leaf_only_allowed(context->command.disable_direct_fallback,context->command.cutoff_radius) ||
@@ -652,19 +660,24 @@ __device__ __forceinline__ void fmm_p2p_grouped_leaf_body(
                 zi = pos_z[orig_i];
                 mi = static_cast<Compute>(mass[orig_i]);
             }
+            // Source order is canonical for cross-context clump work; the
+            // output index remains compact in the target component.
+            const int canonical_i = active && sources.target_canonical
+                ? sources.target_canonical[orig_i]
+                : (sources.remote ? -1 : orig_i);
             Compute ax = 0, ay = 0, az = 0;
             if (metadata->active_tree == 2) {
                 grouped_p2p_leaf_routes<2, OUTER, Compute, LeafOnly>(
-                    leaf, actual_nodes, active, target_mask, sources.remote ? -1 : orig_i, xi, yi, zi, mi, ax, ay, az, arena,
+                    leaf, actual_nodes, active, target_mask, canonical_i, xi, yi, zi, mi, ax, ay, az, arena,
                     nodes, sources.nodes, sources.children, sources.x, sources.y, sources.z, sources.mass, sources.order,
                     lane, sh_pos_x[warp], sh_pos_y[warp], sh_pos_z[warp],
-                    sh_mass[warp], G, softening_sq, cutoff_sq);
+                    sh_mass[warp], G, softening_sq, cutoff_sq, gravity_clump_ids);
             } else {
                 grouped_p2p_leaf_routes<3, OUTER, Compute, LeafOnly>(
-                    leaf, actual_nodes, active, target_mask, sources.remote ? -1 : orig_i, xi, yi, zi, mi, ax, ay, az, arena,
+                    leaf, actual_nodes, active, target_mask, canonical_i, xi, yi, zi, mi, ax, ay, az, arena,
                     nodes, sources.nodes, sources.children, sources.x, sources.y, sources.z, sources.mass, sources.order,
                     lane, sh_pos_x[warp], sh_pos_y[warp], sh_pos_z[warp],
-                    sh_mass[warp], G, softening_sq, cutoff_sq);
+                    sh_mass[warp], G, softening_sq, cutoff_sq, gravity_clump_ids);
             }
             if (active) {
                 out_x[orig_i] += static_cast<double>(ax);
@@ -685,12 +698,13 @@ __global__ void fmm_p2p_grouped_leaf_unified(
     const double* __restrict__ pos_z, const float* __restrict__ mass,
     double* __restrict__ out_x, double* __restrict__ out_y,
     double* __restrict__ out_z, const int* __restrict__ sorted_indices,
-    Compute G, Compute softening,const PersistentTreeContext* context=nullptr)
+    Compute G, Compute softening, const int* gravity_clump_ids = nullptr,
+    const PersistentTreeContext* context = nullptr)
 {
     const GroupedParticleSources sources{nodes,children,pos_x,pos_y,pos_z,mass,sorted_indices,false};
     fmm_p2p_grouped_leaf_body<OUTER, Compute, LeafOnly>(
         arena,metadata,nodes,children,node_capacity,pos_x,pos_y,pos_z,mass,
-        out_x,out_y,out_z,sorted_indices,G,softening,sources,context);
+        out_x,out_y,out_z,sorted_indices,G,softening,sources,gravity_clump_ids,context);
 }
 
 template<bool OUTER,class Compute,bool LeafOnly>
@@ -699,12 +713,12 @@ void launch_p2p_grouped_leaf_mode(
     const PersistentTreeMetadata* metadata,int node_capacity,
     const double* pos_x,const double* pos_y,const double* pos_z,const float* mass,
     double* out_x,double* out_y,double* out_z,double G,double softening,cudaStream_t stream,
-    const PersistentTreeContext* context) {
+    const PersistentTreeContext* context, const int* gravity_clump_ids) {
     constexpr int grid=2048;
     fmm_p2p_grouped_leaf_unified<OUTER,Compute,LeafOnly><<<grid,128,0,stream>>>(
         arena,metadata,dd.unified_nodes,dd.children_compact,node_capacity,
         pos_x,pos_y,pos_z,mass,out_x,out_y,out_z,dd.sorted_to_original,
-        static_cast<Compute>(G),static_cast<Compute>(softening),context);
+        static_cast<Compute>(G),static_cast<Compute>(softening),gravity_clump_ids,context);
 }
 template<bool OUTER>
 void launch_p2p_grouped_leaves(
@@ -713,7 +727,8 @@ void launch_p2p_grouped_leaves(
     const double* pos_x, const double* pos_y, const double* pos_z,
     const float* mass, double* out_x, double* out_y, double* out_z,
     double G, double softening, cudaStream_t stream,
-    const PersistentTreeContext* context=nullptr,bool leaf_only=false)
+    const PersistentTreeContext* context = nullptr, bool leaf_only = false,
+    const int* gravity_clump_ids = nullptr)
 {
     const bool verify=leaf_only && std::getenv("GRANIT_FMM_VERIFY_LEAF_ONLY");
     if(verify)fmm_verify_leaf_only_kernel<<<2048,256,0,stream>>>(context);
@@ -723,15 +738,48 @@ void launch_p2p_grouped_leaves(
     }
     if(softening<0) {
         if(leaf_only)launch_p2p_grouped_leaf_mode<OUTER,double,true>(dd,arena,metadata,node_capacity,
-            pos_x,pos_y,pos_z,mass,out_x,out_y,out_z,G,softening,stream,context);
+            pos_x,pos_y,pos_z,mass,out_x,out_y,out_z,G,softening,stream,context,gravity_clump_ids);
         else launch_p2p_grouped_leaf_mode<OUTER,double,false>(dd,arena,metadata,node_capacity,
-            pos_x,pos_y,pos_z,mass,out_x,out_y,out_z,G,softening,stream,context);
+            pos_x,pos_y,pos_z,mass,out_x,out_y,out_z,G,softening,stream,context,gravity_clump_ids);
     } else {
         if(leaf_only)launch_p2p_grouped_leaf_mode<OUTER,p2p_compute_t,true>(dd,arena,metadata,node_capacity,
-            pos_x,pos_y,pos_z,mass,out_x,out_y,out_z,G,softening,stream,context);
+            pos_x,pos_y,pos_z,mass,out_x,out_y,out_z,G,softening,stream,context,gravity_clump_ids);
         else launch_p2p_grouped_leaf_mode<OUTER,p2p_compute_t,false>(dd,arena,metadata,node_capacity,
-            pos_x,pos_y,pos_z,mass,out_x,out_y,out_z,G,softening,stream,context);
+            pos_x,pos_y,pos_z,mass,out_x,out_y,out_z,G,softening,stream,context,gravity_clump_ids);
     }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+
+__global__ void fmm_p2p_cross_leaf_kernel(
+    GroupedInteractionArena arena, const PersistentTreeMetadata* metadata,
+    const UnifiedNode* targets, const int* target_children, int capacity,
+    const double* x, const double* y, const double* z, const float* mass,
+    double* fx, double* fy, double* fz, const int* target_order,
+    GroupedParticleSources sources, const int* clump_ids,
+    p2p_compute_t G, p2p_compute_t eps) {
+    // Component and union contexts have different native node/index spaces.
+    // Keep their full target ancestry walk, with canonical pair filtering.
+    fmm_p2p_grouped_leaf_body<false, p2p_compute_t, false>(
+        arena, metadata, targets, target_children, capacity, x, y, z, mass,
+        fx, fy, fz, target_order, G, eps, sources, clump_ids);
+}
+
+void launch_p2p_cross_leaves(
+    const fmm::FMMDeviceData& target, const GroupedInteractionArena& arena,
+    const PersistentTreeMetadata* metadata, int capacity,
+    const double* x, const double* y, const double* z, const float* mass,
+    double* fx, double* fy, double* fz, const int* target_canonical,
+    const fmm::FMMDeviceData& source,
+    const double* sx, const double* sy, const double* sz, const float* sm,
+    const int* clump_ids, double G, double eps, cudaStream_t stream) {
+    const GroupedParticleSources sources{
+        source.unified_nodes, source.children_compact, sx, sy, sz, sm,
+        source.sorted_to_original, false, target_canonical};
+    fmm_p2p_cross_leaf_kernel<<<2048, 128, 0, stream>>>(
+        arena, metadata, target.unified_nodes, target.children_compact, capacity,
+        x, y, z, mass, fx, fy, fz, target.sorted_to_original, sources, clump_ids,
+        static_cast<p2p_compute_t>(G), static_cast<p2p_compute_t>(eps));
     CUDA_CHECK(cudaGetLastError());
 }
 

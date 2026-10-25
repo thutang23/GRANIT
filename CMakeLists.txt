@@ -266,4 +266,19 @@ if(BUILD_TESTING)
         LABELS "gpu" SKIP_RETURN_CODE 77)
     set_tests_properties(cll_shear_contacts PROPERTIES
         LABELS "gpu" SKIP_RETURN_CODE 77)
+    granit_solver(granit_clump_gravity_test
+        components/tests/unit_test/body_fitted_fmm/clump_gravity.cu)
+    target_compile_definitions(granit_clump_gravity_test PRIVATE
+        GRANIT_CLUMP_MEMBER_TEST=1 GRANIT_CLUMP_ALIGNED_TEST=1)
+    # Verify membership/reduction against direct near forces and the existing
+    # FMM operator. The executable without this flag separately enforces the
+    # reported accuracy targets, which p4 does not uniformly satisfy.
+    add_test(NAME clump_gravity_contract
+        COMMAND granit_clump_gravity_test --implementation-check)
+    set_tests_properties(clump_gravity_contract PROPERTIES
+        LABELS "gpu" SKIP_RETURN_CODE 77)
+    add_test(NAME clump_gravity_aligned_contract
+        COMMAND granit_clump_gravity_test --case aligned_all --implementation-check)
+    set_tests_properties(clump_gravity_aligned_contract PROPERTIES
+        LABELS "gpu" SKIP_RETURN_CODE 77)
 endif()

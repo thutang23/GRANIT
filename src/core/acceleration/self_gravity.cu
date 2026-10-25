@@ -44,7 +44,6 @@
 #include "../sph/sph_neighbor_query.cuh"
 #include "../neighbor/lbvh/lbvh_manager.h"
 #include "../particle_model/clump.h"
-#include "body_fitted_fmm/clump_p3_gravity.cuh"
 #include "body_fitted_fmm/clump_gravity_body_view.cuh"
 #include "shear_gravity_images.cuh"
 #ifdef CUDADEM_HAVE_LET
@@ -57,6 +56,9 @@
 #include "cuda_utils.h"
 #endif
 #include <cstdint>
+#include <cfloat>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <iostream>
 
@@ -183,213 +185,225 @@ void AccelerationManager::set_clump_runtime(
     clump_runtime_segments_ = segments;
 }
 
-// Gravity bodies are never materialized in the primary ParticleSoA.  The
-// compact BFFMM shadow view contains [0,normal_count) live normal particles
-// followed by one CoM body per clump.  Thus Karras can never split a rigid
-// clump or accidentally include a member/dead particle.
-__device__ __forceinline__ body_fitted_fmm::ClumpP3 load_gravity_body_p3(
-    int body, int normal_begin, int normal_count, const ParticleSoA& p,
-    const ClumpStateSoA& cs, body_fitted_fmm::ClumpVec3& pos, bool& clump) {
-    body_fitted_fmm::ClumpP3 out;
-    if (body < normal_count) {
-        const int i = normal_begin + body;
-        pos = {p.pos_x[i], p.pos_y[i], p.pos_z[i]}; out.c[0] = p.mass[i]; clump = false;
-    } else {
-        const int c = body - normal_count;
-        body_fitted_fmm::ClumpP3 body_p3;
-        for (int q = 0; q < body_fitted_fmm::CLUMP_P3_COEFFS; ++q)
-            body_p3.c[q] = cs.multipole_p3[q][c];
-        // Mass is canonical state, even when old/imported p3 metadata omitted it.
-        body_p3.c[0] = cs.mass[c];
-        out = body_fitted_fmm::clump_p3_rotate_body_to_world(
-            body_p3, cs.quat_w[c], cs.quat_x[c], cs.quat_y[c], cs.quat_z[c]);
-        pos = {cs.com_x[c], cs.com_y[c], cs.com_z[c]}; clump = true;
-    }
-    return out;
-}
-
-template<bool Outer>
-__global__ void compute_clump_body_gravity_direct_kernel(
-    ParticleSoA p, ClumpStateSoA cs, int normal_begin, int normal_count,
-    int num_clumps, double G, double softening,
-    bool periodic_x, bool periodic_y, bool periodic_z,
-    double box_length_x, double box_length_y, double box_length_z) {
+// A live-member shadow view keeps canonical particle indices. Inactive rows
+// receive zero mass at a live anchor, so they neither source gravity nor alter
+// the Karras AABB. Dead tail rows are excluded by the registered segment bound.
+__global__ void find_clump_gravity_anchor(ParticleSoA p, int count, int* anchor) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    const int nbody = normal_count + num_clumps;
-    if (i >= nbody) return;
-    body_fitted_fmm::ClumpVec3 xi{}; bool i_clump = false;
-    const auto pi = load_gravity_body_p3(i, normal_begin, normal_count, p, cs, xi, i_clump);
-    // Each unordered pair is evaluated exactly once.  The returned opposite
-    // force is routed verbatim, so pair momentum cancellation does not depend
-    // on two separately rounded target-side evaluations.
-    for (int j = i + 1; j < nbody; ++j) {
-        body_fitted_fmm::ClumpVec3 xj{}; bool j_clump = false;
-        const auto pj = load_gravity_body_p3(j, normal_begin, normal_count, p, cs, xj, j_clump);
-        body_fitted_fmm::ClumpVec3 separation{xj.x-xi.x, xj.y-xi.y, xj.z-xi.z};
-        if (periodic_x && box_length_x > 0.0) {
-            const double half = 0.5 * box_length_x;
-            if (separation.x > half) separation.x -= box_length_x;
-            else if (separation.x < -half) separation.x += box_length_x;
-        }
-        if (periodic_y && box_length_y > 0.0) {
-            const double half = 0.5 * box_length_y;
-            if (separation.y > half) separation.y -= box_length_y;
-            else if (separation.y < -half) separation.y += box_length_y;
-        }
-        if (periodic_z && box_length_z > 0.0) {
-            const double half = 0.5 * box_length_z;
-            if (separation.z > half) separation.z -= box_length_z;
-            else if (separation.z < -half) separation.z += box_length_z;
-        }
-        body_fitted_fmm::ClumpVec3 fij{}, fji{};
-        body_fitted_fmm::clump_p3_pair_force(pi, pj, separation, G, softening, fij, fji);
-        if (i_clump) {
-            const int c=i-normal_count;
-            double *fx=Outer?cs.gravity_force_x:cs.net_force_x,*fy=Outer?cs.gravity_force_y:cs.net_force_y,*fz=Outer?cs.gravity_force_z:cs.net_force_z;
-            double *tx=Outer?cs.gravity_torque_x:cs.net_torque_x,*ty=Outer?cs.gravity_torque_y:cs.net_torque_y,*tz=Outer?cs.gravity_torque_z:cs.net_torque_z;
-            atomicAdd(&fx[c],fij.x); atomicAdd(&fy[c],fij.y); atomicAdd(&fz[c],fij.z);
-            const auto t=body_fitted_fmm::clump_p3_pair_torque(pi,pj,separation,G,softening,true);
-            atomicAdd(&tx[c],t.x); atomicAdd(&ty[c],t.y); atomicAdd(&tz[c],t.z);
-        }
-        else { const int particle=normal_begin+i;
-        if constexpr (Outer) {
-            const double inv_m = p.mass[particle] > 0.0f ? 1.0 / static_cast<double>(p.mass[particle]) : 0.0;
-            atomicAdd(&p.gravity_force_x[particle], fij.x * inv_m); atomicAdd(&p.gravity_force_y[particle], fij.y * inv_m); atomicAdd(&p.gravity_force_z[particle], fij.z * inv_m);
-        } else {
-            atomicAdd(&p.force_x[particle], fij.x); atomicAdd(&p.force_y[particle], fij.y); atomicAdd(&p.force_z[particle], fij.z); }}
-        if (j_clump) {
-            const int c=j-normal_count;
-            double *fx=Outer?cs.gravity_force_x:cs.net_force_x,*fy=Outer?cs.gravity_force_y:cs.net_force_y,*fz=Outer?cs.gravity_force_z:cs.net_force_z;
-            double *tx=Outer?cs.gravity_torque_x:cs.net_torque_x,*ty=Outer?cs.gravity_torque_y:cs.net_torque_y,*tz=Outer?cs.gravity_torque_z:cs.net_torque_z;
-            atomicAdd(&fx[c],fji.x); atomicAdd(&fy[c],fji.y); atomicAdd(&fz[c],fji.z);
-            const auto t=body_fitted_fmm::clump_p3_pair_torque(pi,pj,separation,G,softening,false);
-            atomicAdd(&tx[c],t.x); atomicAdd(&ty[c],t.y); atomicAdd(&tz[c],t.z);
-        }
-        else { const int particle=normal_begin+j;
-        if constexpr (Outer) { const double inv_m=p.mass[particle]>0.0f?1.0/static_cast<double>(p.mass[particle]):0.0; atomicAdd(&p.gravity_force_x[particle],fji.x*inv_m); atomicAdd(&p.gravity_force_y[particle],fji.y*inv_m); atomicAdd(&p.gravity_force_z[particle],fji.z*inv_m); }
-        else { atomicAdd(&p.force_x[particle],fji.x); atomicAdd(&p.force_y[particle],fji.y); atomicAdd(&p.force_z[particle],fji.z); }}
+    if (i < count && p.clump_id[i] >= 0 &&
+        (!p.lifecycle_state || p.lifecycle_state[i] == 0)) {
+        atomicMin(anchor, i);
     }
 }
 
-static void compute_registered_clump_direct_gravity(
-    SimulationState& state, ClumpStateSoA& cs, const ClumpSegmentOffsets& seg,
-    const SimConfig& config, bool outer, cudaStream_t stream) {
-    const int normal_count = seg.normal_end - seg.normal_begin;
-    const int nbody = normal_count + cs.num_clumps;
-    if (nbody < 2) return;
-    const double G = config.acceleration.unified_fmm.gravitational_constant;
-    const double eps = config.particle.radius_min * config.acceleration.unified_fmm.softening_factor;
-    const PeriodicBoundaryConfig pbc = WallManager::get_pbc_config();
-    const int block = 128, grid = (nbody + block - 1) / block;
-    if (outer)
-        compute_clump_body_gravity_direct_kernel<true><<<grid, block, 0, stream>>>(
-            state.particles, cs, seg.normal_begin, normal_count, cs.num_clumps, G, eps,
-            pbc.periodic_x, pbc.periodic_y, pbc.periodic_z,
-            pbc.box_length_x, pbc.box_length_y, pbc.box_length_z);
-    else
-        compute_clump_body_gravity_direct_kernel<false><<<grid, block, 0, stream>>>(
-            state.particles, cs, seg.normal_begin, normal_count, cs.num_clumps, G, eps,
-            pbc.periodic_x, pbc.periodic_y, pbc.periodic_z,
-            pbc.box_length_x, pbc.box_length_y, pbc.box_length_z);
-    CUDA_CHECK(cudaGetLastError());
+__global__ void build_clump_member_gravity_view(
+    ParticleSoA p, int count, const int* anchor,
+    double* x, double* y, double* z, float* mass) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const bool live = p.clump_id[i] >= 0 &&
+                      (!p.lifecycle_state || p.lifecycle_state[i] == 0);
+    const int a = live ? i : (*anchor < count ? *anchor : 0);
+    x[i] = p.pos_x[a];
+    y[i] = p.pos_y[a];
+    z[i] = p.pos_z[a];
+    mass[i] = live ? p.mass[i] : 0.0f;
 }
 
-// Build the compact gravity-body view used by the clump-aware BFFMM path.
-// Clump members and dead rows are never copied into this view.  Clump masses
-// are zero in `fmm_mass`: their interactions are evaluated by the conservative
-// p3 cross pass, while their physical mass remains available in view.mass for
-// the mandatory global projection.
-__global__ void build_clump_gravity_body_view_kernel(
-    ParticleSoA p, ClumpStateSoA cs, int normal_begin, int normal_count,
-    body_fitted_fmm::GravityBodyView view, float* fmm_mass) {
-    const int body = blockIdx.x * blockDim.x + threadIdx.x;
-    if (body >= view.count) return;
-    if (body < normal_count) {
-        const int particle = normal_begin + body;
-        view.pos_x[body] = p.pos_x[particle];
-        view.pos_y[body] = p.pos_y[particle];
-        view.pos_z[body] = p.pos_z[particle];
-        view.mass[body] = static_cast<double>(p.mass[particle]);
-        view.source_index[body] = particle;
-        view.kind[body] = body_fitted_fmm::GravityBodyKind::NormalParticle;
-        fmm_mass[body] = p.mass[particle];
-    } else {
-        const int clump = body - normal_count;
-        view.pos_x[body] = cs.com_x[clump];
-        view.pos_y[body] = cs.com_y[clump];
-        view.pos_z[body] = cs.com_z[clump];
-        view.mass[body] = cs.mass[clump];
-        view.source_index[body] = clump;
-        view.kind[body] = body_fitted_fmm::GravityBodyKind::ClumpCoM;
-        fmm_mass[body] = 0.0f;
+// Same arithmetic as Karras's dynamic root reduction, including the degenerate
+// domain fallback. The strict diameter test remains valid across cell borders.
+__global__ void clump_gravity_root_size(
+    const double* x, const double* y, const double* z, int count, double* root) {
+    __shared__ double lo[3][256], hi[3][256];
+    const int t = threadIdx.x;
+    double lx = INFINITY, ly = INFINITY, lz = INFINITY;
+    double hx = -INFINITY, hy = -INFINITY, hz = -INFINITY;
+    for (int i = t; i < count; i += blockDim.x) {
+        lx = fmin(lx, x[i]);
+        ly = fmin(ly, y[i]);
+        lz = fmin(lz, z[i]);
+        hx = fmax(hx, x[i]);
+        hy = fmax(hy, y[i]);
+        hz = fmax(hz, z[i]);
+    }
+    lo[0][t] = lx;
+    lo[1][t] = ly;
+    lo[2][t] = lz;
+    hi[0][t] = hx;
+    hi[1][t] = hy;
+    hi[2][t] = hz;
+    __syncthreads();
+    for (int d = 128; d; d >>= 1) {
+        if (t < d) {
+            for (int k = 0; k < 3; ++k) {
+                lo[k][t] = fmin(lo[k][t], lo[k][t + d]);
+                hi[k][t] = fmax(hi[k][t], hi[k][t + d]);
+            }
+        }
+        __syncthreads();
+    }
+    if (t == 0) {
+        double e = fmax(hi[0][0] - lo[0][0],
+                        fmax(hi[1][0] - lo[1][0], hi[2][0] - lo[2][0]));
+        if (e < 1e-30) e = 1.0;
+        const double pad = e * 0.01;
+        root[0] = e + 2.0 * pad;
+        root[1] = lo[0][0] - pad;
+        root[2] = lo[1][0] - pad;
+        root[3] = lo[2][0] - pad;
     }
 }
 
-__device__ __forceinline__ body_fitted_fmm::ClumpP3 load_view_body_p3(
-    int body, const body_fitted_fmm::GravityBodyView& view,
-    const ParticleSoA& p, const ClumpStateSoA& cs) {
-    body_fitted_fmm::ClumpP3 out;
-    if (view.kind[body] == body_fitted_fmm::GravityBodyKind::NormalParticle) {
-        out.c[0] = static_cast<double>(p.mass[view.source_index[body]]);
-    } else {
-        const int clump = view.source_index[body];
-        body_fitted_fmm::ClumpP3 body_p3;
-        for (int q = 0; q < body_fitted_fmm::CLUMP_P3_COEFFS; ++q)
-            body_p3.c[q] = cs.multipole_p3[q][clump];
-        body_p3.c[0] = cs.mass[clump];
-        out = body_fitted_fmm::clump_p3_rotate_body_to_world(
-            body_p3, cs.quat_w[clump], cs.quat_x[clump],
-            cs.quat_y[clump], cs.quat_z[clump]);
+__global__ void classify_clump_member_gravity(
+    ParticleSoA p, ClumpStateSoA cs, ClumpSegmentOffsets seg,
+    const double* root, int depth, int* safe, int* large_flags) {
+    // Four clumps per block, one warp per clump. Small bodies avoid a whole
+    // block; large populations are tiled cooperatively over their warp.
+    const int c = blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (c >= cs.num_clumps) return;
+    const int lane = threadIdx.x & 31;
+    double radius = 0;
+    const int begin = seg.member_begin + seg.seg_begin[c];
+    const int end = seg.member_begin + seg.seg_end[c];
+    for (int i = begin + lane; i < end; i += 32) {
+        if (p.lifecycle_state && p.lifecycle_state[i] != 0) continue;
+        const double dx = p.pos_x[i] - cs.com_x[c];
+        const double dy = p.pos_y[i] - cs.com_y[c];
+        const double dz = p.pos_z[i] - cs.com_z[c];
+        radius = fmax(radius, sqrt(dx * dx + dy * dy + dz * dz) +
+                              static_cast<double>(p.radius[i]));
     }
-    return out;
+    for (int offset = 16; offset; offset >>= 1)
+        radius = fmax(radius, __shfl_down_sync(0xffffffffu, radius, offset));
+    if (lane == 0) {
+        const double h = ldexp(root[0], -depth);
+        const bool large = !(2.0 * radius < h * (1.0 - 64.0 * DBL_EPSILON));
+        large_flags[c] = large ? 1 : 0;
+        if (large) atomicExch(safe, 0);
+    }
 }
 
-// Exact conservative cross pass for every body pair involving a clump.
-// Normal-normal pairs remain in BFFMM.  Evaluating each unordered cross pair
-// once gives bitwise-opposite pair forces before the global projection.
-__global__ void compute_clump_bffmm_cross_kernel(
-    ParticleSoA p, ClumpStateSoA cs,
+__global__ void compute_clump_member_direct_gravity(
+    const double* x, const double* y, const double* z,
+    const float* mass, const int* ids, int count,
+    double* fx, double* fy, double* fz, double G, double eps,
+    bool periodic_x, bool periodic_y, bool periodic_z,
+    double lx, double ly, double lz) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    double ax = 0, ay = 0, az = 0;
+    if (mass[i] > 0) {
+        for (int j = 0; j < count; ++j) {
+            if (i == j || mass[j] <= 0 || (ids[i] > 0 && ids[i] == ids[j])) continue;
+            double dx = x[j] - x[i];
+            double dy = y[j] - y[i];
+            double dz = z[j] - z[i];
+            if (periodic_x && lx > 0) dx -= nearbyint(dx / lx) * lx;
+            if (periodic_y && ly > 0) dy -= nearbyint(dy / ly) * ly;
+            if (periodic_z && lz > 0) dz -= nearbyint(dz / lz) * lz;
+            const double r2 = dx * dx + dy * dy + dz * dz + eps * eps;
+            if (!(r2 > 0)) continue;
+            const double inv = 1.0 / sqrt(r2);
+            const double f = G * static_cast<double>(mass[i]) * mass[j] * inv * inv * inv;
+            ax += f * dx;
+            ay += f * dy;
+            az += f * dz;
+        }
+    }
+    fx[i] = ax;
+    fy[i] = ay;
+    fz[i] = az;
+}
+
+// One deterministic reduction per rigid body. Member gravity stays in scratch:
+// contact force collection must not count it a second time.
+__global__ void reduce_clump_member_gravity(
+    ParticleSoA p, ClumpStateSoA cs, ClumpSegmentOffsets seg,
+    const double* fx, const double* fy, const double* fz,
     body_fitted_fmm::GravityBodyView view,
-    double* body_fx, double* body_fy, double* body_fz,
-    double* body_tx, double* body_ty, double* body_tz,
-    double G, double softening,
-    bool periodic_x, bool periodic_y, bool periodic_z,
-    double box_length_x, double box_length_y, double box_length_z) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= view.count) return;
-    const bool i_clump = view.kind[i] == body_fitted_fmm::GravityBodyKind::ClumpCoM;
-    const auto pi = load_view_body_p3(i, view, p, cs);
-    const body_fitted_fmm::ClumpVec3 xi{view.pos_x[i], view.pos_y[i], view.pos_z[i]};
-    for (int j = i + 1; j < view.count; ++j) {
-        const bool j_clump = view.kind[j] == body_fitted_fmm::GravityBodyKind::ClumpCoM;
-        if (!i_clump && !j_clump) continue;
-        const auto pj = load_view_body_p3(j, view, p, cs);
-        body_fitted_fmm::ClumpVec3 r{
-            view.pos_x[j] - xi.x, view.pos_y[j] - xi.y, view.pos_z[j] - xi.z};
-        if (periodic_x && box_length_x > 0.0) {
-            const double half = 0.5 * box_length_x;
-            if (r.x > half) r.x -= box_length_x; else if (r.x < -half) r.x += box_length_x;
+    double* bx, double* by, double* bz, double* tx, double* ty, double* tz,
+    bool normals_only = false) {
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= view.count || (normals_only && b >= view.normal_count)) return;
+    tx[b] = ty[b] = tz[b] = 0;
+    if (b < view.normal_count) {
+        const int i = seg.normal_begin + b;
+        view.pos_x[b] = p.pos_x[i];
+        view.pos_y[b] = p.pos_y[i];
+        view.pos_z[b] = p.pos_z[i];
+        view.mass[b] = (p.lifecycle_state && p.lifecycle_state[i] != 0) ? 0.0 : p.mass[i];
+        view.source_index[b] = i;
+        view.kind[b] = body_fitted_fmm::GravityBodyKind::NormalParticle;
+        bx[b] = fx[i];
+        by[b] = fy[i];
+        bz[b] = fz[i];
+    } else {
+        const int c = b - view.normal_count;
+        view.pos_x[b] = cs.com_x[c];
+        view.pos_y[b] = cs.com_y[c];
+        view.pos_z[b] = cs.com_z[c];
+        view.mass[b] = cs.mass[c];
+        view.source_index[b] = c;
+        view.kind[b] = body_fitted_fmm::GravityBodyKind::ClumpCoM;
+        double sx = 0, sy = 0, sz = 0, rx = 0, ry = 0, rz = 0;
+        const int begin = seg.member_begin + seg.seg_begin[c];
+        const int end = seg.member_begin + seg.seg_end[c];
+        for (int i = begin; i < end; ++i) {
+            const double dx = p.pos_x[i] - cs.com_x[c];
+            const double dy = p.pos_y[i] - cs.com_y[c];
+            const double dz = p.pos_z[i] - cs.com_z[c];
+            sx += fx[i];
+            sy += fy[i];
+            sz += fz[i];
+            rx += dy * fz[i] - dz * fy[i];
+            ry += dz * fx[i] - dx * fz[i];
+            rz += dx * fy[i] - dy * fx[i];
         }
-        if (periodic_y && box_length_y > 0.0) {
-            const double half = 0.5 * box_length_y;
-            if (r.y > half) r.y -= box_length_y; else if (r.y < -half) r.y += box_length_y;
-        }
-        if (periodic_z && box_length_z > 0.0) {
-            const double half = 0.5 * box_length_z;
-            if (r.z > half) r.z -= box_length_z; else if (r.z < -half) r.z += box_length_z;
-        }
-        body_fitted_fmm::ClumpVec3 fi{}, fj{};
-        body_fitted_fmm::clump_p3_pair_force(pi, pj, r, G, softening, fi, fj);
-        atomicAdd(&body_fx[i], fi.x); atomicAdd(&body_fy[i], fi.y); atomicAdd(&body_fz[i], fi.z);
-        atomicAdd(&body_fx[j], fj.x); atomicAdd(&body_fy[j], fj.y); atomicAdd(&body_fz[j], fj.z);
-        if (i_clump) {
-            const auto t = body_fitted_fmm::clump_p3_pair_torque(pi, pj, r, G, softening, true);
-            atomicAdd(&body_tx[i], t.x); atomicAdd(&body_ty[i], t.y); atomicAdd(&body_tz[i], t.z);
-        }
-        if (j_clump) {
-            const auto t = body_fitted_fmm::clump_p3_pair_torque(pi, pj, r, G, softening, false);
-            atomicAdd(&body_tx[j], t.x); atomicAdd(&body_ty[j], t.y); atomicAdd(&body_tz[j], t.z);
-        }
+        bx[b] = sx;
+        by[b] = sy;
+        bz[b] = sz;
+        tx[b] = rx;
+        ty[b] = ry;
+        tz[b] = rz;
+    }
+}
+
+// Large bodies use a block reduction instead of serial work proportional to
+// their complete population. Each block owns one wrench and writes it once.
+__global__ void reduce_aligned_clump_member_gravity(
+    ParticleSoA p, ClumpStateSoA cs, ClumpSegmentOffsets seg,
+    const double* fx, const double* fy, const double* fz,
+    body_fitted_fmm::GravityBodyView view,
+    double* bx, double* by, double* bz, double* tx, double* ty, double* tz) {
+    const int c = blockIdx.x;
+    __shared__ double sums[6][128];
+    double f[6] = {};
+    const int begin = seg.member_begin + seg.seg_begin[c];
+    const int end = seg.member_begin + seg.seg_end[c];
+    for (int i = begin + threadIdx.x; i < end; i += blockDim.x) {
+        const double dx = p.pos_x[i] - cs.com_x[c];
+        const double dy = p.pos_y[i] - cs.com_y[c];
+        const double dz = p.pos_z[i] - cs.com_z[c];
+        f[0] += fx[i]; f[1] += fy[i]; f[2] += fz[i];
+        f[3] += dy * fz[i] - dz * fy[i];
+        f[4] += dz * fx[i] - dx * fz[i];
+        f[5] += dx * fy[i] - dy * fx[i];
+    }
+    for (int k = 0; k < 6; ++k) sums[k][threadIdx.x] = f[k];
+    __syncthreads();
+    for (int offset = 64; offset; offset >>= 1) {
+        if (threadIdx.x < offset)
+            for (int k = 0; k < 6; ++k)
+                sums[k][threadIdx.x] += sums[k][threadIdx.x + offset];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const int b = view.normal_count + c;
+        view.pos_x[b] = cs.com_x[c]; view.pos_y[b] = cs.com_y[c]; view.pos_z[b] = cs.com_z[c];
+        view.mass[b] = cs.mass[c]; view.source_index[b] = c;
+        view.kind[b] = body_fitted_fmm::GravityBodyKind::ClumpCoM;
+        bx[b] = sums[0][0]; by[b] = sums[1][0]; bz[b] = sums[2][0];
+        tx[b] = sums[3][0]; ty[b] = sums[4][0]; tz[b] = sums[5][0];
     }
 }
 
@@ -455,6 +469,17 @@ __global__ void scatter_clump_gravity_body_kernel(
         atomicAdd(&out_fz[source],fz[body]); atomicAdd(&out_tx[source],tx[body]);
         atomicAdd(&out_ty[source],ty[body]); atomicAdd(&out_tz[source],tz[body]);
     }
+}
+
+__global__ void restore_checkpoint_clump_gravity_kernel(ClumpStateSoA cs) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cs.num_clumps) return;
+    cs.net_force_x[c] += cs.gravity_force_x[c];
+    cs.net_force_y[c] += cs.gravity_force_y[c];
+    cs.net_force_z[c] += cs.gravity_force_z[c];
+    cs.net_torque_x[c] += cs.gravity_torque_x[c];
+    cs.net_torque_y[c] += cs.gravity_torque_y[c];
+    cs.net_torque_z[c] += cs.gravity_torque_z[c];
 }
 
 // =============================================================================
@@ -1369,11 +1394,22 @@ AdaptiveFMMDepthDiagnostic export_adaptive_fmm_depth_diagnostic(
 
 struct ClumpGravityBodyBuffers {
     ::body_fitted_fmm::GravityBodyView view{};
-    float* fmm_mass = nullptr;
     double *fx=nullptr,*fy=nullptr,*fz=nullptr,*tx=nullptr,*ty=nullptr,*tz=nullptr;
     double* projection_scalars = nullptr;
+    int member_capacity=0;
+    double *member_x=nullptr,*member_y=nullptr,*member_z=nullptr;
+    float* member_mass=nullptr;
+    double *member_fx=nullptr,*member_fy=nullptr,*member_fz=nullptr,*root_size=nullptr;
+    int *safe=nullptr,*anchor=nullptr,*large_flags=nullptr;
 
-    explicit ClumpGravityBodyBuffers(int normal_count, int clump_count) {
+    explicit ClumpGravityBodyBuffers(int normal_count, int clump_count, int member_count) {
+        member_capacity=member_count;
+        const size_t mbytes=static_cast<size_t>(member_count)*sizeof(double);
+        CUDA_CHECK(cudaMalloc(&member_x,mbytes));CUDA_CHECK(cudaMalloc(&member_y,mbytes));CUDA_CHECK(cudaMalloc(&member_z,mbytes));
+        CUDA_CHECK(cudaMalloc(&member_mass,static_cast<size_t>(member_count)*sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&member_fx,mbytes));CUDA_CHECK(cudaMalloc(&member_fy,mbytes));CUDA_CHECK(cudaMalloc(&member_fz,mbytes));
+        CUDA_CHECK(cudaMalloc(&root_size,4*sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&large_flags,clump_count*sizeof(int)));CUDA_CHECK(cudaMalloc(&safe,sizeof(int)));CUDA_CHECK(cudaMalloc(&anchor,sizeof(int)));
         view.normal_count=normal_count; view.clump_count=clump_count;
         view.count=normal_count+clump_count;
         const size_t dbytes=static_cast<size_t>(view.count)*sizeof(double);
@@ -1381,16 +1417,17 @@ struct ClumpGravityBodyBuffers {
         CUDA_CHECK(cudaMalloc(&view.pos_z,dbytes)); CUDA_CHECK(cudaMalloc(&view.mass,dbytes));
         CUDA_CHECK(cudaMalloc(&view.source_index,static_cast<size_t>(view.count)*sizeof(int)));
         CUDA_CHECK(cudaMalloc(&view.kind,static_cast<size_t>(view.count)*sizeof(::body_fitted_fmm::GravityBodyKind)));
-        CUDA_CHECK(cudaMalloc(&fmm_mass,static_cast<size_t>(view.count)*sizeof(float)));
         CUDA_CHECK(cudaMalloc(&fx,dbytes)); CUDA_CHECK(cudaMalloc(&fy,dbytes)); CUDA_CHECK(cudaMalloc(&fz,dbytes));
         CUDA_CHECK(cudaMalloc(&tx,dbytes)); CUDA_CHECK(cudaMalloc(&ty,dbytes)); CUDA_CHECK(cudaMalloc(&tz,dbytes));
         CUDA_CHECK(cudaMalloc(&projection_scalars,CLUMP_GP_SCALARS*sizeof(double)));
     }
     ~ClumpGravityBodyBuffers() {
         cudaFree(view.pos_x); cudaFree(view.pos_y); cudaFree(view.pos_z); cudaFree(view.mass);
-        cudaFree(view.source_index); cudaFree(view.kind); cudaFree(fmm_mass);
+        cudaFree(view.source_index); cudaFree(view.kind);
         cudaFree(fx); cudaFree(fy); cudaFree(fz); cudaFree(tx); cudaFree(ty); cudaFree(tz);
         cudaFree(projection_scalars);
+        cudaFree(member_x);cudaFree(member_y);cudaFree(member_z);cudaFree(member_mass);
+        cudaFree(member_fx);cudaFree(member_fy);cudaFree(member_fz);cudaFree(root_size);cudaFree(safe);cudaFree(anchor);cudaFree(large_flags);
     }
     ClumpGravityBodyBuffers(const ClumpGravityBodyBuffers&)=delete;
     ClumpGravityBodyBuffers& operator=(const ClumpGravityBodyBuffers&)=delete;
@@ -1436,55 +1473,140 @@ void project_clump_gravity_bodies(ClumpGravityBodyBuffers& b, cudaStream_t strea
     CUDA_CHECK(cudaGetLastError());
 }
 
-void compute_registered_clump_bffmm_gravity(
+static DeviceStateArray<ClumpGravityBodyBuffers*> clump_member_buffers = {};
+
+void compute_registered_clump_member_gravity(
     SimulationState& state, ClumpStateSoA& cs, const ClumpSegmentOffsets& seg,
     const SimConfig& config, const PeriodicBoundaryConfig& pbc, bool outer,
     double evaluation_time, cudaStream_t stream) {
-    const int normal_count=seg.normal_end-seg.normal_begin;
-    ClumpGravityBodyBuffers b(normal_count,cs.num_clumps);
-    if(!::body_fitted_fmm::gravity_body_view_valid(b.view))
-        throw std::runtime_error("invalid compact clump gravity body view");
-    const int block=128,grid=(b.view.count+block-1)/block;
-    build_clump_gravity_body_view_kernel<<<grid,block,0,stream>>>(
-        state.particles,cs,seg.normal_begin,normal_count,b.view,b.fmm_mass);
+    if (config.physics != SimulationPhysics::DEM)
+        throw std::invalid_argument("member clump gravity requires DEM physics");
+    if (config.shear_box.enabled)
+        throw std::invalid_argument("member clump gravity does not support shear boxes");
+    if (seg.normal_begin != 0 || seg.member_begin != seg.normal_end ||
+        seg.member_end > state.particles.num_particles || seg.member_end < seg.member_begin ||
+        seg.num_segments != cs.num_clumps || !state.particles.clump_id) {
+        throw std::runtime_error("invalid registered live clump member ranges");
+    }
+    body_fitted_fmm::UnifiedFMMDispatcher::reset_aligned_clump_diagnostics();
+    const int count = seg.member_end, normal_count = seg.normal_end;
+    if (count == 0) return;
+    int gpu = 0;
+    CUDA_CHECK(cudaGetDevice(&gpu));
+    auto*& slot = clump_member_buffers[gpu];
+    if (!slot || slot->member_capacity < count ||
+        slot->view.normal_count != normal_count || slot->view.clump_count != cs.num_clumps) {
+        delete slot;
+        slot = nullptr;
+        slot = new ClumpGravityBodyBuffers(normal_count, cs.num_clumps, count);
+    }
+    auto& b = *slot;
+    const int block = 128, grid = (count + block - 1) / block;
+    CUDA_CHECK(cudaMemsetAsync(b.anchor, 0x7f, sizeof(int), stream));
+    find_clump_gravity_anchor<<<grid, block, 0, stream>>>(state.particles, count, b.anchor);
+    build_clump_member_gravity_view<<<grid, block, 0, stream>>>(
+        state.particles, count, b.anchor, b.member_x, b.member_y, b.member_z, b.member_mass);
     CUDA_CHECK(cudaGetLastError());
-    const size_t bytes=static_cast<size_t>(b.view.count)*sizeof(double);
-    CUDA_CHECK(cudaMemsetAsync(b.fx,0,bytes,stream)); CUDA_CHECK(cudaMemsetAsync(b.fy,0,bytes,stream));
-    CUDA_CHECK(cudaMemsetAsync(b.fz,0,bytes,stream)); CUDA_CHECK(cudaMemsetAsync(b.tx,0,bytes,stream));
-    CUDA_CHECK(cudaMemsetAsync(b.ty,0,bytes,stream)); CUDA_CHECK(cudaMemsetAsync(b.tz,0,bytes,stream));
 
-    SimulationState body_state;
-    body_state.current_step=state.current_step; body_state.current_time=state.current_time; body_state.dt=state.dt;
-    body_state.particles.num_particles=b.view.count; body_state.particles.num_local=b.view.count;
-    body_state.particles.capacity=b.view.count;
-    body_state.particles.pos_x=b.view.pos_x; body_state.particles.pos_y=b.view.pos_y; body_state.particles.pos_z=b.view.pos_z;
-    body_state.particles.mass=b.fmm_mass;
-    body_state.particles.force_x=b.fx; body_state.particles.force_y=b.fy; body_state.particles.force_z=b.fz;
-
-    // Normal-normal gravity follows the configured BFFMM hierarchy. Clump
-    // virtual bodies have zero FMM source/target mass, so no point-monopole
-    // interaction can duplicate the p3 cross pass below.
-    SimConfig fmm_config=config;
-    fmm_config.acceleration.unified_fmm.enable_global_projection=false;
-    body_fitted_fmm::UnifiedFMMDispatcher::compute(
-        body_state,fmm_config,body_state.neighbor,pbc,evaluation_time,stream,true);
-
-    const double G=config.acceleration.unified_fmm.gravitational_constant;
-    const double eps=config.particle.radius_min*config.acceleration.unified_fmm.softening_factor;
-    compute_clump_bffmm_cross_kernel<<<grid,block,0,stream>>>(
-        state.particles,cs,b.view,b.fx,b.fy,b.fz,b.tx,b.ty,b.tz,G,eps,
-        pbc.periodic_x,pbc.periodic_y,pbc.periodic_z,
-        pbc.box_length_x,pbc.box_length_y,pbc.box_length_z);
+    bool use_fmm = config.acceleration.gravity_method == SelfGravityMethod::BFFMM &&
+        !pbc.periodic_x && !pbc.periodic_y && !pbc.periodic_z && !config.shear_box.enabled &&
+        config.acceleration.unified_fmm.tree_dimension == 3 &&
+        config.acceleration.unified_fmm.tree_depth >= 2 &&
+        config.acceleration.unified_fmm.tree_depth <= 20;
+    const bool aligned_eligible = use_fmm;
+    if (use_fmm) {
+        CUDA_CHECK(cudaMemsetAsync(b.safe, 1, sizeof(int), stream));
+        clump_gravity_root_size<<<1, 256, 0, stream>>>(
+            b.member_x, b.member_y, b.member_z, count, b.root_size);
+        classify_clump_member_gravity<<<(cs.num_clumps + 3) / 4, block, 0, stream>>>(
+            state.particles, cs, seg, b.root_size, config.acceleration.unified_fmm.tree_depth, b.safe, b.large_flags);
+        int safe = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&safe, b.safe, sizeof(safe), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        use_fmm = safe != 0;
+    }
+    const bool use_aligned = aligned_eligible && !use_fmm;
+    // Minimum-image pair forces can have nonzero orbital torque when measured
+    // in one Euclidean periodic cell. A global angular projection would change
+    // those physical pair forces. DIRECT also retains its unprojected model.
+    const bool apply_projection =
+        config.acceleration.unified_fmm.enable_global_projection &&
+        config.acceleration.gravity_method == SelfGravityMethod::BFFMM &&
+        !pbc.periodic_x && !pbc.periodic_y && !pbc.periodic_z;
+    if (std::getenv("GRANIT_CLUMP_GRAVITY_DIAGNOSTICS")) {
+        std::fprintf(stderr,
+            "[Clump gravity] mode=%s members_and_normals=%d clumps=%d "
+            "depth=%d projection=%d outer=%d\n",
+            use_fmm ? "member_fmm" : (use_aligned ? "aligned_components" : "member_direct"), count, cs.num_clumps,
+            config.acceleration.unified_fmm.tree_depth,
+            static_cast<int>(apply_projection),
+            static_cast<int>(outer));
+    }
+    const size_t bytes = static_cast<size_t>(count) * sizeof(double);
+    CUDA_CHECK(cudaMemsetAsync(b.member_fx, 0, bytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(b.member_fy, 0, bytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(b.member_fz, 0, bytes, stream));
+    if (use_fmm || use_aligned) {
+        SimulationState members;
+        members.current_step = state.current_step;
+        members.current_time = state.current_time;
+        members.dt = state.dt;
+        members.particles.num_particles = count;
+        members.particles.num_local = count;
+        members.particles.capacity = count;
+        members.particles.pos_x = b.member_x;
+        members.particles.pos_y = b.member_y;
+        members.particles.pos_z = b.member_z;
+        members.particles.mass = b.member_mass;
+        members.particles.force_x = b.member_fx;
+        members.particles.force_y = b.member_fy;
+        members.particles.force_z = b.member_fz;
+        SimConfig fmm_config = config;
+        fmm_config.acceleration.unified_fmm.enable_global_projection = false;
+        if (use_aligned) {
+            body_fitted_fmm::UnifiedFMMDispatcher::compute_aligned_clumps(
+                members, fmm_config, cs.num_clumps, seg.member_begin,
+                seg.seg_begin, seg.seg_end, state.particles.clump_id,
+                b.large_flags, b.root_size, stream);
+        } else {
+            body_fitted_fmm::UnifiedFMMDispatcher::compute(
+                members, fmm_config, members.neighbor, pbc, evaluation_time,
+                stream, false, state.particles.clump_id);
+        }
+    } else {
+        // The selected method owns G even when BFFMM dispatches its temporary
+        // direct fallback. Registered clump gravity uses the same Plummer eps
+        // for both methods; direct.sph_softening_mode applies only to SPH.
+        const double G = config.acceleration.gravity_method == SelfGravityMethod::DIRECT
+            ? config.acceleration.direct_gravity.gravitational_constant
+            : config.acceleration.unified_fmm.gravitational_constant;
+        const double eps = config.particle.radius_min *
+                           config.acceleration.unified_fmm.softening_factor;
+        compute_clump_member_direct_gravity<<<grid, block, 0, stream>>>(
+            b.member_x, b.member_y, b.member_z, b.member_mass, state.particles.clump_id,
+            count, b.member_fx, b.member_fy, b.member_fz, G, eps,
+            pbc.periodic_x, pbc.periodic_y, pbc.periodic_z,
+            pbc.box_length_x, pbc.box_length_y, pbc.box_length_z);
+    }
+    const int body_grid = (b.view.count + block - 1) / block;
+    reduce_clump_member_gravity<<<body_grid, block, 0, stream>>>(
+        state.particles, cs, seg, b.member_fx, b.member_fy, b.member_fz,
+        b.view, b.fx, b.fy, b.fz, b.tx, b.ty, b.tz, use_aligned);
+    if (use_aligned) {
+        reduce_aligned_clump_member_gravity<<<cs.num_clumps, 128, 0, stream>>>(
+            state.particles, cs, seg, b.member_fx, b.member_fy, b.member_fz,
+            b.view, b.fx, b.fy, b.fz, b.tx, b.ty, b.tz);
+    }
     CUDA_CHECK(cudaGetLastError());
-    project_clump_gravity_bodies(b,stream);
-    if(outer)
-        scatter_clump_gravity_body_kernel<true><<<grid,block,0,stream>>>(
-            b.view,state.particles,cs,b.fx,b.fy,b.fz,b.tx,b.ty,b.tz);
-    else
-        scatter_clump_gravity_body_kernel<false><<<grid,block,0,stream>>>(
-            b.view,state.particles,cs,b.fx,b.fy,b.fz,b.tx,b.ty,b.tz);
+    if (apply_projection) project_clump_gravity_bodies(b, stream);
+    if (outer) {
+        scatter_clump_gravity_body_kernel<true><<<body_grid, block, 0, stream>>>(
+            b.view, state.particles, cs, b.fx, b.fy, b.fz, b.tx, b.ty, b.tz);
+    } else {
+        scatter_clump_gravity_body_kernel<false><<<body_grid, block, 0, stream>>>(
+            b.view, state.particles, cs, b.fx, b.fy, b.fz, b.tx, b.ty, b.tz);
+    }
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 } // namespace
@@ -1709,20 +1831,8 @@ void AccelerationManager::compute_self_gravity(
         if (config.acceleration.unified_fmm.adaptive_depth.enabled)
             throw std::invalid_argument(
                 "adaptive unified_fmm tree depth is not supported for clump gravity");
-        if (config.acceleration.gravity_method == SelfGravityMethod::DIRECT) {
-            compute_registered_clump_direct_gravity(
-                state,*clump_runtime_state_,*clump_runtime_segments_,config,false,stream);
-        } else {
-            const int body_count=(clump_runtime_segments_->normal_end-clump_runtime_segments_->normal_begin)
-                               +clump_runtime_state_->num_clumps;
-            int g=0; cudaGetDevice(&g);
-            if(!fmm_initialized_[g]) {
-                body_fitted_fmm::UnifiedFMMDispatcher::initialize(config,body_count);
-                fmm_initialized_[g]=true;
-            }
-            compute_registered_clump_bffmm_gravity(
-                state,*clump_runtime_state_,*clump_runtime_segments_,config,pbc,false,evaluation_time,stream);
-        }
+        compute_registered_clump_member_gravity(
+            state,*clump_runtime_state_,*clump_runtime_segments_,config,pbc,false,evaluation_time,stream);
         return;
     }
 
@@ -1744,6 +1854,21 @@ void AccelerationManager::compute_self_gravity(
             SelfGravityDispatcher::compute(state, config, pbc, evaluation_time, stream);
             return;
     }
+}
+
+AlignedClumpGravityDiagnostics AccelerationManager::get_aligned_clump_gravity_diagnostics() {
+    return body_fitted_fmm::UnifiedFMMDispatcher::aligned_clump_diagnostics();
+}
+
+void AccelerationManager::restore_checkpoint_clump_gravity(
+    SimulationState& state, const SimConfig& config,
+    double evaluation_time, cudaStream_t stream) {
+    if (!clump_runtime_state_ || clump_runtime_state_->num_clumps == 0 ||
+        !self_gravity_config.enabled) return;
+    compute_outer_gravity(state, config, evaluation_time, stream);
+    const int block = 128, grid = (clump_runtime_state_->num_clumps + block - 1) / block;
+    restore_checkpoint_clump_gravity_kernel<<<grid, block, 0, stream>>>(*clump_runtime_state_);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void AccelerationManager::compute_outer_gravity(
@@ -1774,19 +1899,8 @@ void AccelerationManager::compute_outer_gravity(
         CUDA_CHECK(cudaMemsetAsync(clump_runtime_state_->gravity_torque_x,0,clump_bytes,stream));
         CUDA_CHECK(cudaMemsetAsync(clump_runtime_state_->gravity_torque_y,0,clump_bytes,stream));
         CUDA_CHECK(cudaMemsetAsync(clump_runtime_state_->gravity_torque_z,0,clump_bytes,stream));
-        if(config.acceleration.gravity_method==SelfGravityMethod::BFFMM) {
-            const int body_count=normal_count+clump_runtime_state_->num_clumps;
-            int g=0;cudaGetDevice(&g);
-            if(!fmm_initialized_[g]) {
-                body_fitted_fmm::UnifiedFMMDispatcher::initialize(config,body_count);
-                fmm_initialized_[g]=true;
-            }
-            compute_registered_clump_bffmm_gravity(
-                state,*clump_runtime_state_,*clump_runtime_segments_,config,pbc,true,evaluation_time,stream);
-        } else {
-            compute_registered_clump_direct_gravity(
-                state,*clump_runtime_state_,*clump_runtime_segments_,config,true,stream);
-        }
+        compute_registered_clump_member_gravity(
+            state,*clump_runtime_state_,*clump_runtime_segments_,config,pbc,true,evaluation_time,stream);
         return;
     }
 
@@ -1889,6 +2003,7 @@ void AccelerationManager::shutdown() {
         cudaFree(shear_direct_diagnostic_[gpu]);
         shear_direct_diagnostic_[gpu] = nullptr;
     }
+    for(int gpu=0;gpu<clump_member_buffers.size();++gpu){if(clump_member_buffers[gpu]){cudaSetDevice(gpu);delete clump_member_buffers[gpu];clump_member_buffers[gpu]=nullptr;}}
     cudaSetDevice(saved_gpu);
     fmm_initialized_.fill(false);
     // Each manager remembers its owning device.  Unbound slots require no

@@ -93,6 +93,32 @@ struct AccelerationTypeTraits<AccelerationType::FIELD_3D> {
 // Self-Gravity Configuration
 // =============================================================================
 
+// Last completed aligned-tree evaluation on the current GPU. Counts describe
+// real component/union contexts; source audit violations must remain zero.
+struct AlignedClumpGravityDiagnostics {
+    uint64_t epoch = 0;
+    bool used = false;
+    int component_count = 0, large_count = 0, green_members = 0, live_members = 0;
+    double root_min_x = 0, root_min_y = 0, root_min_z = 0, root_size = 0;
+    int depth = 0;
+    uint64_t target_node_count = 0, source_node_count = 0;
+    uint64_t m2l_route_count = 0, p2p_route_count = 0;
+    uint64_t alignment_checked_count = 0, alignment_violation_count = 0;
+    uint64_t self_exclusion_checked_count = 0;
+    uint64_t self_source_coefficient_violations = 0;
+    // Compatibility alias for coefficient audit violations, not geometric
+    // routes: a union source cell may contain excluded members with zero
+    // contribution to its target-specific source expansion.
+    uint64_t self_source_route_count = 0;
+    uint64_t context_remap_count = 0, index_remap_checked_count = 0;
+    // Conservative upper estimate for retained capacities, not measured VRAM.
+    uint64_t reserved_bytes = 0;
+    // Canonical live-prefix forces before body projection. Read-only; valid
+    // until the next registered evaluation or AccelerationManager shutdown.
+    const double *member_force_x = nullptr, *member_force_y = nullptr, *member_force_z = nullptr;
+    int member_force_count = 0;
+};
+
 struct SelfGravityConfig {
     bool enabled;
     float softening;           // Softening parameter (meters)
@@ -264,6 +290,14 @@ public:
         double evaluation_time,
         cudaStream_t stream = 0
     );
+
+    // Restore only the clump gravity portion absent from member checkpoint
+    // force rows. Normal checkpoint forces already retain their full force.
+    static AlignedClumpGravityDiagnostics get_aligned_clump_gravity_diagnostics();
+
+    static void restore_checkpoint_clump_gravity(
+        SimulationState& state, const SimConfig& config,
+        double evaluation_time, cudaStream_t stream = 0);
 
     // Compute all non-gravity accelerations: inertial, tidal, fields, YORP.
     // Does NOT call compute_self_gravity.
