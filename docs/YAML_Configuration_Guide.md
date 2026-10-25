@@ -148,7 +148,7 @@ coefficient-scale tolerance of `1e-9`); inconsistent overrides are rejected.
 Checkpoint comparisons additionally allow the FP32 body-offset quantization
 bound `8*r*epsilon_float*M*R^r` for moment rank `r > 0`.
 
-The first BFFMM stage places all live members and normal particles in the
+The small-clump BFFMM path places all live members and normal particles in the
 ordinary global Karras tree when every clump satisfies `2R < h_leaf`, with a
 floating-point margin. Here `R` bounds member spheres about their clump CoM,
 and `h_leaf` uses the exact current dynamic root extent and configured depth.
@@ -157,14 +157,46 @@ pairs remain in near routes and are filtered there. Distant interactions still
 use M2L. Its far kernel remains the existing Newtonian FMM approximation;
 nonzero Plummer softening applies in P2P.
 
-If any clump fails the size condition, this stage evaluates the entire live
-population with direct member gravity. Periodic runs also use direct member
-gravity with minimum-image displacement and no global projection, because
-periodic pair forces need not have zero Euclidean-cell orbital torque. 2D
-trees use the direct fallback.
-Adaptive depth and shear boxes remain unsupported for clumps. A later aligned
-branch-tree stage will replace the large-clump fallback. Set
+If any clump fails the size condition, BFFMM builds independent globally
+aligned Karras contexts: one green population containing ordinary particles
+and certified small-clump members, and one blue population for each large
+clump. Each context has its own upward moments and target local expansions,
+using the same current padded root and configured depth. An additional union
+geometry provides the source-cell topology and canonical particle ordering.
+Component moments merge by `(level, Morton)` at every common cell, including
+coarse ancestors. There is no second M2M after this addition.
+
+Green targets use all components. Each blue target uses a freshly cleared
+source workspace summed from green and every other blue component; its entire
+own component is omitted before M2L. This constructs the external field without
+subtracting a large self-field. Cross-context P2P uses original canonical
+particle indices and excludes same-clump pairs. Near rows remain P2P even when
+green and blue occupy the same spatial cells. Large-body force and torque
+reduction runs cooperatively on the GPU.
+
+Tree contexts, maps, workspaces and operators are cached per GPU. A conservative
+memory preflight includes retained capacities and rejects oversized requests
+explicitly. Target populations are evaluated sequentially; the cost grows with
+the number of large clumps. This implementation targets the case where large
+clumps are uncommon. The read-only aligned diagnostics report actual context
+alignment, remaps, interaction counts and excluded-source coefficient audits.
+The reserve report includes generic workspace estimates and headroom, rather
+than measured VRAM. Admission is a heuristic memory screen; checked CUDA
+allocations remain authoritative. Cached aligned trees persist during subsequent
+all-small evaluations until shutdown.
+
+Periodic runs retain direct member gravity with minimum-image displacement
+and no global projection, because periodic pair forces need not have zero
+Euclidean-cell orbital torque. 2D trees also retain the direct fallback.
+Adaptive depth and shear boxes remain unsupported for clumps. Set
 `GRANIT_CLUMP_GRAVITY_DIAGNOSTICS=1` to print the selected evaluation path.
+
+Both BFFMM paths retain the existing p4 approximation and shipped theta=0.8
+operators. Member-force and torque reduction correctness does not establish a
+uniform force or resultant-torque accuracy target: force errors of order one
+percent and larger conditioned torque errors occur in the recorded validation
+cases. Inspect raw per-body errors and torque conditioning for the intended
+configuration.
 
 `unified_fmm.enable_global_projection` controls the final body-level force
 projection for nonperiodic BFFMM evaluations; its default remains true, and

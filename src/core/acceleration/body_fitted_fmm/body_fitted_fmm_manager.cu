@@ -732,6 +732,8 @@ static void preload_post_scheduler_kernels()
 
 namespace body_fitted_fmm {
 
+static void release_aligned_clump_pool(int gpu);
+
 // Static member definitions — per-GPU arrays
 static ::cudadem::DeviceStateArray<fmm::FMMHostData> host_data_;
 static ::cudadem::DeviceStateArray<fmm::FMMDeviceData> device_data_;
@@ -2500,6 +2502,7 @@ void UnifiedFMMDispatcher::initialize_adaptive(
 
 void UnifiedFMMDispatcher::shutdown() {
     int gpu_id = current_gpu();
+    release_aligned_clump_pool(gpu_id);
     shear_reclaimable_bytes_[gpu_id] = 0;
     if (!initialized_[gpu_id]) {
         if (!distributed_fmm_[gpu_id].evaluating) shear_census_workspace_[gpu_id].reset();
@@ -2548,6 +2551,7 @@ void UnifiedFMMDispatcher::shutdown() {
 
 void UnifiedFMMDispatcher::shutdown_all() {
     for (int g = 0; g < initialized_.size(); ++g) {
+        release_aligned_clump_pool(g);
         if (initialized_[g]) {
             CUDA_CHECK(cudaSetDevice(g));
             if (persistent_tree_runtime_[g].adaptive_options.enabled &&
@@ -2682,6 +2686,8 @@ static void run_m2l_phase(int gpu_id, cudaStream_t stream)
 #endif
 }
 
+
+#include "aligned_clump_fmm.cuh"
 
 // =============================================================================
 // Helper: Run P2P phase (inner — writes to force_*)

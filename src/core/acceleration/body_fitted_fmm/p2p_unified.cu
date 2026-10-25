@@ -458,6 +458,7 @@ struct GroupedParticleSources {
     const float* mass;
     const int* order;
     bool remote;
+    const int* target_canonical = nullptr;
 };
 
 template<int D, bool OUTER, class Compute = p2p_compute_t>
@@ -590,13 +591,13 @@ __device__ __forceinline__ void fmm_p2p_grouped_leaf_body(
             Compute ax = 0, ay = 0, az = 0;
             if (metadata->active_tree == 2) {
                 grouped_p2p_leaf_routes<2, OUTER>(
-                    leaf, actual_nodes, active, target_mask, sources.remote ? -1 : orig_i, xi, yi, zi, mi, ax, ay, az, arena,
+                    leaf, actual_nodes, active, target_mask, (active && sources.target_canonical) ? sources.target_canonical[orig_i] : (sources.remote ? -1 : orig_i), xi, yi, zi, mi, ax, ay, az, arena,
                     nodes, sources.nodes, sources.children, sources.x, sources.y, sources.z, sources.mass, sources.order,
                     lane, sh_pos_x[warp], sh_pos_y[warp], sh_pos_z[warp],
                     sh_mass[warp], G, softening_sq, cutoff_sq, gravity_clump_ids);
             } else {
                 grouped_p2p_leaf_routes<3, OUTER>(
-                    leaf, actual_nodes, active, target_mask, sources.remote ? -1 : orig_i, xi, yi, zi, mi, ax, ay, az, arena,
+                    leaf, actual_nodes, active, target_mask, (active && sources.target_canonical) ? sources.target_canonical[orig_i] : (sources.remote ? -1 : orig_i), xi, yi, zi, mi, ax, ay, az, arena,
                     nodes, sources.nodes, sources.children, sources.x, sources.y, sources.z, sources.mass, sources.order,
                     lane, sh_pos_x[warp], sh_pos_y[warp], sh_pos_z[warp],
                     sh_mass[warp], G, softening_sq, cutoff_sq, gravity_clump_ids);
@@ -651,6 +652,37 @@ void launch_p2p_grouped_leaves(
         dd.sorted_to_original, static_cast<p2p_compute_t>(G),
         static_cast<p2p_compute_t>(softening), gravity_clump_ids);
     }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+
+__global__ void fmm_p2p_cross_leaf_kernel(
+    GroupedInteractionArena arena, const PersistentTreeMetadata* metadata,
+    const UnifiedNode* targets, const int* target_children, int capacity,
+    const double* x, const double* y, const double* z, const float* mass,
+    double* fx, double* fy, double* fz, const int* target_order,
+    GroupedParticleSources sources, const int* clump_ids,
+    p2p_compute_t G, p2p_compute_t eps) {
+    fmm_p2p_grouped_leaf_body<false>(
+        arena, metadata, targets, target_children, capacity, x, y, z, mass,
+        fx, fy, fz, target_order, G, eps, sources, clump_ids);
+}
+
+void launch_p2p_cross_leaves(
+    const fmm::FMMDeviceData& target, const GroupedInteractionArena& arena,
+    const PersistentTreeMetadata* metadata, int capacity,
+    const double* x, const double* y, const double* z, const float* mass,
+    double* fx, double* fy, double* fz, const int* target_canonical,
+    const fmm::FMMDeviceData& source,
+    const double* sx, const double* sy, const double* sz, const float* sm,
+    const int* clump_ids, double G, double eps, cudaStream_t stream) {
+    const GroupedParticleSources sources{
+        source.unified_nodes, source.children_compact, sx, sy, sz, sm,
+        source.sorted_to_original, false, target_canonical};
+    fmm_p2p_cross_leaf_kernel<<<2048, 128, 0, stream>>>(
+        arena, metadata, target.unified_nodes, target.children_compact, capacity,
+        x, y, z, mass, fx, fy, fz, target.sorted_to_original, sources, clump_ids,
+        static_cast<p2p_compute_t>(G), static_cast<p2p_compute_t>(eps));
     CUDA_CHECK(cudaGetLastError());
 }
 

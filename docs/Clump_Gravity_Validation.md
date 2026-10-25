@@ -191,4 +191,187 @@ with their original results rather than overwritten as passes.
 
 ## Stage 2: aligned large-clump trees
 
-Pending implementation and separate validation after the stage-1 checkpoint.
+Implemented after stage 1 was validated, benchmarked, and committed as
+`6cd592347adc86ad85f492759169c331e18ef8ab`.
+
+### Tree ownership and evaluation
+
+The green Karras tree contains ordinary particles and small-clump members. Each
+large clump has its own blue Karras tree. All components use the same current
+root origin, root width, depth, and aligned cell centers; their occupied cells
+may overlap. Each component computes its own P2M/M2M coefficients.
+
+A union tree supplies the common source topology. Component coefficients are
+added into matching `(level, Morton key)` cells at every level, including their
+shared coarse parents. There is no second upward pass over already-merged
+coefficients. For a blue target, this sum includes only other components; its own
+coefficients are never added. This avoids subtracting a large internal field from
+a small external field. Green targets use all source components. Near P2P checks
+canonical particle indices and excludes same-clump pairs.
+
+Target locals and downward propagation remain private to each component. Source
+node/child indices belong to the union tree; target ancestry belongs to the
+component tree. The result is scattered once to each canonical member row, then
+reduced as `sum(F_i)` and `sum((x_i-COM) cross F_i)`. A block cooperatively reduces
+each clump when the aligned path is active. The all-small route continues using
+the stage-1 tree and reduction.
+
+The pool caches capacity per GPU and shares one immutable G table across aligned
+components. Allocation preflight reports an estimated reserve and fails explicitly
+on its memory budget; it does not silently select direct summation. Periodic and
+2D registered-clump cases retain direct evaluation. The aligned route requires
+fixed-depth, single-GPU, nonperiodic 3D DEM. Adaptive depth remains unsupported.
+
+### Verification and precision limits
+
+The FP64 standard and expanded implementation contracts pass. Tests cover an
+isolated large clump, mixed green/blue populations, overlapping large clumps,
+shared occupied cells, unequal component sizes, dead rows, partial P2P tiles,
+near-only interactions, populated M2L, depths 2 and 12, and both gravity APIs.
+A same-process fixture changes the number of large clumps through **2 → 1 → 0 → 2**,
+checking both pool reuse and the return from the ordinary dispatcher. Ordinary
+all-small, differing-G, periodic, and checkpoint-helper regressions also pass.
+
+For populated far-field fixtures with thresholds 0/0, the cancellation-free
+ordinary-FMM control uses the identical union geometry and zeros only the target
+clump's source masses. Canonical member forces agree within about `5e-15` in the
+expanded FP64 fixtures, and body force/torque reductions agree at roundoff.
+Same-clump source coefficients, cell alignment, remapping, actual interaction
+routes, and member output counts are checked independently. This verifies the
+aligned decomposition against the existing FMM operator, while retaining its
+approximation error relative to direct gravity.
+
+Production uninterrupted/resumed trajectories pass for DIRECT/FMM and update
+rates 1/2 with large clumps. A separate no-green case (two clumps, eight members,
+zero ordinary particles) also passes all four combinations. A traced production
+run confirms `mode=aligned_components`. These short restart tests establish
+restart consistency, not long-time rotational accuracy.
+
+Both standard CTest contracts pass in FP64 and the default `TF32_TC`/FP32 build.
+The expanded default-precision suite has **retained failures** at the original
+`1e-6` near/member-comparison tolerance:
+
+* Near-only two-clump/1024-members-each: worst member error `2.65610e-6`;
+  clump force and moment-normalized torque errors are `3.63e-7` and `4.30e-7`.
+  An ordinary INNER P2P control produces **bit-identical member forces** and the
+  same CPU-reference error. Thus this failure comes from inherited FP32 P2P
+  arithmetic. Switching only P2P to FP64 reduces the worst member error to `2.96e-15`.
+* Far-field canonical-member comparisons reach `1.02e-6`, `1.30e-6`, and
+  `1.96e-6` in the expanded many/overlap/shared-cell cases. With TF32 M2L retained
+  and only P2P changed to FP64, these differences fall to `2.27e-7`, `2.51e-7`, and
+  `1.87e-7`. P2P arithmetic therefore contributes most of the discrepancy, but
+  this experiment does not isolate the remaining residual. The diagnostic
+  FP64-P2P build fails its stricter `1e-10` comparison gate for those far cases.
+* The 256-member reclassification fixture also retains a roughly `1.12e-6`
+  member error in its large-clump phases. All corresponding structure checks pass.
+
+No threshold was relaxed and the production precision defaults were unchanged.
+Original CPU-reference FMM accuracy targets also remain failed where reported.
+The expanded depth-12 mixed fixture reaches **12.52% worst body/member force
+error** against direct gravity, while matching the ordinary FMM control within
+`1.96e-16`. The percent-level benchmark errors below are geometry-specific, not
+a uniform bound over the validation matrix.
+
+Compute Sanitizer memcheck reports **zero errors** for 33-member, three-clump
+overlap tests in both precisions, and FP64 reclassification. Checks use padding
+256 and error exit code 99, with no kernel filtering. `--report-api-errors explicit`
+retains user-facing CUDA API errors while avoiding the extended internal logging
+mode: the frozen stage-1 executable reports three CUB kernel-registration messages
+in extended mode, preserved in its original log. These checks cover device memory
+access, not every race or synchronization hazard.
+
+### Matched stage-2 benchmarks
+
+Same A100 and FP64 build settings as above; depth 5, thresholds 0/0, raw forces,
+3 warmups and 20 samples. Each pair uses the same final harness and geometry.
+The stage-1 comparator links the frozen stage-1 production objects, which use
+member-direct fallback whenever a large clump is present. Stage 2 uses the
+aligned trees. Thus these timings compare different accuracy/cost choices.
+The large-clump benchmark places small-clump centers on a bounded grid so growing
+their count does not change the intended large/small classification.
+
+| Total rows | Small clumps | Large clumps × members | Stage 1 direct fallback | Stage 2 aligned | Direct reference |
+|---:|---:|---:|---:|---:|---|
+| 512 | 8 | 1 × 64 | 0.386 ms | 2.972 ms | Yes |
+| 2048 | 64 | 1 × 256 | 1.145 ms | 3.772 ms | Yes |
+| 8192 | 256 | 1 × 1024 | 4.404 ms | 6.248 ms | Yes |
+| 32768 | 2048 | 1 × 1024 | 17.479 ms | 12.782 ms | No, timing only |
+| 131072 | 8192 | 1 × 1024 | 181.305 ms | 16.811 ms | No, timing only |
+| 32768 | 2048 | 2 × 1024 | 17.495 ms | 14.025 ms | No, timing only |
+| 32768 | 2048 | 8 × 256 | 17.200 ms | 21.123 ms | No, timing only |
+
+With one large clump, the measured speedup is **1.37× at 32768 rows** and **10.78×
+at 131072 rows**; smaller fixtures favor direct evaluation. Eight large clumps
+are slower here. Target branches run sequentially, rebuilding their source sums
+and auditing exclusion. For `L` large targets, `K` components, and `U` union nodes,
+the always-on full-coefficient exclusion audit costs `O(L (K-1) U)`; this grows
+quadratically with large-clump count when `K` grows with `L`. Cross-P2P still
+visits own-clump near candidates before filtering their IDs. These costs are
+included in the measurements and favor the intended rare-large-clump regime.
+The two-versus-eight comparison has equal large-member totals but different
+spatial distributions; it is not an isolated measurement of clump-count scaling.
+With projection enabled, the 32768-row/one-large pair is 18.151 ms versus 13.470 ms.
+
+For the verified 512/2048/8192-row aligned benchmarks, respectively:
+
+| Rows | Body force RMS | Worst body force | Worst clump force | Worst clump torque / moment scale |
+|---:|---:|---:|---:|---:|
+| 512 | 0.3998% | 1.8015% | 0.6193% | 0.1035% |
+| 2048 | 0.2405% | 1.5107% | 0.4904% | 0.06784% |
+| 8192 | 0.2342% | 1.7281% | 0.9154% | 0.2108% |
+
+The corresponding stage-1 direct forces agree with the CPU oracle within
+`8e-15`. With production thresholds 16/64 at 2048 rows, aligned FP64 gives
+1.1667% worst body force, 0.4238% worst clump force, and 0.03509%
+worst moment-normalized torque error. The stage-1 discussion of cancellation and
+resultant torque remains applicable; these fixtures do not guarantee accuracy
+for arbitrary clump geometry.
+
+All-small paired medians preserve the existing path:
+
+| Rows / small clumps | Frozen stage 1 | Stage 2 |
+|---:|---:|---:|
+| 2048 / 64 | 2.295 ms | 2.311 ms |
+| 8192 / 256 | 4.197 ms | 4.263 ms |
+| 32768 / 2048 | 10.700 ms | 10.684 ms |
+
+The first two pairs have identical reported force/torque errors; the final pair
+is timing-only with matching populated tree/task metadata. Observed timing changes
+range from -0.15% to +1.56%, with no large regression in these cases.
+
+The reported aligned-pool reserve is an **estimate, not measured peak VRAM**:
+about 334 MiB for the 32768-row/one-large case, 400 MiB at 131072 rows, and
+819 MiB for the eight-large case. The generic estimator includes per-context
+64 MiB headroom, a legacy-tree allowance, and arrays unused by the source-only
+union, plus a shared 32 MiB allowance. It excludes other solver storage and uses
+heuristic workspace estimates. Preflight adds the previous estimate back to free
+memory, so admission is a heuristic screen; checked CUDA allocations determine
+whether the request actually fits. An all-small evaluation retains a previously
+allocated aligned pool until shutdown. Aligned first calls in these benchmarks take approximately 53–99 ms; warmed timings should not
+be substituted for initialization cost.
+
+### Reproduction and evidence
+
+```bash
+CUDA_VISIBLE_DEVICES=1 <build>/bin/granit_clump_gravity_test \
+  --case aligned_all --method both --implementation-check --json <new-results.jsonl>
+CUDA_VISIBLE_DEVICES=1 <build>/bin/granit_clump_gravity_test \
+  --case aligned_many --members-per-large 1024 --large-clumps 2 \
+  --method both --implementation-check --json <new-results.jsonl>
+CUDA_VISIBLE_DEVICES=1 <build>/bin/granit_clump_gravity_test \
+  --case aligned_benchmark --size 32768 --small-clumps 2048 \
+  --large-clumps 1 --members-per-large 1024 --method bffmm \
+  --benchmark --warmup 3 --repeats 20 --no-verify --json <new-results.jsonl>
+CUDA_VISIBLE_DEVICES=1 python3 components/tests/unit_test/body_fitted_fmm/clump_restart.py \
+  --executable <build>/bin/granit_dem --output-dir <new-directory> --large
+```
+
+Evidence under `stage2/`: `stable-full-fp64.jsonl`, `validation-fp64/`,
+`validation-default/`, `precision-near-1024.jsonl`, `final-checks/`,
+`restart-large/`, `restart-no-green/`, and `benchmarks-fp64/`. Commands and binary
+hashes accompany the matrices and benchmarks. `stage1-comparator-v2/` records the
+common-harness build and hashes of every frozen production object.
+`final-checks/` supersedes the earlier two 2048-row benchmark diagnostics after
+the bounded-grid fixture correction. Earlier failures and build diagnostics remain
+preserved. `manifest.json` records final source/binary hashes and report status;
+`scripts/` contains campaign reproduction drivers.

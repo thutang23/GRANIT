@@ -247,19 +247,25 @@ __global__ void clump_gravity_root_size(
                         fmax(hi[1][0] - lo[1][0], hi[2][0] - lo[2][0]));
         if (e < 1e-30) e = 1.0;
         const double pad = e * 0.01;
-        *root = e + 2.0 * pad;
+        root[0] = e + 2.0 * pad;
+        root[1] = lo[0][0] - pad;
+        root[2] = lo[1][0] - pad;
+        root[3] = lo[2][0] - pad;
     }
 }
 
 __global__ void classify_clump_member_gravity(
     ParticleSoA p, ClumpStateSoA cs, ClumpSegmentOffsets seg,
-    const double* root, int depth, int* safe) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const double* root, int depth, int* safe, int* large_flags) {
+    // Four clumps per block, one warp per clump. Small bodies avoid a whole
+    // block; large populations are tiled cooperatively over their warp.
+    const int c = blockIdx.x * 4 + (threadIdx.x >> 5);
     if (c >= cs.num_clumps) return;
+    const int lane = threadIdx.x & 31;
     double radius = 0;
     const int begin = seg.member_begin + seg.seg_begin[c];
     const int end = seg.member_begin + seg.seg_end[c];
-    for (int i = begin; i < end; ++i) {
+    for (int i = begin + lane; i < end; i += 32) {
         if (p.lifecycle_state && p.lifecycle_state[i] != 0) continue;
         const double dx = p.pos_x[i] - cs.com_x[c];
         const double dy = p.pos_y[i] - cs.com_y[c];
@@ -267,10 +273,13 @@ __global__ void classify_clump_member_gravity(
         radius = fmax(radius, sqrt(dx * dx + dy * dy + dz * dz) +
                               static_cast<double>(p.radius[i]));
     }
-    const double h = ldexp(*root, -depth);
-    // Leave a floating-point margin for quantization at an exact cell border.
-    if (!(2.0 * radius < h * (1.0 - 64.0 * DBL_EPSILON))) {
-        atomicExch(safe, 0);
+    for (int offset = 16; offset; offset >>= 1)
+        radius = fmax(radius, __shfl_down_sync(0xffffffffu, radius, offset));
+    if (lane == 0) {
+        const double h = ldexp(root[0], -depth);
+        const bool large = !(2.0 * radius < h * (1.0 - 64.0 * DBL_EPSILON));
+        large_flags[c] = large ? 1 : 0;
+        if (large) atomicExch(safe, 0);
     }
 }
 
@@ -312,9 +321,10 @@ __global__ void reduce_clump_member_gravity(
     ParticleSoA p, ClumpStateSoA cs, ClumpSegmentOffsets seg,
     const double* fx, const double* fy, const double* fz,
     body_fitted_fmm::GravityBodyView view,
-    double* bx, double* by, double* bz, double* tx, double* ty, double* tz) {
+    double* bx, double* by, double* bz, double* tx, double* ty, double* tz,
+    bool normals_only = false) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= view.count) return;
+    if (b >= view.count || (normals_only && b >= view.normal_count)) return;
     tx[b] = ty[b] = tz[b] = 0;
     if (b < view.normal_count) {
         const int i = seg.normal_begin + b;
@@ -355,6 +365,45 @@ __global__ void reduce_clump_member_gravity(
         tx[b] = rx;
         ty[b] = ry;
         tz[b] = rz;
+    }
+}
+
+// Large bodies use a block reduction instead of serial work proportional to
+// their complete population. Each block owns one wrench and writes it once.
+__global__ void reduce_aligned_clump_member_gravity(
+    ParticleSoA p, ClumpStateSoA cs, ClumpSegmentOffsets seg,
+    const double* fx, const double* fy, const double* fz,
+    body_fitted_fmm::GravityBodyView view,
+    double* bx, double* by, double* bz, double* tx, double* ty, double* tz) {
+    const int c = blockIdx.x;
+    __shared__ double sums[6][128];
+    double f[6] = {};
+    const int begin = seg.member_begin + seg.seg_begin[c];
+    const int end = seg.member_begin + seg.seg_end[c];
+    for (int i = begin + threadIdx.x; i < end; i += blockDim.x) {
+        const double dx = p.pos_x[i] - cs.com_x[c];
+        const double dy = p.pos_y[i] - cs.com_y[c];
+        const double dz = p.pos_z[i] - cs.com_z[c];
+        f[0] += fx[i]; f[1] += fy[i]; f[2] += fz[i];
+        f[3] += dy * fz[i] - dz * fy[i];
+        f[4] += dz * fx[i] - dx * fz[i];
+        f[5] += dx * fy[i] - dy * fx[i];
+    }
+    for (int k = 0; k < 6; ++k) sums[k][threadIdx.x] = f[k];
+    __syncthreads();
+    for (int offset = 64; offset; offset >>= 1) {
+        if (threadIdx.x < offset)
+            for (int k = 0; k < 6; ++k)
+                sums[k][threadIdx.x] += sums[k][threadIdx.x + offset];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const int b = view.normal_count + c;
+        view.pos_x[b] = cs.com_x[c]; view.pos_y[b] = cs.com_y[c]; view.pos_z[b] = cs.com_z[c];
+        view.mass[b] = cs.mass[c]; view.source_index[b] = c;
+        view.kind[b] = body_fitted_fmm::GravityBodyKind::ClumpCoM;
+        bx[b] = sums[0][0]; by[b] = sums[1][0]; bz[b] = sums[2][0];
+        tx[b] = sums[3][0]; ty[b] = sums[4][0]; tz[b] = sums[5][0];
     }
 }
 
@@ -1351,7 +1400,7 @@ struct ClumpGravityBodyBuffers {
     double *member_x=nullptr,*member_y=nullptr,*member_z=nullptr;
     float* member_mass=nullptr;
     double *member_fx=nullptr,*member_fy=nullptr,*member_fz=nullptr,*root_size=nullptr;
-    int *safe=nullptr,*anchor=nullptr;
+    int *safe=nullptr,*anchor=nullptr,*large_flags=nullptr;
 
     explicit ClumpGravityBodyBuffers(int normal_count, int clump_count, int member_count) {
         member_capacity=member_count;
@@ -1359,7 +1408,8 @@ struct ClumpGravityBodyBuffers {
         CUDA_CHECK(cudaMalloc(&member_x,mbytes));CUDA_CHECK(cudaMalloc(&member_y,mbytes));CUDA_CHECK(cudaMalloc(&member_z,mbytes));
         CUDA_CHECK(cudaMalloc(&member_mass,static_cast<size_t>(member_count)*sizeof(float)));
         CUDA_CHECK(cudaMalloc(&member_fx,mbytes));CUDA_CHECK(cudaMalloc(&member_fy,mbytes));CUDA_CHECK(cudaMalloc(&member_fz,mbytes));
-        CUDA_CHECK(cudaMalloc(&root_size,sizeof(double)));CUDA_CHECK(cudaMalloc(&safe,sizeof(int)));CUDA_CHECK(cudaMalloc(&anchor,sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&root_size,4*sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&large_flags,clump_count*sizeof(int)));CUDA_CHECK(cudaMalloc(&safe,sizeof(int)));CUDA_CHECK(cudaMalloc(&anchor,sizeof(int)));
         view.normal_count=normal_count; view.clump_count=clump_count;
         view.count=normal_count+clump_count;
         const size_t dbytes=static_cast<size_t>(view.count)*sizeof(double);
@@ -1377,7 +1427,7 @@ struct ClumpGravityBodyBuffers {
         cudaFree(fx); cudaFree(fy); cudaFree(fz); cudaFree(tx); cudaFree(ty); cudaFree(tz);
         cudaFree(projection_scalars);
         cudaFree(member_x);cudaFree(member_y);cudaFree(member_z);cudaFree(member_mass);
-        cudaFree(member_fx);cudaFree(member_fy);cudaFree(member_fz);cudaFree(root_size);cudaFree(safe);cudaFree(anchor);
+        cudaFree(member_fx);cudaFree(member_fy);cudaFree(member_fz);cudaFree(root_size);cudaFree(safe);cudaFree(anchor);cudaFree(large_flags);
     }
     ClumpGravityBodyBuffers(const ClumpGravityBodyBuffers&)=delete;
     ClumpGravityBodyBuffers& operator=(const ClumpGravityBodyBuffers&)=delete;
@@ -1438,6 +1488,7 @@ void compute_registered_clump_member_gravity(
         seg.num_segments != cs.num_clumps || !state.particles.clump_id) {
         throw std::runtime_error("invalid registered live clump member ranges");
     }
+    body_fitted_fmm::UnifiedFMMDispatcher::reset_aligned_clump_diagnostics();
     const int count = seg.member_end, normal_count = seg.normal_end;
     if (count == 0) return;
     int gpu = 0;
@@ -1462,17 +1513,19 @@ void compute_registered_clump_member_gravity(
         config.acceleration.unified_fmm.tree_dimension == 3 &&
         config.acceleration.unified_fmm.tree_depth >= 2 &&
         config.acceleration.unified_fmm.tree_depth <= 20;
+    const bool aligned_eligible = use_fmm;
     if (use_fmm) {
         CUDA_CHECK(cudaMemsetAsync(b.safe, 1, sizeof(int), stream));
         clump_gravity_root_size<<<1, 256, 0, stream>>>(
             b.member_x, b.member_y, b.member_z, count, b.root_size);
-        classify_clump_member_gravity<<<(cs.num_clumps + block - 1) / block, block, 0, stream>>>(
-            state.particles, cs, seg, b.root_size, config.acceleration.unified_fmm.tree_depth, b.safe);
+        classify_clump_member_gravity<<<(cs.num_clumps + 3) / 4, block, 0, stream>>>(
+            state.particles, cs, seg, b.root_size, config.acceleration.unified_fmm.tree_depth, b.safe, b.large_flags);
         int safe = 0;
         CUDA_CHECK(cudaMemcpyAsync(&safe, b.safe, sizeof(safe), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         use_fmm = safe != 0;
     }
+    const bool use_aligned = aligned_eligible && !use_fmm;
     // Minimum-image pair forces can have nonzero orbital torque when measured
     // in one Euclidean periodic cell. A global angular projection would change
     // those physical pair forces. DIRECT also retains its unprojected model.
@@ -1484,7 +1537,7 @@ void compute_registered_clump_member_gravity(
         std::fprintf(stderr,
             "[Clump gravity] mode=%s members_and_normals=%d clumps=%d "
             "depth=%d projection=%d outer=%d\n",
-            use_fmm ? "member_fmm" : "member_direct", count, cs.num_clumps,
+            use_fmm ? "member_fmm" : (use_aligned ? "aligned_components" : "member_direct"), count, cs.num_clumps,
             config.acceleration.unified_fmm.tree_depth,
             static_cast<int>(apply_projection),
             static_cast<int>(outer));
@@ -1493,7 +1546,7 @@ void compute_registered_clump_member_gravity(
     CUDA_CHECK(cudaMemsetAsync(b.member_fx, 0, bytes, stream));
     CUDA_CHECK(cudaMemsetAsync(b.member_fy, 0, bytes, stream));
     CUDA_CHECK(cudaMemsetAsync(b.member_fz, 0, bytes, stream));
-    if (use_fmm) {
+    if (use_fmm || use_aligned) {
         SimulationState members;
         members.current_step = state.current_step;
         members.current_time = state.current_time;
@@ -1510,9 +1563,16 @@ void compute_registered_clump_member_gravity(
         members.particles.force_z = b.member_fz;
         SimConfig fmm_config = config;
         fmm_config.acceleration.unified_fmm.enable_global_projection = false;
-        body_fitted_fmm::UnifiedFMMDispatcher::compute(
-            members, fmm_config, members.neighbor, pbc, evaluation_time,
-            stream, false, state.particles.clump_id);
+        if (use_aligned) {
+            body_fitted_fmm::UnifiedFMMDispatcher::compute_aligned_clumps(
+                members, fmm_config, cs.num_clumps, seg.member_begin,
+                seg.seg_begin, seg.seg_end, state.particles.clump_id,
+                b.large_flags, b.root_size, stream);
+        } else {
+            body_fitted_fmm::UnifiedFMMDispatcher::compute(
+                members, fmm_config, members.neighbor, pbc, evaluation_time,
+                stream, false, state.particles.clump_id);
+        }
     } else {
         // The selected method owns G even when BFFMM dispatches its temporary
         // direct fallback. Registered clump gravity uses the same Plummer eps
@@ -1531,7 +1591,12 @@ void compute_registered_clump_member_gravity(
     const int body_grid = (b.view.count + block - 1) / block;
     reduce_clump_member_gravity<<<body_grid, block, 0, stream>>>(
         state.particles, cs, seg, b.member_fx, b.member_fy, b.member_fz,
-        b.view, b.fx, b.fy, b.fz, b.tx, b.ty, b.tz);
+        b.view, b.fx, b.fy, b.fz, b.tx, b.ty, b.tz, use_aligned);
+    if (use_aligned) {
+        reduce_aligned_clump_member_gravity<<<cs.num_clumps, 128, 0, stream>>>(
+            state.particles, cs, seg, b.member_fx, b.member_fy, b.member_fz,
+            b.view, b.fx, b.fy, b.fz, b.tx, b.ty, b.tz);
+    }
     CUDA_CHECK(cudaGetLastError());
     if (apply_projection) project_clump_gravity_bodies(b, stream);
     if (outer) {
@@ -1789,6 +1854,10 @@ void AccelerationManager::compute_self_gravity(
             SelfGravityDispatcher::compute(state, config, pbc, evaluation_time, stream);
             return;
     }
+}
+
+AlignedClumpGravityDiagnostics AccelerationManager::get_aligned_clump_gravity_diagnostics() {
+    return body_fitted_fmm::UnifiedFMMDispatcher::aligned_clump_diagnostics();
 }
 
 void AccelerationManager::restore_checkpoint_clump_gravity(

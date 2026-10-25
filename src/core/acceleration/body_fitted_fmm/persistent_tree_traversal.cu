@@ -88,8 +88,11 @@ __global__ void persistent_stencil_finalize_counts_kernel(
 }
 
 template<int D>
-__global__ void persistent_stencil_emit_kernel(PersistentTreeContext* ctx) {
+__global__ void persistent_stencil_emit_kernel(PersistentTreeContext* ctx,
+    const PersistentTreeContext* sources = nullptr) {
     using T = GroupedStencilTraits<D>;
+    const auto* source_ctx = sources ? sources : ctx;
+    const auto* source_nodes = source_ctx->dd.unified_nodes;
     __shared__ int block_counts[4];
     if (threadIdx.x < 4) block_counts[threadIdx.x] = 0;
     __syncthreads();
@@ -164,19 +167,19 @@ __global__ void persistent_stencil_emit_kernel(PersistentTreeContext* ctx) {
             if (lane < T::CROSS_COUNT) {
                 const GeneratedCrossStencilEntry entry = T::cross(child_q, lane);
                 const int source = persistent_linear_lookup<D>(
-                    ctx, level - 1,
+                    source_ctx, level - 1,
                     (c0 >> 1) + static_cast<int>(entry.parent[0]),
                     (c1 >> 1) + static_cast<int>(entry.parent[1]),
                     (c2 >> 1) + static_cast<int>(entry.parent[2]));
                 if (source >= 0) {
                     const CutoffRelation cutoff = persistent_cutoff_relation(
                         ctx->dd.unified_nodes[target_idx],
-                        ctx->dd.unified_nodes[source],
+                        source_nodes[source],
                         ctx->command.cutoff_radius,ctx->metadata.root_cell_size);
                     if (cutoff != CutoffRelation::Outside) {
                         const uint64_t work = static_cast<uint64_t>(
-                            (ctx->dd.unified_nodes[source].global_count ?
-                             ctx->dd.unified_nodes[source].global_count : ctx->dd.unified_nodes[source].count)) *
+                            (source_nodes[source].global_count ?
+                             source_nodes[source].global_count : source_nodes[source].count)) *
                             static_cast<uint64_t>(target_count);
                         const bool direct = cutoff == CutoffRelation::Straddles ||
                             (!ctx->command.disable_direct_fallback &&
@@ -198,7 +201,7 @@ __global__ void persistent_stencil_emit_kernel(PersistentTreeContext* ctx) {
             if (lane < T::BLOCK_COUNT) {
                 const GeneratedChildBlockStencilEntry entry = T::block(child_q, lane);
                 const int source_parent = persistent_linear_lookup<D>(
-                    ctx, level - 1,
+                    source_ctx, level - 1,
                     (c0 >> 1) + static_cast<int>(entry.parent[0]),
                     (c1 >> 1) + static_cast<int>(entry.parent[1]),
                     (c2 >> 1) + static_cast<int>(entry.parent[2]));
@@ -207,13 +210,13 @@ __global__ void persistent_stencil_emit_kernel(PersistentTreeContext* ctx) {
                     #pragma unroll
                     for (int child = 0; child < T::CHILD_COUNT; ++child) {
                         const int source = grouped_child_node<D>(
-                            ctx->dd.unified_nodes, ctx->dd.children_compact,
+                            source_nodes, source_ctx->dd.children_compact,
                             source_parent, child);
                         if (source < 0) continue;
                         const uint8_t bit = static_cast<uint8_t>(1u << child);
                         const CutoffRelation cutoff = persistent_cutoff_relation(
                             ctx->dd.unified_nodes[target_idx],
-                            ctx->dd.unified_nodes[source],
+                            source_nodes[source],
                             ctx->command.cutoff_radius,ctx->metadata.root_cell_size);
                         if (cutoff == CutoffRelation::Outside) {
                             if (entry.far_mask & bit) omit_mask |= bit;
@@ -221,8 +224,8 @@ __global__ void persistent_stencil_emit_kernel(PersistentTreeContext* ctx) {
                         }
                         if (entry.far_mask & bit) {
                             const uint64_t work = static_cast<uint64_t>(
-                                (ctx->dd.unified_nodes[source].global_count ?
-                             ctx->dd.unified_nodes[source].global_count : ctx->dd.unified_nodes[source].count)) *
+                                (source_nodes[source].global_count ?
+                             source_nodes[source].global_count : source_nodes[source].count)) *
                                 static_cast<uint64_t>(target_count);
                             if (cutoff == CutoffRelation::Straddles ||
                                 (!ctx->command.disable_direct_fallback &&
@@ -234,7 +237,7 @@ __global__ void persistent_stencil_emit_kernel(PersistentTreeContext* ctx) {
                             }
                         } else if (is_leaf && (entry.near_mask & bit)) {
                             direct_mask |= bit;
-                            if (source == target_idx)
+                            if (source_ctx == ctx && source == target_idx)
                                 ++p2p_self_count;
                             else
                                 ++p2p_regular_count;
@@ -860,6 +863,17 @@ int fixed_depth_node_upper_bound(int particle_capacity, int tree_depth,
     if (tree_dimension != 2 && tree_dimension != 3)
         throw std::invalid_argument("tree_dimension must be 2 or 3");
     return bound(tree_dimension);
+}
+
+void rebuild_cross_context_stencil(PersistentTreeRuntime& target,
+                                   const PersistentTreeRuntime& source,
+                                   cudaStream_t stream) {
+    const auto& hc = target.host_context;
+    persistent_stencil_emit_kernel<3><<<hc.stencil_block_capacity,
+        PERSISTENT_STENCIL_BLOCK, 0, stream>>>(target.device_context, source.device_context);
+    persistent_stencil_finalize_counts_kernel<<<1, 32, 0, stream>>>(
+        target.device_context, hc.stencil_block_capacity);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void initialize_persistent_tree_runtime(
