@@ -2702,7 +2702,8 @@ double sph_compact_baseline_length(const SimConfig& config, cudaStream_t stream)
 }
 
 static void run_p2p_inner(int gpu_id, ::cudadem::SimulationState& state,
-                          const ::cudadem::SimConfig& config, cudaStream_t stream)
+                          const ::cudadem::SimConfig& config, cudaStream_t stream,
+                          const int* gravity_clump_ids)
 {
     fmm::FMMDeviceData& dd = device_data_[gpu_id];
 
@@ -2720,7 +2721,7 @@ static void run_p2p_inner(int gpu_id, ::cudadem::SimulationState& state,
         state.particles.pos_y,
         state.particles.pos_z,
         state.particles.mass, state.particles.force_x, state.particles.force_y,
-        state.particles.force_z, G, softening, stream);
+        state.particles.force_z, G, softening, stream, gravity_clump_ids);
     if (distributed.evaluating) body_fitted_fmm::launch_p2p_remote_leaves<false>(
         distributed.remote_lists.near_view(),dd,
         &persistent_tree_runtime_[gpu_id].device_context->metadata,
@@ -2735,7 +2736,8 @@ static void run_p2p_inner(int gpu_id, ::cudadem::SimulationState& state,
 // =============================================================================
 
 static void run_p2p_outer(int gpu_id, ::cudadem::SimulationState& state,
-                           const ::cudadem::SimConfig& config, cudaStream_t stream)
+                           const ::cudadem::SimConfig& config, cudaStream_t stream,
+                          const int* gravity_clump_ids)
 {
     fmm::FMMDeviceData& dd = device_data_[gpu_id];
 
@@ -2754,7 +2756,7 @@ static void run_p2p_outer(int gpu_id, ::cudadem::SimulationState& state,
         state.particles.pos_z,
         state.particles.mass, state.particles.gravity_force_x,
         state.particles.gravity_force_y, state.particles.gravity_force_z,
-        G, softening, stream);
+        G, softening, stream, gravity_clump_ids);
     if (distributed.evaluating) body_fitted_fmm::launch_p2p_remote_leaves<true>(
         distributed.remote_lists.near_view(),dd,
         &persistent_tree_runtime_[gpu_id].device_context->metadata,
@@ -2777,9 +2779,16 @@ void UnifiedFMMDispatcher::compute(
     const ::cudadem::PeriodicBoundaryConfig& pbc,
     double evaluation_time,
     cudaStream_t stream,
-    bool synchronize_at_end)
+    bool synchronize_at_end,
+    const int* gravity_clump_ids)
 {
     (void)neighbor_data;
+    if(gravity_clump_ids &&
+       (config.physics!=SimulationPhysics::DEM || config.shear_box.enabled ||
+        pbc.periodic_x || pbc.periodic_y || pbc.periodic_z ||
+        config.acceleration.unified_fmm.adaptive_depth.enabled ||
+        distributed_fmm_[current_gpu()].evaluating))
+        throw std::invalid_argument("clump membership filtering requires nonperiodic fixed-depth single-GPU DEM");
     const ShearGravityImages shear_images =
         make_shear_gravity_images(config, pbc, evaluation_time);
 
@@ -3082,7 +3091,7 @@ void UnifiedFMMDispatcher::compute(
         gpu_id, BFFMMActivePhase::P2P, state.current_step,
         (double)N,
         RCBWorkPhase::FmmLeaf, false, stream);
-    run_p2p_inner(gpu_id, state, config, stream);
+    run_p2p_inner(gpu_id, state, config, stream, gravity_clump_ids);
     mark_distributed_fmm_phase(gpu_id,5,stream);
     end_bffmm_sample(gpu_id, p2p_sample, stream);
     BF_FMM_NVTX_END();
@@ -3140,10 +3149,17 @@ void UnifiedFMMDispatcher::compute_outer(
     const ::cudadem::NeighborData& neighbor_data,
     const ::cudadem::PeriodicBoundaryConfig& pbc,
     double evaluation_time,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const int* gravity_clump_ids)
 {
 
     (void)neighbor_data;
+    if(gravity_clump_ids &&
+       (config.physics!=SimulationPhysics::DEM || config.shear_box.enabled ||
+        pbc.periodic_x || pbc.periodic_y || pbc.periodic_z ||
+        config.acceleration.unified_fmm.adaptive_depth.enabled ||
+        distributed_fmm_[current_gpu()].evaluating))
+        throw std::invalid_argument("clump membership filtering requires nonperiodic fixed-depth single-GPU DEM");
     const ShearGravityImages shear_images =
         make_shear_gravity_images(config, pbc, evaluation_time);
     if (shear_images.enabled) {
@@ -3356,7 +3372,7 @@ void UnifiedFMMDispatcher::compute_outer(
     mark_distributed_fmm_phase(gpu_id,4,stream);
     // Phase 8: P2P (outer — writes to gravity_force_*)
     BF_FMM_NVTX_RANGE("BF-FMM: P2P");
-    run_p2p_outer(gpu_id, state, config, stream);
+    run_p2p_outer(gpu_id, state, config, stream, gravity_clump_ids);
     mark_distributed_fmm_phase(gpu_id,5,stream);
     BF_FMM_NVTX_END();
 

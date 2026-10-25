@@ -265,6 +265,12 @@ public:
         cudaStream_t stream = 0
     );
 
+    // Restore only the clump gravity portion absent from member checkpoint
+    // force rows. Normal checkpoint forces already retain their full force.
+    static void restore_checkpoint_clump_gravity(
+        SimulationState& state, const SimConfig& config,
+        double evaluation_time, cudaStream_t stream = 0);
+
     // Compute all non-gravity accelerations: inertial, tidal, fields, YORP.
     // Does NOT call compute_self_gravity.
     static void compute_all_without_gravity(

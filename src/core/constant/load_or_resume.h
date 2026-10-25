@@ -8,6 +8,7 @@
 #include "../acceleration/external_bodies.h"
 #include "../neighbor/neighbor_api.h"
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>

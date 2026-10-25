@@ -2084,11 +2084,6 @@ SimConfig parse_yaml(const std::string& yaml_path) {
         throw std::runtime_error(
             "adaptive unified_fmm tree depth does not support clump gravity");
     }
-    if (config.clump.num_instances > 0 &&
-        config.acceleration.gravity_method == SelfGravityMethod::BFFMM &&
-        !config.acceleration.unified_fmm.enable_global_projection) {
-        throw std::runtime_error("BFFMM clump runs require enable_global_projection: true");
-    }
 
     if (morton_fmm) {
         const auto& fmm = config.acceleration.unified_fmm;

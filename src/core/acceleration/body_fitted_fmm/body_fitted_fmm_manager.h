@@ -120,16 +120,21 @@ public:
     static void shutdown();
     static void shutdown_all();
 
+    // Optional IDs are used only by the certified small-clump DEM shadow
+    // view. Positive equal IDs suppress near pairs; callers must establish
+    // that same-clump members cannot enter accepted far interactions.
     static void compute(::cudadem::SimulationState& state, const ::cudadem::SimConfig& config,
                         const ::cudadem::NeighborData& neighbor_data,
                         const ::cudadem::PeriodicBoundaryConfig& pbc,
                         double evaluation_time, cudaStream_t stream = 0,
-                        bool synchronize_at_end = true);
+                        bool synchronize_at_end = true,
+                        const int* gravity_clump_ids = nullptr);
 
     static void compute_outer(::cudadem::SimulationState& state, const ::cudadem::SimConfig& config,
                               const ::cudadem::NeighborData& neighbor_data,
                               const ::cudadem::PeriodicBoundaryConfig& pbc,
-                              double evaluation_time, cudaStream_t stream = 0);
+                              double evaluation_time, cudaStream_t stream = 0,
+                              const int* gravity_clump_ids = nullptr);
 
     // Multi-GPU compute uses the common Morton grid and compact halo exchange.
     // Empty owners still publish an epoch. The communicator must be initialized;
