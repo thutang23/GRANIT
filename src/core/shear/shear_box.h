@@ -162,7 +162,7 @@ public:
     // quaternion drift.  Retained force/torque arrays are cleared.
     static void drift_step1(SimulationState& state, const SimConfig& config,
                             double dt, int32_t num_particles,
-                            cudaStream_t stream = 0);
+                            cudaStream_t stream = 0,const int32_t* clump_ids = nullptr);
 
     // Canonical half-open x/y wrap at the endpoint phase, with checked int64
     // winding updates and the radial-image velocity jump.
@@ -174,7 +174,7 @@ public:
     // Closing non-Hill half kick; rotational Verlet step 2 is unchanged.
     static void kick_step2(SimulationState& state, const SimConfig& config,
                            double dt, int32_t num_particles,
-                           cudaStream_t stream = 0);
+                           cudaStream_t stream = 0,const int32_t* clump_ids = nullptr);
 
     // Contact epochs preserve spring memory while distinguishing a missed
     // image/contact from an active one.  begin clears seen_this_step; the

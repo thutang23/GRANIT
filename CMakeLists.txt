@@ -223,10 +223,29 @@ if(BUILD_TESTING)
     target_include_directories(granit_sph_respa_test PRIVATE ${GRANIT_INCLUDE_DIRS})
     target_link_libraries(granit_sph_respa_test PRIVATE CUDA::cudart yaml-cpp)
     add_test(NAME sph_respa COMMAND granit_sph_respa_test)
+    add_executable(granit_fmm_depth_constraints_test
+        components/tests/unit_test/domain/test_fmm_depth_constraints.cpp
+        src/domain/distributed_fmm_depth_controller.cpp)
+    target_include_directories(granit_fmm_depth_constraints_test PRIVATE
+        ${GRANIT_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(granit_fmm_depth_constraints_test PRIVATE
+        CUDA::cudart yaml-cpp Threads::Threads)
+    add_test(NAME fmm_depth_constraints COMMAND granit_fmm_depth_constraints_test)
+    add_executable(granit_clump_shear_math_test
+        components/tests/unit_test/domain/clump_shear_math.cpp)
+    target_include_directories(granit_clump_shear_math_test PRIVATE
+        ${GRANIT_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(granit_clump_shear_math_test PRIVATE CUDA::cudart yaml-cpp)
+    add_test(NAME clump_shear_math COMMAND granit_clump_shear_math_test)
     add_executable(granit_peer_transport_policy_test
         components/tests/release_defaults/peer_transport_policy.cpp)
     target_include_directories(granit_peer_transport_policy_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME peer_transport_policy COMMAND granit_peer_transport_policy_test)
+    add_executable(granit_particle_clump_order_test
+        components/tests/unit_test/constant/particle_clump_order.cpp)
+    target_include_directories(granit_particle_clump_order_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME particle_clump_order COMMAND granit_particle_clump_order_test)
     # Opt-in GPU payload verification; ordinary CTest remains host-only.
     add_executable(granit_peer_transfer_gpu_test
         components/tests/release_defaults/peer_transfer_gpu.cu)

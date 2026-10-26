@@ -28,6 +28,10 @@ bool DistributedFMMDepthController::initialize(
     config_ = config;
     gpu_count_ = gpu_count;
     gpu_states_.assign(gpu_count_, DistributedFMMDepthGpuState{});
+    for (auto& state : gpu_states_) {
+        state.effective_min_depth = config_.min_depth;
+        state.effective_max_depth = config_.max_depth;
+    }
     initial_depth_ready_.assign(gpu_count_, false);
     stable_count_valid_.assign(gpu_count_, false);
     mailbox_.resize(kMailboxSlots);
@@ -58,7 +62,8 @@ bool DistributedFMMDepthController::set_initial_depth(
     int32_t gpu, int32_t depth, int32_t effective_max_depth, uint64_t epoch) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_ || frozen_ || !valid_gpu_locked(gpu) ||
-        depth < config_.min_depth || effective_max_depth < config_.min_depth ||
+        depth < gpu_states_[gpu].effective_min_depth ||
+        effective_max_depth < gpu_states_[gpu].effective_min_depth ||
         effective_max_depth > config_.max_depth || depth > effective_max_depth) {
         if (initialized_ && !frozen_) freeze_locked("invalid lazy FMM startup depth", epoch);
         return false;
@@ -213,18 +218,47 @@ void DistributedFMMDepthController::notify_disruptive_event(
 void DistributedFMMDepthController::set_effective_max_depth(
     int32_t gpu, int32_t effective_max_depth, uint64_t epoch) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!initialized_ || frozen_ || !valid_gpu_locked(gpu) ||
-        effective_max_depth < config_.min_depth || effective_max_depth > config_.max_depth) {
-        if (initialized_ && !frozen_) freeze_locked("invalid distributed FMM effective ceiling", epoch);
+    const int minimum = valid_gpu_locked(gpu) ? gpu_states_[gpu].effective_min_depth : config_.min_depth;
+    set_effective_depth_range_locked(gpu, minimum, effective_max_depth, epoch);
+}
+
+void DistributedFMMDepthController::set_effective_depth_range(
+    int32_t gpu, int32_t minimum, int32_t maximum, uint64_t epoch) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    set_effective_depth_range_locked(gpu, minimum, maximum, epoch);
+}
+
+void DistributedFMMDepthController::set_effective_depth_range_locked(
+    int32_t gpu, int32_t minimum, int32_t maximum, uint64_t epoch) {
+    if (!initialized_ || frozen_ || !valid_gpu_locked(gpu) || minimum < config_.min_depth ||
+        maximum > config_.max_depth || minimum > maximum || epoch == UINT64_MAX) {
+        if (initialized_ && !frozen_)
+            freeze_locked("invalid distributed FMM effective depth range", epoch);
         return;
     }
-    DistributedFMMDepthGpuState& state = gpu_states_[gpu];
-    state.effective_max_depth = effective_max_depth;
-    state.selected_depth = std::min(state.selected_depth, effective_max_depth);
-    state.candidate_depth = state.selected_depth;
-    state.confirmation_count = 0;
+    auto& state = gpu_states_[gpu];
+    if (minimum == state.effective_min_depth && maximum == state.effective_max_depth) return;
+    const bool minimum_changed = minimum != state.effective_min_depth;
     cancel_trial_locked(epoch, DistributedFMMDepthCancelReason::CapacityService);
-    emit_locked(DistributedFMMDepthEvent::EffectiveCeilingChanged, epoch, gpu);
+    state.effective_min_depth = minimum;
+    state.effective_max_depth = maximum;
+    state.selected_depth = std::max(minimum, std::min(state.selected_depth, maximum));
+    state.candidate_depth = state.selected_depth;
+    for (auto& peer : gpu_states_) {
+        peer.confirmation_count = 0;
+        peer.selected_evaluations_since_trial = 0;
+    }
+    // Hard feasibility changes invalidate optimization history, including
+    // asynchronous records that were already queued before this boundary.
+    discarded_before_epoch_ = std::max(discarded_before_epoch_, epoch+1);
+    for (auto& slot : mailbox_) {
+        if (slot.epoch && slot.epoch < UINT64_MAX)
+            discarded_before_epoch_ = std::max(discarded_before_epoch_, slot.epoch+1);
+        slot.epoch = 0;
+        std::fill(slot.present.begin(), slot.present.end(), false);
+    }
+    emit_locked(minimum_changed ? DistributedFMMDepthEvent::EffectiveBoundsChanged :
+                DistributedFMMDepthEvent::EffectiveCeilingChanged, epoch, gpu);
 }
 
 void DistributedFMMDepthController::freeze(const std::string& reason, uint64_t epoch) {
@@ -549,7 +583,7 @@ void DistributedFMMDepthController::advance_phase_locked() {
 int32_t DistributedFMMDepthController::candidate_for_locked(int32_t gpu) const {
     const DistributedFMMDepthGpuState& state = gpu_states_[gpu];
     const int32_t raw = state.selected_depth + (state.search_direction >= 0 ? 1 : -1);
-    return std::max(config_.min_depth, std::min(raw, state.effective_max_depth));
+    return std::max(state.effective_min_depth, std::min(raw, state.effective_max_depth));
 }
 
 
@@ -568,6 +602,8 @@ template<class T> void depth_read(std::istream& in, T& value) {
 void DistributedFMMDepthController::save_checkpoint(std::ostream& out) const {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_ || frozen_) throw std::runtime_error("Cannot checkpoint an inactive/frozen depth controller");
+    depth_write(out, uint32_t{0x32434446}); // FDC2: bounds-aware controller state
+    depth_write(out, uint32_t{2});
     depth_write(out, gpu_count_);
     depth_write(out, initialized_);
     depth_write(out, frozen_);
@@ -604,7 +640,14 @@ void DistributedFMMDepthController::save_checkpoint(std::ostream& out) const {
 void DistributedFMMDepthController::restore_checkpoint(std::istream& in, const AdaptiveDepthConfig& config) {
     std::lock_guard<std::mutex> lock(mutex_);
     config_ = config;
-    depth_read(in, gpu_count_);
+    uint32_t first = 0; depth_read(in, first);
+    const bool legacy = first != uint32_t{0x32434446};
+    if (legacy) gpu_count_ = static_cast<int32_t>(first);
+    else {
+        uint32_t version = 0; depth_read(in, version);
+        if (version != 2) throw std::runtime_error("Unsupported distributed depth controller checkpoint version");
+        depth_read(in, gpu_count_);
+    }
     depth_read(in, initialized_);
     depth_read(in, frozen_);
     depth_read(in, last_processed_epoch_);
@@ -629,14 +672,29 @@ void DistributedFMMDepthController::restore_checkpoint(std::istream& in, const A
         throw std::runtime_error("Invalid distributed depth controller checkpoint");
     gpu_states_.resize(gpu_count_); initial_depth_ready_.resize(gpu_count_); stable_count_valid_.resize(gpu_count_);
     for (int g=0; g<gpu_count_; ++g) {
-        depth_read(in, gpu_states_[g]); uint8_t ready, valid;
+        if (legacy) {
+            struct LegacyGpuState {
+                int32_t selected_depth, candidate_depth, effective_max_depth;
+                int32_t search_direction, confirmation_count, selected_evaluations_since_trial;
+                int64_t stable_local_owned_particles;
+            } old{};
+            depth_read(in, old);
+            auto& state = gpu_states_[g];
+            state.selected_depth=old.selected_depth;state.candidate_depth=old.candidate_depth;
+            state.effective_max_depth=old.effective_max_depth;state.effective_min_depth=config.min_depth;
+            state.search_direction=old.search_direction;state.confirmation_count=old.confirmation_count;
+            state.selected_evaluations_since_trial=old.selected_evaluations_since_trial;
+            state.stable_local_owned_particles=old.stable_local_owned_particles;
+        } else depth_read(in, gpu_states_[g]);
+        uint8_t ready, valid;
         depth_read(in, ready); depth_read(in, valid);
         initial_depth_ready_[g]=ready; stable_count_valid_[g]=valid;
         const auto& state = gpu_states_[g];
         if (ready>1 || valid>1 || state.selected_depth<config.min_depth ||
-            state.selected_depth>config.max_depth || state.effective_max_depth<config.min_depth ||
-            state.effective_max_depth>config.max_depth || state.candidate_depth<config.min_depth ||
-            state.candidate_depth>config.max_depth)
+            state.selected_depth>config.max_depth || state.effective_min_depth<config.min_depth ||
+            state.effective_min_depth>state.effective_max_depth || state.effective_max_depth>config.max_depth ||
+            state.selected_depth<state.effective_min_depth || state.selected_depth>state.effective_max_depth ||
+            state.candidate_depth<state.effective_min_depth || state.candidate_depth>state.effective_max_depth)
             throw std::runtime_error("Invalid checkpoint depth range");
     }
     mailbox_.resize(kMailboxSlots);

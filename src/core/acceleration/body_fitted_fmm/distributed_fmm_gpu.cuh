@@ -435,6 +435,9 @@ template<int D> inline void fmm_receive_halo(int gpu,int peer,DistributedFMMStat
     if(total_particles>INT_MAX)throw std::overflow_error("FMM halo particle payload exceeds signed indexing");
     const int particles=int(total_particles);
     q.particles.reserve(particles);q.particle_count=particles;
+    const bool clump_payload = producer.publication.clump_ids != nullptr;
+    q.has_clump_ids = clump_payload;
+    if (clump_payload) q.particle_clump_ids.reserve(particles);
     if(s.debug_coverage) {
         q.debug_source_ids=producer.debug_arena_ids;
         std::vector<int> ids(n),offsets(h.cells+1);
@@ -451,21 +454,26 @@ template<int D> inline void fmm_receive_halo(int gpu,int peer,DistributedFMMStat
     fmm_halo_particle_requests_kernel<<<(n+256)/256,256,0,q.stream>>>(q.selected.data,q.particle_counts.data,
         q.particle_offsets.data,n,q.particle_requests.data,q.packed_particle_offsets.data);
     if(particles)fmm_pack_image_particles_kernel<<<std::min(n,8192),256,0,q.stream>>>(producer.publication,
-        h.table.part_offsets.data,h.table.parts.data,q.particle_requests.data,q.particles.data,n,self);
+        h.table.part_offsets.data,h.table.parts.data,q.particle_requests.data,q.particles.data,n,self,
+        clump_payload ? q.particle_clump_ids.data : nullptr);
     CUDA_CHECK(cudaEventRecord(q.end,q.stream));
     CUDA_CHECK(cudaSetDevice(gpu));
     q.local_ids.reserve(n+1);q.halo_particles.reserve(particles);q.halo_order.reserve(particles);
     q.halo_x.reserve(particles);q.halo_y.reserve(particles);q.halo_z.reserve(particles);q.halo_mass.reserve(particles);
+    if (clump_payload) q.halo_clump_ids.reserve(particles);
     CUDA_CHECK(cudaStreamWaitEvent(stream,q.end,0));
     ::cudadem::copy_peer_payload(q.local_ids.data,gpu,q.packed_particle_offsets.data,peer,(n+1)*sizeof(int),stream);
     fmm_halo_refresh_nodes_kernel<<<(n+7)/8,256,0,stream>>>(q.remote_values.data,q.local_ids.data,n,q.halo_nodes.data,q.halo_multipoles.data);
     if(particles) {
         ::cudadem::copy_peer_payload(q.halo_particles.data,gpu,q.particles.data,peer,size_t(particles)*sizeof(FMMSourceParticle),stream);
+        if (clump_payload) ::cudadem::copy_peer_payload(q.halo_clump_ids.data,gpu,
+            q.particle_clump_ids.data,peer,size_t(particles)*sizeof(int),stream);
         fmm_unpack_source_particles_kernel<<<(size_t(particles)+255)/256,256,0,stream>>>(q.halo_particles.data,particles,0,
             q.halo_x.data,q.halo_y.data,q.halo_z.data,q.halo_mass.data);
         fmm_halo_identity_order_kernel<<<(size_t(particles)+255)/256,256,0,stream>>>(q.halo_order.data,particles);
     }
-    if(!self)s.let_wire_bytes+=(n+1)*sizeof(int)+size_t(particles)*sizeof(FMMSourceParticle);
+    if(!self)s.let_wire_bytes+=(n+1)*sizeof(int)+size_t(particles)*
+        (sizeof(FMMSourceParticle)+(clump_payload?sizeof(int):0));
     s.received_cells+=n;s.received_particle_count+=particles;
     fmm_halo_publish_counts_kernel<<<1,4,0,stream>>>(runtime->device_context,q.route_counts.data,s.remote_interactions.data);
 }
@@ -585,6 +593,7 @@ inline void exchange_distributed_fmm_sources(int gpu,fmm::FMMDeviceData* dd,
     s.publication={owned?runtime->device_context:nullptr,owned?dd->sorted_to_original:nullptr,
         particles.particles.pos_x,particles.particles.pos_y,particles.particles.pos_z,
         particles.particles.mass,owned,particles.particles.global_id,targets};
+    s.publication.clump_ids = s.gravity_clump_ids;
     p.owned_nodes=0;p.depth=config.acceleration.unified_fmm.tree_depth;
     double effective_cutoff=0;
     if(owned) {

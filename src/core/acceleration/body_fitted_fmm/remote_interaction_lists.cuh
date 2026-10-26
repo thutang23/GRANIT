@@ -23,6 +23,7 @@ struct FMMRemoteView {
     const int* order = nullptr;
     int count = 0;
     const int* route_index = nullptr; // local target -> compact row; -1 means absent
+    const int* clump_ids = nullptr; // same order as the independent source arrays
 };
 __host__ __device__ __forceinline__ int fmm_remote_route_row(const FMMRemoteView& view,int target) {
     return view.route_index?view.route_index[target]:target;

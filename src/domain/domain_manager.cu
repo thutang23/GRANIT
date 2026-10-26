@@ -453,8 +453,9 @@ DomainParamsGPU DomainManager::initialize(
     DomainParamsGPU params{};
     params.num_gpus = num_gpus;
     params.morton_enabled = config.shear_box.enabled || (config.multigpu.morton_ownership &&
-        config.acceleration.enable_self_gravity &&
-        config.acceleration.gravity_method == SelfGravityMethod::BFFMM);
+        ((config.physics == SimulationPhysics::DEM && config.clump.num_instances > 0) ||
+         (config.acceleration.enable_self_gravity &&
+          config.acceleration.gravity_method == SelfGravityMethod::BFFMM)));
     if (!params.morton_enabled && num_gpus > MAX_MULTI_GPUS)
         throw std::invalid_argument("legacy RCB supports at most eight GPUs");
 
@@ -729,6 +730,7 @@ void DomainManager::distribute_particles(
     // Contextual identity: DEM clump membership or SPHSOL Part ID.  This must
     // survive the initial host-staged scatter just as it survives migration.
     std::vector<int32_t> g_clump_id(total_particles);
+    std::vector<float> g_clump_off_x(total_particles), g_clump_off_y(total_particles), g_clump_off_z(total_particles);
 
     const auto& src = global_state.particles;
     CUDA_CHECK(cudaMemcpy(g_pos_x.data(), src.pos_x, total_particles * sizeof(double), cudaMemcpyDeviceToHost));
@@ -802,6 +804,9 @@ void DomainManager::distribute_particles(
     CUDA_CHECK(cudaMemcpy(g_winding_y.data(), src.winding_y, total_particles * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(g_winding_z.data(), src.winding_z, total_particles * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(g_clump_id.data(), src.clump_id, total_particles * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(g_clump_off_x.data(), src.clump_off_x, total_particles * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(g_clump_off_y.data(), src.clump_off_y, total_particles * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(g_clump_off_z.data(), src.clump_off_z, total_particles * sizeof(float), cudaMemcpyDeviceToHost));
 
     // Step 8: Allocate and copy to each GPU
     // Material tables are dense but runtime-sized.  Replicate the same
@@ -869,6 +874,7 @@ void DomainManager::distribute_particles(
         std::vector<int32_t> flaws_ntot(n);
         std::vector<float> L_00(n), L_01(n), L_02(n), L_10(n), L_11(n), L_12(n), L_20(n), L_21(n), L_22(n);
         std::vector<int32_t> id(n), material_id(n), clump_id(n);
+        std::vector<float> clump_off_x(n), clump_off_y(n), clump_off_z(n);
         std::vector<int64_t> winding_x(n), winding_y(n), winding_z(n);
 
         for (int32_t local_idx = 0; local_idx < n; ++local_idx) {
@@ -938,6 +944,9 @@ void DomainManager::distribute_particles(
             winding_y[local_idx] = g_winding_y[global_idx];
             winding_z[local_idx] = g_winding_z[global_idx];
             clump_id[local_idx] = g_clump_id[global_idx];
+            clump_off_x[local_idx] = g_clump_off_x[global_idx];
+            clump_off_y[local_idx] = g_clump_off_y[global_idx];
+            clump_off_z[local_idx] = g_clump_off_z[global_idx];
         }
 
         // Copy to device
@@ -1012,6 +1021,9 @@ void DomainManager::distribute_particles(
         CUDA_CHECK(cudaMemcpy(dst.global_id, id.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(dst.material_id, material_id.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(dst.clump_id, clump_id.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dst.clump_off_x, clump_off_x.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dst.clump_off_y, clump_off_y.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dst.clump_off_z, clump_off_z.data(), n * sizeof(float), cudaMemcpyHostToDevice));
 
         // Initialize last_pos to current pos
         CUDA_CHECK(cudaMemcpy(dst.last_pos_x, p_x.data(), n * sizeof(double), cudaMemcpyHostToDevice));

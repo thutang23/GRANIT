@@ -325,7 +325,8 @@ template<int D> inline void fmm_prepare_remote_lists(int gpu,DistributedFMMState
         if(!q.request_count)continue;
         plan.host_views[peer]={q.halo_nodes.data,q.halo_children.data,q.halo_multipoles.data,
             q.moment_routes.data,q.halo_routes.data,q.halo_x.data,q.halo_y.data,q.halo_z.data,
-            q.halo_mass.data,q.halo_order.data,q.request_count,q.route_index.data};
+            q.halo_mass.data,q.halo_order.data,q.request_count,q.route_index.data,
+            q.has_clump_ids ? q.halo_clump_ids.data : nullptr};
     }
     plan.views.reserve(s.ranks);
     CUDA_CHECK(cudaMemcpyAsync(plan.views.data,plan.host_views.data(),s.ranks*sizeof(FMMRemoteView),cudaMemcpyHostToDevice,stream));

@@ -148,6 +148,24 @@ coefficient-scale tolerance of `1e-9`); inconsistent overrides are rejected.
 Checkpoint comparisons additionally allow the FP32 body-offset quantization
 bound `8*r*epsilon_float*M*R^r` for moment rank `r > 0`.
 
+The following large-clump, ordinary-periodic, projection, and subcycling
+descriptions apply to `granit_dem`. The `granit_multigpu` runner supports small
+clumps, including all-clump populations and bodies spanning ranks, with fixed
+or adaptive common-depth gravity, shear boxes, and exact checkpoint/restart.
+It requires LBVH neighbors, Morton ownership, and (with gravity) 3D BFFMM,
+depths at least two, update rate one, `gravity_macro_dt: 0`, both direct
+thresholds zero, and `enable_global_projection: false`. The full body bounding
+diameter, including member radii, must be below the actual gravity leaf width
+by a relative margin of `1e-6`. Adaptive clumps additionally enforce a global
+maximum of 128 actual source particles per leaf, including finite shear
+replicas, before each gravity evaluation. Infeasible occupancy, diameter,
+configured-depth, and memory constraints produce an explicit error.
+Distributed checkpoints require the exact `.distributed_clumps` sidecar;
+adaptive restart also requires `.adaptive_fmm_depth` and the same rank count.
+Fixed-depth restart can change rank count. Ordinary periodic boundaries outside
+the shear-box formulation remain unsupported by the distributed clump path.
+See [distributed small-clump DEM](MultiGPU_Clumps.md) for the complete contract.
+
 The small-clump BFFMM path places all live members and normal particles in the
 ordinary global Karras tree when every clump satisfies `2R < h_leaf`, with a
 floating-point margin. Here `R` bounds member spheres about their clump CoM,
@@ -188,7 +206,7 @@ all-small evaluations until shutdown.
 Periodic runs retain direct member gravity with minimum-image displacement
 and no global projection, because periodic pair forces need not have zero
 Euclidean-cell orbital torque. 2D trees also retain the direct fallback.
-Adaptive depth and shear boxes remain unsupported for clumps. Set
+On `granit_dem`, adaptive depth and shear boxes remain unsupported for clumps. Set
 `GRANIT_CLUMP_GRAVITY_DIAGNOSTICS=1` to print the selected evaluation path.
 
 Both BFFMM paths retain the existing p4 approximation and shipped theta=0.8
@@ -243,7 +261,7 @@ large outer step safe when gravity is balanced by a frictional contact network.
 
 ## Adaptive BFFMM tree depth
 
-New non-shear BFFMM simulations can let the runtime select and time neighboring
+BFFMM simulations can let the runtime select and time neighboring
 tree depths. Estimating a suitable fixed depth is difficult and the best depth
 changes with particle count and spatial occupancy:
 
@@ -303,9 +321,9 @@ and persisted CSV watermark. The sidecar is required when resuming an adaptive
 run; version-1 adaptive sidecars are rejected rather than converted. The CSV is
 rewound to the checkpoint watermark before new rows are appended. A diagnostic
 sequence gap is fatal: telemetry is lossless and never reports normal dropped
-records. Multi-GPU SPH uses backend version 3, preserving the common controller,
-ownership root/cuts, gravity epoch and load-balance calibration; rank count must
-match on resume.
+records. Common-tree multi-GPU SPH and clump DEM use backend version 3,
+preserving the common controller, ownership root/cuts, gravity epoch and
+load-balance calibration; rank count must match on resume.
 
 `unified_fmm.tree_dimension` defaults to `3` and accepts `2` or `3`. The legacy
 `force_tree_type: 2|3` spelling is accepted with a warning;
@@ -322,17 +340,20 @@ and `shape_ratio_quadtree` are rejected.
 
 To deliberately ignore an existing checkpoint and begin from the particle
 input, set `io.checkpoint.force_fresh: true`. Otherwise an adaptive resume
-requires its matching version-2 sidecar; a fixed-depth configuration may resume
+requires its matching backend sidecar (version 2 for standalone runs, version 3
+for common-tree multi-GPU runs); a fixed-depth configuration may resume
 the base particle checkpoint and emits a warning that the adaptive controller
-state is ignored.
+state is ignored. Distributed clumps still require their exact
+`.distributed_clumps` sidecar when using fixed depth.
 
 With Morton ownership, the multi-GPU runner uses one common computation depth
 across ranks. The host controller scores maximum rank gravity time, mean rank
 time, and aggregate LET bytes, and stages the same depth on every rank. The
 minimum per-rank memory ceiling constrains all trials; ownership
-`partition_depth` remains separate. This path supports fresh shear-box inputs,
+`partition_depth` remains separate. This path supports shear-box inputs,
 including one visible GPU through `granit_multigpu`; the finite-image envelope
-adds levels to the selected base depth. Adaptive shear is rejected by the
+maps the selected base depth to an effective launch depth, including an image
+alignment floor for elongated boxes. Adaptive shear is rejected by the
 standalone `granit_dem` runner. See [shear-box configuration](shear_box.md).
 
 The legacy non-Morton route uses one independently selected depth per GPU. GPU 0 runs
@@ -370,9 +391,22 @@ An invalid physical metric produces the same FATAL state on every GPU, writes th
 final common-step output, and terminates the run cleanly. CUDA/P2P coordination
 failures remain fatal process errors.
 
-Adaptive multi-GPU depth remains limited to fresh-start, unclumped DEM with
-non-shear BFFMM. Clump runs fail before launching their gravity pipeline; use a
-fixed integer `tree_depth` for those simulations.
+Adaptive common-tree multi-GPU depth supports isolated and shear-box clump DEM.
+Before every clump gravity evaluation, an exact GPU Morton-key census counts
+all live global source particles per leaf, combining leaves split across ranks.
+The maximum must be at most 128; the count includes all logical finite X/Y
+gravity images in a shear box, including virtually translated Y images. The
+feasible base-depth interval intersects this occupancy lower bound with the
+configured range, common memory ceiling, and the full clump-diameter upper
+bound. Geometry uses the actual image-envelope root and effective launch depth,
+which can differ from both the base depth and physical XY ownership grid.
+Every clump must satisfy `D < h_leaf * (1 - 1e-6)`; shear clumps also require
+`2D < min(Lx,Ly) * (1 - 1e-6)` for a unique internal image. An empty interval
+fails cleanly without relaxing the limits or enabling direct occupancy fallback.
+Selected and trial depths are clamped to the current feasible interval, and
+changing bounds clears stale timing comparisons. Adaptive clump restart requires
+the same ranks/backend/configuration and both matching checkpoint sidecars.
+Standalone `granit_dem` adaptive clump gravity remains unsupported.
 
 ## Common runtime sections
 

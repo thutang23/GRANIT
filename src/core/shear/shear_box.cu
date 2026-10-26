@@ -37,9 +37,9 @@ __global__ void shear_drift_step1_kernel(
     double* fx, double* fy, double* fz,
     double* tx, double* ty, double* tz,
     const float* mass, const float* moi,
-    double omega, double q, double nu, double dt, int32_t n) {
+    double omega, double q, double nu, double dt, int32_t n,const int32_t* clump_ids) {
     const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
+    if (i >= n || (clump_ids && clump_ids[i]>0)) return;
     const double half_dt = 0.5 * dt;
     const double inv_m = 1.0 / static_cast<double>(mass[i]);
     const double inv_I = 1.0 / static_cast<double>(moi[i]);
@@ -204,7 +204,7 @@ ShearPhase ShearBoxManager::validate_step(
 }
 
 void ShearBoxManager::drift_step1(SimulationState& state,const SimConfig& config,
-                                  double dt,int32_t n,cudaStream_t stream) {
+                                  double dt,int32_t n,cudaStream_t stream,const int32_t* clump_ids) {
     if (n<=0) return;
     const int threads=config.gpu.block_size, blocks=(n+threads-1)/threads;
     ParticleSoA& p=state.particles;
@@ -213,7 +213,7 @@ void ShearBoxManager::drift_step1(SimulationState& state,const SimConfig& config
         p.omega_x,p.omega_y,p.omega_z,p.quat_w,p.quat_x,p.quat_y,p.quat_z,
         p.force_x,p.force_y,p.force_z,p.torque_x,p.torque_y,p.torque_z,
         p.mass,p.moment_of_inertia,config.shear_box.omega,
-        config.shear_box.shear_parameter,config.shear_box.vertical_frequency,dt,n);
+        config.shear_box.shear_parameter,config.shear_box.vertical_frequency,dt,n,clump_ids);
     check_launch();
 }
 
@@ -243,14 +243,14 @@ ShearPhase ShearBoxManager::wrap(SimulationState& state,const SimConfig& config,
 }
 
 void ShearBoxManager::kick_step2(SimulationState& state,const SimConfig& config,
-                                 double dt,int32_t n,cudaStream_t stream) {
+                                 double dt,int32_t n,cudaStream_t stream,const int32_t* clump_ids) {
     if (n<=0) return;
     const int threads=config.gpu.block_size, blocks=(n+threads-1)/threads;
     ParticleSoA& p=state.particles;
     verlet_step2_fused_kernel<<<blocks,threads,0,stream>>>(
         p.vel_x,p.vel_y,p.vel_z,p.omega_x,p.omega_y,p.omega_z,
         p.force_x,p.force_y,p.force_z,p.torque_x,p.torque_y,p.torque_z,
-        p.mass,p.moment_of_inertia,dt,n);
+        p.mass,p.moment_of_inertia,dt,n,clump_ids);
     check_launch();
 }
 

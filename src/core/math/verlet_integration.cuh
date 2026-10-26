@@ -464,10 +464,11 @@ static __global__ void verlet_step1_fused_kernel(
     const float* __restrict__ moment_of_inertia,
     // Timestep
     double dt,
-    int32_t num_particles
+    int32_t num_particles,
+    const int32_t* clump_ids = nullptr
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_particles) return;
+    if (idx >= num_particles || (clump_ids && clump_ids[idx] > 0)) return;
 
     double m = static_cast<double>(mass[idx]);
     double I = static_cast<double>(moment_of_inertia[idx]);
@@ -630,10 +631,11 @@ static __global__ void verlet_step2_fused_kernel(
     const float* __restrict__ moment_of_inertia,
     // Timestep
     double dt,
-    int32_t num_particles
+    int32_t num_particles,
+    const int32_t* clump_ids = nullptr
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_particles) return;
+    if (idx >= num_particles || (clump_ids && clump_ids[idx] > 0)) return;
 
     double inv_m = 1.0 / static_cast<double>(mass[idx]);
     double inv_I = 1.0 / static_cast<double>(moment_of_inertia[idx]);

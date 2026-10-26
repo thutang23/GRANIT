@@ -192,21 +192,42 @@ helper_names = ('grouped_p2p_leaf_only_allowed', 'grouped_p2p_leaf_eligible', 'g
 helpers = '\n'.join(function(p2p, name) for name in helper_names)
 source_helper = function(p2p, 'grouped_p2p_source_warp')
 # Frozen main's arithmetic and visitation order remain byte-for-byte pinned.
-# Normalize ONLY the three explicit stage-1 clump-filter additions; requiring
+# Normalize ONLY the explicit local and remote clump-filter additions; requiring
 # each exact fragment once prevents this exception from hiding other changes.
 normalized_helper = source_helper
 clump_additions = (
-    ('Compute G, Compute softening_sq, double cutoff_sq,\n'
-     '    const int* gravity_clump_ids = nullptr)',
-     'Compute G, Compute softening_sq, double cutoff_sq)'),
-    ('contributes = target_orig != orig_j &&\n'
-     '                        !(gravity_clump_ids && gravity_clump_ids[target_orig] > 0 &&\n'
-     '                          gravity_clump_ids[target_orig] == gravity_clump_ids[orig_j]);',
-     'contributes = target_orig != orig_j;'),
-    ('if (orig_i == orig_j ||\n'
-     '                    (gravity_clump_ids && gravity_clump_ids[orig_i] > 0 &&\n'
-     '                     gravity_clump_ids[orig_i] == gravity_clump_ids[orig_j])) continue;',
-     'if (orig_i == orig_j) continue;'),
+    ('''                const int target_clump = __shfl_sync(0xffffffffu, remote_target_clump_id, target_lane);
+''', ''),
+    ('''Compute G, Compute softening_sq, double cutoff_sq,
+    const int* gravity_clump_ids = nullptr,
+    int remote_target_clump_id = 0, const int* remote_source_clump_ids = nullptr,
+    double clump_exclusion_distance_sq = 0.0)''', 'Compute G, Compute softening_sq, double cutoff_sq)'),
+    ('''                    const bool same_clump =
+                        (gravity_clump_ids && gravity_clump_ids[target_orig] > 0 &&
+                         gravity_clump_ids[target_orig] == gravity_clump_ids[orig_j]) ||
+                        (target_clump > 0 && remote_source_clump_ids &&
+                         target_clump == remote_source_clump_ids[orig_j]);
+''', ''),
+    ('''                        const double distance_sq = rdx*rdx+rdy*rdy+rdz*rdz;
+                        // In a shearing lattice only the geometrically adjacent
+                        // copy is internal. Other replicas of this clump remain
+                        // physical sources. The host checks D<h and 2D<min(Lx,Ly).
+                        contributes = !(same_clump && (clump_exclusion_distance_sq <= 0.0 ||
+                            distance_sq < clump_exclusion_distance_sq)) &&
+                            !(cutoff_sq > 0.0 && distance_sq > cutoff_sq);''', '''                        contributes = !(cutoff_sq > 0.0 &&
+                            rdx * rdx + rdy * rdy + rdz * rdz > cutoff_sq);'''),
+    ('''                const bool same_clump =
+                    (gravity_clump_ids && gravity_clump_ids[orig_i] > 0 &&
+                     gravity_clump_ids[orig_i] == gravity_clump_ids[orig_j]) ||
+                    (remote_target_clump_id > 0 && remote_source_clump_ids &&
+                     remote_target_clump_id == remote_source_clump_ids[orig_j]);
+''', ''),
+    ('''                const double distance_sq = rdx*rdx+rdy*rdy+rdz*rdz;
+                if ((same_clump && (clump_exclusion_distance_sq <= 0.0 ||
+                     distance_sq < clump_exclusion_distance_sq)) ||
+                    (cutoff_sq > 0.0 && distance_sq > cutoff_sq)) continue;''', '''                if (cutoff_sq > 0.0 &&
+                    rdx * rdx + rdy * rdy + rdz * rdz > cutoff_sq)
+                    continue;'''),
 )
 for addition, original in clump_additions:
     assert normalized_helper.count(addition) == 1, 'Documented clump-filter addition changed'
@@ -215,7 +236,7 @@ assert hashlib.sha256(normalized_helper.encode()).hexdigest() == \
     '879bd6434401a6fd755c26bc180f6093a43b3c8b3cd93b26193abdc6701f4092', 'Particle arithmetic/source callback changed from frozen baseline'
 cpp = prelude + arena + types + traits + '\nnamespace body_fitted_fmm {\n' + callback + helpers + current + reference + '\n}\n' + cases
 
-# Execute the unchanged production filter expressions in both occupancy paths.
+# Execute production local and remote filter expressions in both occupancy paths.
 # One source in lane zero makes scalar shuffle/ballot shims sufficient; the
 # force primitive is a marker, so this verifies filtering and mass placement,
 # while the frozen hash above still pins the real arithmetic callback/order.
@@ -258,9 +279,57 @@ template<bool OUTER,class Compute> void check_source_filters(){
             throw std::runtime_error("production source helper clump/null/self filter regression");
     }
 }
+template<bool OUTER,class Compute> void check_remote_source_filters(){
+    UnifiedNode node{};node.begin=0;node.count=1;
+    int order[1]={7},source_ids[8]{};double pos[8]{},sx[32]{},sy[32]{},sz[32]{};
+    float mass[8]{};mass[7]=1;Compute sm[32]{};
+    for(unsigned mask:{1u,31u})for(int scenario=0;scenario<6;++scenario){
+        int target_clump=11;source_ids[7]=11;const int* source_filter=source_ids;
+        bool included=true;
+        if(scenario==0)source_filter=nullptr;
+        if(scenario==1)included=false;
+        if(scenario==2)source_ids[7]=12;
+        if(scenario==3)target_clump=source_ids[7]=0;
+        if(scenario==4)target_clump=0;
+        if(scenario==5)source_ids[7]=0;
+        Compute x=0,y=0,z=0;primitive_calls=0;
+        // Remote target indices deliberately have no meaning in the source arrays.
+        grouped_p2p_source_warp<OUTER,Compute>(0,true,mask,-1,
+            0.,0.,0.,Compute(2),x,y,z,&node,pos,pos,pos,mass,order,0,
+            sx,sy,sz,sm,Compute(1),Compute(0),0.,nullptr,target_clump,source_filter);
+        const Compute multiplier=included?Compute(OUTER?1:2):Compute(0);
+        if(primitive_calls!=int(included)||x!=2*multiplier||y!=3*multiplier||z!=5*multiplier)
+            throw std::runtime_error("production remote clump/null filter or force units regression");
+    }
+}
+
+template<bool OUTER,class Compute> void check_shear_source_filters(){
+    UnifiedNode node{};node.begin=0;node.count=1;
+    int order[1]={7},ids[8]{};ids[2]=ids[7]=11;
+    double px[8]{},zero[8]{},sx[32]{},sy[32]{},sz[32]{};
+    float mass[8]{};mass[7]=1;Compute sm[32]{};
+    for(unsigned mask:{1u,31u})for(bool remote:{false,true})
+    for(double separation:{0.,0.05,0.1,1.}) {
+        px[7]=separation;Compute x=0,y=0,z=0;primitive_calls=0;
+        grouped_p2p_source_warp<OUTER,Compute>(0,true,mask,remote?-1:2,
+            0.,0.,0.,Compute(2),x,y,z,&node,px,zero,zero,mass,order,0,
+            sx,sy,sz,sm,Compute(1),Compute(0),0.,remote?nullptr:ids,
+            remote?11:0,remote?ids:nullptr,0.01);
+        // D=0.1; only the close copy is internal. The exact boundary and
+        // distant replica are retained (the full body envelope has a margin).
+        const bool included=separation>=0.1;
+        const Compute multiplier=included?Compute(OUTER?1:2):Compute(0);
+        if(primitive_calls!=int(included)||x!=2*multiplier||y!=3*multiplier||z!=5*multiplier)
+            throw std::runtime_error("shear clump image identity regression");
+    }
+}
 int main(){check_source_filters<false,float>();check_source_filters<true,float>();
     check_source_filters<false,double>();check_source_filters<true,double>();
-    std::puts("Production P2P source filters PASS cases=48 (sparse/dense, force/acceleration, float/double)");}
+    check_remote_source_filters<false,float>();check_remote_source_filters<true,float>();
+    check_remote_source_filters<false,double>();check_remote_source_filters<true,double>();
+    check_shear_source_filters<false,float>();check_shear_source_filters<true,float>();
+    check_shear_source_filters<false,double>();check_shear_source_filters<true,double>();
+    std::puts("Production P2P source filters PASS cases=160 (local/remote, sparse/dense, force/acceleration, float/double)");}
 '''
 source_cpp = prelude + arena + types + source_shims + source_helper + source_cases
 if args.emit:

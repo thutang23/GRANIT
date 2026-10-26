@@ -115,6 +115,7 @@ public:
     static void distributed_particle_work(std::vector<DistributedFMMParticleWork>& work,
                                           cudaStream_t stream=0);
     static void set_distributed_compute_depth(int depth);
+    static void set_distributed_clump_exclusion_diameter(double diameter);
     static void set_distributed_partition(const ::cudadem::DomainParamsGPU& params);
     static void initialize(const ::cudadem::SimConfig& config, int max_particles);
     static void shutdown();
@@ -150,6 +151,11 @@ public:
     // Multi-GPU compute uses the common Morton grid and compact halo exchange.
     // Empty owners still publish an epoch. The communicator must be initialized;
     // a non-Morton configuration is supported only with one rank.
+    // Optional membership is refreshed after migration. The caller guarantees every
+    // clump diameter is below the actual source-tree leaf width. Clump mode
+    // requires controlled 3D DEM, zero occupancy fallbacks, and no projection.
+    // Shear images additionally require 2*diameter < min(Lx,Ly), preserving
+    // nonlocal replicas while the near filter removes the internal body copy.
 #ifdef CUDADEM_HAVE_LET
     static void compute_multigpu(
         ::cudadem::SimulationState& state,
@@ -159,7 +165,8 @@ public:
         ::cudadem::LETCommunicator& let_comm,
         uint64_t gravity_evaluation_epoch,
         double evaluation_time,
-        cudaStream_t stream = 0);
+        cudaStream_t stream = 0,
+        const int* gravity_clump_ids = nullptr);
 
     // Collective RESPA slow-force endpoint.  Unlike compute_multigpu(), this
     // writes acceleration (not force) to gravity_force_* and receives an
@@ -172,7 +179,8 @@ public:
         ::cudadem::LETCommunicator& let_comm,
         uint64_t gravity_evaluation_epoch,
         double evaluation_time,
-        cudaStream_t stream = 0);
+        cudaStream_t stream = 0,
+        const int* gravity_clump_ids = nullptr);
 #endif
 
     static void build_tree(::cudadem::SimulationState& state, const ::cudadem::SimConfig& config,
