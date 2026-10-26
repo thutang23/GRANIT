@@ -269,7 +269,8 @@ public:
         double current_time,
         uint64_t gravity_evaluation_epoch,
         class LETCommunicator* let_comm,
-        cudaStream_t stream = 0
+        cudaStream_t stream = 0,
+        const int* gravity_clump_ids = nullptr
     );
 #endif
 
@@ -360,7 +361,8 @@ public:
         double evaluation_time,
         uint64_t gravity_evaluation_epoch,
         class LETCommunicator* let_comm,
-        cudaStream_t stream = 0
+        cudaStream_t stream = 0,
+        const int* gravity_clump_ids = nullptr
     );
 #endif
 

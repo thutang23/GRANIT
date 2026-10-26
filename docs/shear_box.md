@@ -85,7 +85,7 @@ contact duration with roughly 10--100 integration steps.
 
 ## Multi-GPU execution
 
-The `granit_multigpu` executable accepts fresh shear-box DEM inputs on GPUs
+The `granit_multigpu` executable accepts shear-box DEM inputs on GPUs
 within one node. Add the following settings to an otherwise complete shear-box
 configuration, retaining its materials, time step, particle input, and domain:
 
@@ -114,12 +114,32 @@ neighbor:
   update_frequency: 1
 ```
 
-`neighbor.method: cll` is also supported for DEM shear boxes. It rebuilds
-2D XY cell bins at each contact evaluation using the current particle support
+For ordinary-sphere DEM shear boxes, `neighbor.method: cll` is also supported.
+It rebuilds 2D XY cell bins at each contact evaluation using the current particle support
 extent and shear phase, then checks full 3D distances. The contact search
 requires `2*max_support+verlet_skin` to be less than half each planar box
 length so every particle pair has a unique periodic image. The vertical box
 extent does not constrain the bin size. `update_frequency` must remain `1`.
+
+Rigid clumps use the distributed small-clump path with LBVH neighbors and Morton
+ownership. With self-gravity, retain `tree_dimension: 3`,
+`gravity_update_rate: 1`, `gravity_macro_dt: 0`,
+`direct_threshold_leaf: 0`, `direct_threshold_internal: 0`, and
+`enable_global_projection: false`. Both fixed and adaptive common depth are
+supported. Body centers use the exact Hill drift; full-tensor angular dynamics
+include gyroscopic and Hill torques. Rigid reconstruction and unwrapped moment
+arms preserve bodies crossing sliding faces.
+
+Let `D` be the maximum full clump bounding diameter, including sphere radii.
+Require `2D < min(Lx,Ly) * (1 - 1e-6)` for a unique internal image. Gravity also
+requires `D < h_leaf * (1 - 1e-6)`, using the finite-image source root and actual
+effective FMM depth. Same-body internal pairs are excluded, while the body's
+other finite replicas remain gravitational sources. Adaptive clump runs count
+all logical X/Y gravity replicas and enforce at most 128 global source particles
+per leaf before every evaluation. The allowed depth interval must satisfy this
+occupancy limit, the diameter limit, configured bounds, and memory constraints;
+an empty intersection is a normal descriptive error. These checks do not change
+the finite-image gravity model described above.
 
 Keep `shear_box.gravity_images.cutoff_radius: 0.0` when comparing the uncut multi-GPU gravity calculation. All compared runs must use
 the same physical particles, image layers, and force parameters. A positive
@@ -152,10 +172,15 @@ as full solver timings when assessing this diagnostic difference.
 The tree uses a fixed image-envelope root. Observed vertical extents determine
 the allocation bound, but particles leaving that root fail the containment
 check; the root does not expand automatically in `z`. Contact ownership itself
-has no vertical split. Checkpoint/resume through `granit_multigpu` remains
-unsupported: use a fresh `INPUT` record, not an `OUTPUT` or `CHECKPOINT` record.
-The existing shear exclusions for SPH, clumps, and incompatible forcing also
-remain in force.
+has no vertical split. Distributed clump checkpoint/resume preserves body state,
+member/contact histories, and winding through the checkpoint and its mandatory
+`.distributed_clumps` sidecar. Fixed-depth restart can change rank count;
+adaptive restart requires the same ranks/backend/configuration and the matching
+`.adaptive_fmm_depth` sidecar as well. Preserve `time_origin` across restart.
+See [distributed small-clump DEM](MultiGPU_Clumps.md) for the complete contract.
+Shear checkpoint/resume for ordinary-sphere-only multi-GPU DEM, standalone
+single-GPU shear clumps, SPH shear boxes, and incompatible forcing remain
+unsupported.
 
 Build with an installed CUDA compiler and select the devices available to the run:
 

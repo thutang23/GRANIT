@@ -1053,6 +1053,7 @@ struct ShearFMMSourceArena {
     double* pos_y = nullptr;
     double* pos_z = nullptr;
     float* mass = nullptr;
+    int* clump_ids = nullptr; // allocated only for rigid-clump scenes
     double* before_x = nullptr;
     double* before_y = nullptr;
     double* before_z = nullptr;
@@ -1146,7 +1147,8 @@ static int shear_occupied_node_bound(const SimulationState& state, const SimConf
 __global__ void materialize_shear_gravity_sources_kernel(
     const double* source_x, const double* source_y, const double* source_z,
     const float* source_mass, int source_count, ShearGravityImages images,
-    double* image_x, double* image_y, double* image_z, float* image_mass)
+    double* image_x, double* image_y, double* image_z, float* image_mass,
+    const int* source_clump_ids = nullptr, int* image_clump_ids = nullptr)
 {
     const int out = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = source_count * (2*images.layers_x+1);
@@ -1159,6 +1161,7 @@ __global__ void materialize_shear_gravity_sources_kernel(
     image_y[out] = shear_gravity_canonical_y(source_y[source],nx,images);
     image_z[out] = source_z[source];
     image_mass[out] = source_mass[source];
+    if (image_clump_ids) image_clump_ids[out] = source_clump_ids[source];
 }
 
 static void ensure_shear_source_arena(int gpu, int count)
@@ -1169,6 +1172,8 @@ static void ensure_shear_source_arena(int gpu, int count)
     if (arena.pos_y) cudaFree(arena.pos_y);
     if (arena.pos_z) cudaFree(arena.pos_z);
     if (arena.mass) cudaFree(arena.mass);
+    if (arena.clump_ids) cudaFree(arena.clump_ids);
+    arena.clump_ids = nullptr;
     if (arena.before_x) cudaFree(arena.before_x);
     if (arena.before_y) cudaFree(arena.before_y);
     if (arena.before_z) cudaFree(arena.before_z);
@@ -1257,34 +1262,14 @@ static int shear_effective_depth(const UnifiedFMMConfig& fmm,
                                  const ShearGravityImages& images,
                                  const PeriodicBoundaryConfig& pbc)
 {
-    // WallManager populates all box lengths for a shear box, including a
-    // non-periodic z extent.  The reference and super-root must use the same
-    // physical z span or adding replicas would silently coarsen central cells.
-    const double zspan = pbc.box_length_z > 0.0f
-        ? static_cast<double>(pbc.box_length_z)
-        : std::min(images.length_x, images.length_y);
-    const int requested=fmm.tree_depth + shear_fmm_capacity::depth_offset(
-        images.length_x, images.length_y, zspan, images.layers_x, images.layers_y);
-    // Highly elongated boxes still need an integer-cell Y translation. This
-    // only refines an otherwise coarser requested tree; it never coarsens it.
-    return std::max(requested,shear_fmm_capacity::alignment_level(
-        images.length_x, images.length_y, zspan, images.layers_x, images.layers_y));
+    return shear_fmm_effective_depth(fmm, images, pbc);
 }
 
 static double4 shear_static_root(const ShearGravityImages& images,
                                  const PeriodicBoundaryConfig& pbc,
                                  const SimConfig& config)
 {
-    const double zmin = pbc.periodic_z ? pbc.box_min_z : config.domain.box_min.z;
-    const double zmax = pbc.periodic_z ? pbc.box_max_z : config.domain.box_max.z;
-    const double span_z = std::max(1.0e-30, zmax - zmin);
-    const double side = shear_fmm_capacity::root_side(
-        images.length_x, images.length_y, span_z, images.layers_x, images.layers_y);
-    const double cx = 0.5 * (pbc.box_min_x + pbc.box_max_x);
-    const double cy = 0.5 * (pbc.box_min_y + pbc.box_max_y);
-    const double cz = 0.5 * (zmin + zmax);
-    return make_double4(cx - 0.5 * side, cy - 0.5 * side,
-                        cz - 0.5 * side, side);
+    return shear_fmm_static_root(images, pbc, config);
 }
 
 static void configure_distributed_shear_geometry(int gpu,const SimConfig& config,
@@ -2099,6 +2084,12 @@ void UnifiedFMMDispatcher::set_distributed_compute_depth(int depth) {
     state.compute_depth=depth;
 }
 
+void UnifiedFMMDispatcher::set_distributed_clump_exclusion_diameter(double diameter) {
+    if (!std::isfinite(diameter) || diameter < 0)
+        throw std::invalid_argument("Invalid distributed clump exclusion diameter");
+    distributed_fmm_[current_gpu()].clump_exclusion_diameter = diameter;
+}
+
 void UnifiedFMMDispatcher::set_distributed_partition(const ::cudadem::DomainParamsGPU& params) {
     set_distributed_fmm_partition(current_gpu(), params);
 }
@@ -2546,6 +2537,7 @@ void UnifiedFMMDispatcher::shutdown() {
     if (shear_arena.pos_y) cudaFree(shear_arena.pos_y);
     if (shear_arena.pos_z) cudaFree(shear_arena.pos_z);
     if (shear_arena.mass) cudaFree(shear_arena.mass);
+    if (shear_arena.clump_ids) cudaFree(shear_arena.clump_ids);
     if (shear_arena.before_x) cudaFree(shear_arena.before_x);
     if (shear_arena.before_y) cudaFree(shear_arena.before_y);
     if (shear_arena.before_z) cudaFree(shear_arena.before_z);
@@ -2592,6 +2584,7 @@ void UnifiedFMMDispatcher::shutdown_all() {
         if (shear_arena.pos_y) cudaFree(shear_arena.pos_y);
         if (shear_arena.pos_z) cudaFree(shear_arena.pos_z);
         if (shear_arena.mass) cudaFree(shear_arena.mass);
+    if (shear_arena.clump_ids) cudaFree(shear_arena.clump_ids);
         if (shear_arena.before_x) cudaFree(shear_arena.before_x);
         if (shear_arena.before_y) cudaFree(shear_arena.before_y);
         if (shear_arena.before_z) cudaFree(shear_arena.before_z);
@@ -2746,13 +2739,15 @@ static void run_p2p_inner(int gpu_id, ::cudadem::SimulationState& state,
         body_fitted_fmm::grouped_p2p_leaf_only_allowed(
             persistent_tree_runtime_[gpu_id].host_context.command.disable_direct_fallback,
             persistent_tree_runtime_[gpu_id].host_context.command.cutoff_radius),
-        gravity_clump_ids);
+        gravity_clump_ids, shear_target_count_[gpu_id] > 0 ?
+            distributed.clump_exclusion_diameter*distributed.clump_exclusion_diameter : 0.0);
     if (distributed.evaluating) body_fitted_fmm::launch_p2p_remote_leaves<false>(
         distributed.remote_lists.near_view(),dd,
         &persistent_tree_runtime_[gpu_id].device_context->metadata,
         state.particles.pos_x,state.particles.pos_y,state.particles.pos_z,state.particles.mass,
         state.particles.force_x,state.particles.force_y,state.particles.force_z,
-        G,softening,stream);
+        G,softening,stream,gravity_clump_ids, shear_target_count_[gpu_id] > 0 ?
+            distributed.clump_exclusion_diameter*distributed.clump_exclusion_diameter : 0.0);
 
 }
 
@@ -2785,13 +2780,15 @@ static void run_p2p_outer(int gpu_id, ::cudadem::SimulationState& state,
         body_fitted_fmm::grouped_p2p_leaf_only_allowed(
             persistent_tree_runtime_[gpu_id].host_context.command.disable_direct_fallback,
             persistent_tree_runtime_[gpu_id].host_context.command.cutoff_radius),
-        gravity_clump_ids);
+        gravity_clump_ids, shear_target_count_[gpu_id] > 0 ?
+            distributed.clump_exclusion_diameter*distributed.clump_exclusion_diameter : 0.0);
     if (distributed.evaluating) body_fitted_fmm::launch_p2p_remote_leaves<true>(
         distributed.remote_lists.near_view(),dd,
         &persistent_tree_runtime_[gpu_id].device_context->metadata,
         state.particles.pos_x,state.particles.pos_y,state.particles.pos_z,state.particles.mass,
         state.particles.gravity_force_x,state.particles.gravity_force_y,state.particles.gravity_force_z,
-        G,softening,stream);
+        G,softening,stream,gravity_clump_ids, shear_target_count_[gpu_id] > 0 ?
+            distributed.clump_exclusion_diameter*distributed.clump_exclusion_diameter : 0.0);
 
 }
 
@@ -2812,12 +2809,14 @@ void UnifiedFMMDispatcher::compute(
     const int* gravity_clump_ids)
 {
     (void)neighbor_data;
-    if(gravity_clump_ids &&
-       (config.physics!=SimulationPhysics::DEM || config.shear_box.enabled ||
-        pbc.periodic_x || pbc.periodic_y || pbc.periodic_z ||
-        config.acceleration.unified_fmm.adaptive_depth.enabled ||
-        distributed_fmm_[current_gpu()].evaluating))
-        throw std::invalid_argument("clump membership filtering requires nonperiodic fixed-depth single-GPU DEM");
+    if (gravity_clump_ids) {
+        const bool controlled_shear = distributed_fmm_[current_gpu()].evaluating &&
+            (config.shear_box.enabled || shear_target_count_[current_gpu()] > 0);
+        if (config.physics != SimulationPhysics::DEM ||
+            ((!controlled_shear) && (pbc.periodic_x || pbc.periodic_y || pbc.periodic_z)) ||
+            config.acceleration.unified_fmm.adaptive_depth.enabled)
+            throw std::invalid_argument("clump gravity requires an explicitly controlled DEM FMM depth and supported boundaries");
+    }
     const ShearGravityImages shear_images =
         make_shear_gravity_images(config, pbc, evaluation_time);
 
@@ -2860,6 +2859,8 @@ void UnifiedFMMDispatcher::compute(
         ensure_shear_fmm_capacity(staged_config, total, current_gpu());
         const int gpu = current_gpu();
         auto& arena = shear_source_arena_[gpu];
+        if (gravity_clump_ids && !arena.clump_ids)
+            CUDA_CHECK(cudaMalloc(&arena.clump_ids, sizeof(int)*size_t(arena.capacity)));
         const size_t target_bytes = static_cast<size_t>(central_count) *
                                     sizeof(double);
         CUDA_CHECK(cudaMemcpyAsync(arena.before_x, state.particles.force_x,
@@ -2873,7 +2874,8 @@ void UnifiedFMMDispatcher::compute(
             block, 0, stream>>>(
             state.particles.pos_x, state.particles.pos_y, state.particles.pos_z,
             state.particles.mass, central_count, shear_images,
-            arena.pos_x, arena.pos_y, arena.pos_z, arena.mass);
+            arena.pos_x, arena.pos_y, arena.pos_z, arena.mass,
+            gravity_clump_ids, gravity_clump_ids ? arena.clump_ids : nullptr);
         CUDA_CHECK(cudaGetLastError());
 
         SimulationState staged = state;
@@ -2891,10 +2893,13 @@ void UnifiedFMMDispatcher::compute(
         preflight_shear_float_centers(
             shear_fixed_root_[gpu],
             staged_config.acceleration.unified_fmm.tree_depth);
+        const int* staged_ids = gravity_clump_ids ? arena.clump_ids : nullptr;
+        distributed_fmm_[gpu].gravity_clump_ids = staged_ids;
         try {
             compute(staged, staged_config, neighbor_data, pbc, evaluation_time,
-                    stream, synchronize_at_end);
+                    stream, synchronize_at_end, staged_ids);
         } catch (...) {
+            distributed_fmm_[gpu].gravity_clump_ids = gravity_clump_ids;
             shear_node_bound_[gpu] = 0;
             persistent_tree_runtime_[gpu].pending_presorted = body_fitted_fmm::PresortedMortonInput{};
             shear_target_count_[gpu] = 0;
@@ -2902,6 +2907,7 @@ void UnifiedFMMDispatcher::compute(
             shear_fixed_root_[gpu] = make_double4(0.0, 0.0, 0.0, 0.0);
             throw;
         }
+        distributed_fmm_[gpu].gravity_clump_ids = gravity_clump_ids;
         if (config.io.output_gravity_force) {
             cache_shear_gravity_force_kernel<<<(central_count + block - 1) / block,
                 block, 0, stream>>>(
@@ -3183,12 +3189,14 @@ void UnifiedFMMDispatcher::compute_outer(
 {
 
     (void)neighbor_data;
-    if(gravity_clump_ids &&
-       (config.physics!=SimulationPhysics::DEM || config.shear_box.enabled ||
-        pbc.periodic_x || pbc.periodic_y || pbc.periodic_z ||
-        config.acceleration.unified_fmm.adaptive_depth.enabled ||
-        distributed_fmm_[current_gpu()].evaluating))
-        throw std::invalid_argument("clump membership filtering requires nonperiodic fixed-depth single-GPU DEM");
+    if (gravity_clump_ids) {
+        const bool controlled_shear = distributed_fmm_[current_gpu()].evaluating &&
+            (config.shear_box.enabled || shear_target_count_[current_gpu()] > 0);
+        if (config.physics != SimulationPhysics::DEM ||
+            ((!controlled_shear) && (pbc.periodic_x || pbc.periodic_y || pbc.periodic_z)) ||
+            config.acceleration.unified_fmm.adaptive_depth.enabled)
+            throw std::invalid_argument("clump gravity requires an explicitly controlled DEM FMM depth and supported boundaries");
+    }
     const ShearGravityImages shear_images =
         make_shear_gravity_images(config, pbc, evaluation_time);
     if (shear_images.enabled) {
@@ -3227,6 +3235,8 @@ void UnifiedFMMDispatcher::compute_outer(
         ensure_shear_fmm_capacity(staged_config, total, current_gpu());
         const int gpu = current_gpu();
         auto& arena = shear_source_arena_[gpu];
+        if (gravity_clump_ids && !arena.clump_ids)
+            CUDA_CHECK(cudaMalloc(&arena.clump_ids, sizeof(int)*size_t(arena.capacity)));
         const size_t target_bytes = static_cast<size_t>(central_count) *
                                     sizeof(double);
         // compute_outer overwrites the retained acceleration with the new
@@ -3238,7 +3248,8 @@ void UnifiedFMMDispatcher::compute_outer(
         materialize_shear_gravity_sources_kernel<<<(total + block - 1) / block,
             block, 0, stream>>>(state.particles.pos_x, state.particles.pos_y,
             state.particles.pos_z, state.particles.mass, central_count,
-            shear_images, arena.pos_x, arena.pos_y, arena.pos_z, arena.mass);
+            shear_images, arena.pos_x, arena.pos_y, arena.pos_z, arena.mass,
+            gravity_clump_ids, gravity_clump_ids ? arena.clump_ids : nullptr);
         CUDA_CHECK(cudaGetLastError());
         SimulationState staged = state;
         staged.particles.pos_x = arena.pos_x; staged.particles.pos_y = arena.pos_y;
@@ -3253,10 +3264,13 @@ void UnifiedFMMDispatcher::compute_outer(
         preflight_shear_float_centers(
             shear_fixed_root_[gpu],
             staged_config.acceleration.unified_fmm.tree_depth);
+        const int* staged_ids = gravity_clump_ids ? arena.clump_ids : nullptr;
+        distributed_fmm_[gpu].gravity_clump_ids = staged_ids;
         try {
             compute_outer(staged, staged_config, neighbor_data, pbc,
-                          evaluation_time, stream);
+                          evaluation_time, stream, staged_ids);
         } catch (...) {
+            distributed_fmm_[gpu].gravity_clump_ids = gravity_clump_ids;
             shear_node_bound_[gpu] = 0;
             persistent_tree_runtime_[gpu].pending_presorted = body_fitted_fmm::PresortedMortonInput{};
             shear_target_count_[gpu] = 0;
@@ -3264,6 +3278,7 @@ void UnifiedFMMDispatcher::compute_outer(
             shear_fixed_root_[gpu] = make_double4(0.0, 0.0, 0.0, 0.0);
             throw;
         }
+        distributed_fmm_[gpu].gravity_clump_ids = gravity_clump_ids;
         if (!distributed_fmm_[gpu].evaluating || distributed_fmm_[gpu].local_only) launch_shear_force_balance<true>(arena, state, central_count,
             config.shear_box.force_balance_warn_threshold, stream);
         shear_node_bound_[gpu] = 0;
@@ -3437,11 +3452,25 @@ void UnifiedFMMDispatcher::compute_multigpu(
     ::cudadem::LETCommunicator& let_comm,
     uint64_t gravity_evaluation_epoch,
     double evaluation_time,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const int* gravity_clump_ids)
 {
     const int distributed_gpu = current_gpu();
     auto& distributed = distributed_fmm_[distributed_gpu];
+    if (gravity_clump_ids) {
+        const auto& f = config.acceleration.unified_fmm;
+        if (config.physics != SimulationPhysics::DEM ||
+            (!config.shear_box.enabled && (pbc.periodic_x || pbc.periodic_y || pbc.periodic_z)) ||
+            f.tree_dimension != 3 || f.enable_global_projection ||
+            f.direct_threshold_leaf != 0 || f.direct_threshold_internal != 0 ||
+            (f.adaptive_depth.enabled && (!distributed.enabled || distributed.compute_depth < 2)))
+            throw std::invalid_argument("multi-GPU clump gravity requires controlled 3D DEM, supported boundaries, projection disabled, and zero direct occupancy thresholds");
+        if (config.shear_box.enabled && (!(distributed.clump_exclusion_diameter > 0) ||
+            !(2*distributed.clump_exclusion_diameter < std::min(double(pbc.box_length_x), double(pbc.box_length_y)))))
+            throw std::invalid_argument("shear clump gravity requires twice the maximum clump diameter below both planar box lengths");
+    }
     if (distributed.enabled) {
+        distributed.gravity_clump_ids = gravity_clump_ids;
         distributed.coordinator = let_comm.coordinator();
         distributed.epoch = gravity_evaluation_epoch;
         distributed.evaluating = true;
@@ -3463,6 +3492,14 @@ void UnifiedFMMDispatcher::compute_multigpu(
             SimulationState gravity_state=state;
             const bool projection=config.acceleration.unified_fmm.enable_global_projection && !config.shear_box.enabled;
             const int n=state.particles.num_local;
+            const bool cache_clump_gravity=gravity_clump_ids && config.io.output_gravity_force &&
+                !config.shear_box.enabled && !projection;
+            if(cache_clump_gravity && n){
+                distributed.gravity_x.reserve(n);distributed.gravity_y.reserve(n);distributed.gravity_z.reserve(n);
+                CUDA_CHECK(cudaMemcpyAsync(distributed.gravity_x.data,state.particles.force_x,n*sizeof(double),cudaMemcpyDeviceToDevice,stream));
+                CUDA_CHECK(cudaMemcpyAsync(distributed.gravity_y.data,state.particles.force_y,n*sizeof(double),cudaMemcpyDeviceToDevice,stream));
+                CUDA_CHECK(cudaMemcpyAsync(distributed.gravity_z.data,state.particles.force_z,n*sizeof(double),cudaMemcpyDeviceToDevice,stream));
+            }
             if(projection&&n){
                 distributed.gravity_x.reserve(n);distributed.gravity_y.reserve(n);distributed.gravity_z.reserve(n);
                 gravity_state.particles.force_x=distributed.gravity_x.data;
@@ -3474,7 +3511,7 @@ void UnifiedFMMDispatcher::compute_multigpu(
             }
             if (n > 0) {
                 MultigpuOwnedOnlyScope owned_only(distributed_gpu);
-                compute(gravity_state, staged, neighbor_data, pbc, evaluation_time, stream, false);
+                compute(gravity_state, staged, neighbor_data, pbc, evaluation_time, stream, false, gravity_clump_ids);
             } else {
                 invalidate_workload_view(distributed_gpu);
                 mark_distributed_fmm_phase(distributed_gpu,1,stream);
@@ -3489,13 +3526,20 @@ void UnifiedFMMDispatcher::compute_multigpu(
                 if(n)bf_add_distributed_gravity<<<(n+255)/256,256,0,stream>>>(state.particles.force_x,state.particles.force_y,state.particles.force_z,
                     gravity_state.particles.force_x,gravity_state.particles.force_y,gravity_state.particles.force_z,n);
             }
+            if(cache_clump_gravity && n)
+                cache_shear_gravity_force_kernel<<<(n+255)/256,256,0,stream>>>(
+                    state.particles.force_x,state.particles.force_y,state.particles.force_z,
+                    distributed.gravity_x.data,distributed.gravity_y.data,distributed.gravity_z.data,
+                    state.particles.gravity_force_x,state.particles.gravity_force_y,state.particles.gravity_force_z,n);
         } catch (...) {
             distributed.evaluating = false;
+            distributed.gravity_clump_ids = nullptr;
             if (distributed.coordinator) distributed.coordinator->abort();
             throw;
         }
         mark_distributed_fmm_phase(distributed_gpu,6,stream);
         distributed.evaluating = false;
+        distributed.gravity_clump_ids = nullptr;
         return;
     }
 
@@ -3503,7 +3547,7 @@ void UnifiedFMMDispatcher::compute_multigpu(
         throw std::invalid_argument("Multi-GPU BFFMM requires multigpu.morton_ownership=true");
     if (state.particles.num_local > 0) {
         MultigpuOwnedOnlyScope owned_only(distributed_gpu);
-        compute(state,config,neighbor_data,pbc,evaluation_time,stream,false);
+        compute(state,config,neighbor_data,pbc,evaluation_time,stream,false,gravity_clump_ids);
     } else invalidate_workload_view(distributed_gpu);
 }
 
@@ -3515,11 +3559,25 @@ void UnifiedFMMDispatcher::compute_outer_multigpu(
     ::cudadem::LETCommunicator& let_comm,
     uint64_t gravity_evaluation_epoch,
     double evaluation_time,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const int* gravity_clump_ids)
 {
     const int distributed_gpu = current_gpu();
     auto& distributed = distributed_fmm_[distributed_gpu];
+    if (gravity_clump_ids) {
+        const auto& f = config.acceleration.unified_fmm;
+        if (config.physics != SimulationPhysics::DEM ||
+            (!config.shear_box.enabled && (pbc.periodic_x || pbc.periodic_y || pbc.periodic_z)) ||
+            f.tree_dimension != 3 || f.enable_global_projection ||
+            f.direct_threshold_leaf != 0 || f.direct_threshold_internal != 0 ||
+            (f.adaptive_depth.enabled && (!distributed.enabled || distributed.compute_depth < 2)))
+            throw std::invalid_argument("multi-GPU clump gravity requires controlled 3D DEM, supported boundaries, projection disabled, and zero direct occupancy thresholds");
+        if (config.shear_box.enabled && (!(distributed.clump_exclusion_diameter > 0) ||
+            !(2*distributed.clump_exclusion_diameter < std::min(double(pbc.box_length_x), double(pbc.box_length_y)))))
+            throw std::invalid_argument("shear clump gravity requires twice the maximum clump diameter below both planar box lengths");
+    }
     if (distributed.enabled) {
+        distributed.gravity_clump_ids = gravity_clump_ids;
         distributed.coordinator = let_comm.coordinator();
         distributed.epoch = gravity_evaluation_epoch;
         distributed.evaluating = true;
@@ -3540,7 +3598,7 @@ void UnifiedFMMDispatcher::compute_outer_multigpu(
             configure_distributed_shear_geometry(distributed_gpu,staged,pbc,evaluation_time);
             if (state.particles.num_local > 0) {
                 MultigpuOwnedOnlyScope owned_only(distributed_gpu);
-                compute_outer(state, staged, neighbor_data, pbc, evaluation_time, stream);
+                compute_outer(state, staged, neighbor_data, pbc, evaluation_time, stream, gravity_clump_ids);
             } else {
                 invalidate_workload_view(distributed_gpu);
                 mark_distributed_fmm_phase(distributed_gpu,1,stream);
@@ -3554,11 +3612,13 @@ void UnifiedFMMDispatcher::compute_outer_multigpu(
                 bf_distributed_projection(distributed_gpu,state,true,stream);
         } catch (...) {
             distributed.evaluating = false;
+            distributed.gravity_clump_ids = nullptr;
             if (distributed.coordinator) distributed.coordinator->abort();
             throw;
         }
         mark_distributed_fmm_phase(distributed_gpu,6,stream);
         distributed.evaluating = false;
+        distributed.gravity_clump_ids = nullptr;
         return;
     }
 
@@ -3566,7 +3626,7 @@ void UnifiedFMMDispatcher::compute_outer_multigpu(
         throw std::invalid_argument("Multi-GPU BFFMM requires multigpu.morton_ownership=true");
     if (state.particles.num_local > 0) {
         MultigpuOwnedOnlyScope owned_only(distributed_gpu);
-        compute_outer(state,config,neighbor_data,pbc,evaluation_time,stream);
+        compute_outer(state,config,neighbor_data,pbc,evaluation_time,stream,gravity_clump_ids);
     } else invalidate_workload_view(distributed_gpu);
 }
 #endif // CUDADEM_HAVE_LET

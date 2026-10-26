@@ -6,6 +6,7 @@
 // =============================================================================
 
 #include "system_initialize.h"
+#include "particle_clump_order.h"
 #include "command_line_interface.h"
 #include "binary_reader.h"
 #include "../wall/wall.h"
@@ -295,17 +296,11 @@ void canonicalize_particle_clump_order(
     ParticleSoA& p, ContactHistoryBuffer* contact_history,
     bool preserve_active_order) {
     const int32_t n=p.num_particles; if(n<=1) return;
-    std::vector<int32_t> id(n), order; std::vector<uint8_t> life(n); CUDA_CHECK(cudaMemcpy(id.data(),p.clump_id,n*sizeof(int32_t),cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(life.data(),p.lifecycle_state,n*sizeof(uint8_t),cudaMemcpyDeviceToHost));
-    int32_t max_id=0; for(int v:id){if(v < -1) throw std::runtime_error("invalid clump_id");max_id=std::max(max_id,v);} order.reserve(n);
-    for(int i=0;i<n;++i) { if(life[i] > 1) throw std::runtime_error("invalid lifecycle_state"); }
-    if (preserve_active_order) {
-        for(int i=0;i<n;++i) if(id[i]>=0 && life[i]==0) order.push_back(i);
-    } else {
-        for(int i=0;i<n;++i) if(id[i]==0 && life[i]==0) order.push_back(i);
-        for(int c=1;c<=max_id;++c) for(int i=0;i<n;++i) if(id[i]==c && life[i]==0) order.push_back(i);
-    }
-    for(int i=0;i<n;++i) if(life[i]!=0 || id[i]==-1) order.push_back(i);
-    if((int)order.size()!=n) throw std::runtime_error("invalid clump partition");
+    std::vector<int32_t> id(n);
+    std::vector<uint8_t> life(n);
+    CUDA_CHECK(cudaMemcpy(id.data(),p.clump_id,n*sizeof(int32_t),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(life.data(),p.lifecycle_state,n*sizeof(uint8_t),cudaMemcpyDeviceToHost));
+    const std::vector<int32_t> order=particle_clump_order(id,life,preserve_active_order);
 #define PERMUTE_PARTICLE_FIELD(name,type) do { std::vector<type> a(n), b(n); CUDA_CHECK(cudaMemcpy(a.data(),p.name,n*sizeof(type),cudaMemcpyDeviceToHost)); for(int i=0;i<n;++i)b[i]=a[order[i]]; CUDA_CHECK(cudaMemcpy(p.name,b.data(),n*sizeof(type),cudaMemcpyHostToDevice)); } while(0)
     PERMUTE_PARTICLE_FIELD(pos_x,double);PERMUTE_PARTICLE_FIELD(pos_y,double);PERMUTE_PARTICLE_FIELD(pos_z,double);PERMUTE_PARTICLE_FIELD(last_pos_x,double);PERMUTE_PARTICLE_FIELD(last_pos_y,double);PERMUTE_PARTICLE_FIELD(last_pos_z,double);
     PERMUTE_PARTICLE_FIELD(vel_x,double);PERMUTE_PARTICLE_FIELD(vel_y,double);PERMUTE_PARTICLE_FIELD(vel_z,double);PERMUTE_PARTICLE_FIELD(force_x,double);PERMUTE_PARTICLE_FIELD(force_y,double);PERMUTE_PARTICLE_FIELD(force_z,double);PERMUTE_PARTICLE_FIELD(gravity_force_x,double);PERMUTE_PARTICLE_FIELD(gravity_force_y,double);PERMUTE_PARTICLE_FIELD(gravity_force_z,double);PERMUTE_PARTICLE_FIELD(omega_x,double);PERMUTE_PARTICLE_FIELD(omega_y,double);PERMUTE_PARTICLE_FIELD(omega_z,double);PERMUTE_PARTICLE_FIELD(torque_x,double);PERMUTE_PARTICLE_FIELD(torque_y,double);PERMUTE_PARTICLE_FIELD(torque_z,double);PERMUTE_PARTICLE_FIELD(quat_w,double);PERMUTE_PARTICLE_FIELD(quat_x,double);PERMUTE_PARTICLE_FIELD(quat_y,double);PERMUTE_PARTICLE_FIELD(quat_z,double);PERMUTE_PARTICLE_FIELD(energy,double);PERMUTE_PARTICLE_FIELD(energy_cold,double);PERMUTE_PARTICLE_FIELD(energy_thermal_peak,double);PERMUTE_PARTICLE_FIELD(pressure_peak,double);PERMUTE_PARTICLE_FIELD(fracture_area,double);PERMUTE_PARTICLE_FIELD(fragment_length,double);PERMUTE_PARTICLE_FIELD(damping_energy,double);PERMUTE_PARTICLE_FIELD(dedt,double);

@@ -34,6 +34,7 @@ enum class DistributedFMMDepthEvent : uint8_t {
     SampleDropped,
     EffectiveCeilingChanged,
     Frozen,
+    EffectiveBoundsChanged,
 };
 
 // Produced after a full-rebuild evaluation. `elapsed_ns` must cover the whole local
@@ -68,6 +69,7 @@ struct DistributedFMMDepthGpuState {
     int32_t selected_depth = 0;
     int32_t candidate_depth = 0;
     int32_t effective_max_depth = 0;
+    int32_t effective_min_depth = 0;
     int32_t search_direction = 1;
     int32_t confirmation_count = 0;
     int32_t selected_evaluations_since_trial = 0;
@@ -138,6 +140,11 @@ public:
     // clamps that GPU's selected/candidate depths and resumes correctly.
     void set_effective_max_depth(int32_t gpu, int32_t effective_max_depth,
                                  uint64_t epoch);
+    // Hard geometry/occupancy bounds are refreshed before launching gravity.
+    // epoch is the highest already-launched gravity epoch; all older queued
+    // samples are invalidated when either bound changes.
+    void set_effective_depth_range(int32_t gpu, int32_t effective_min_depth,
+                                   int32_t effective_max_depth, uint64_t epoch);
     void freeze(const std::string& reason, uint64_t epoch = 0);
 
     std::vector<DistributedFMMDepthDiagnostic> diagnostics() const;
@@ -158,6 +165,8 @@ private:
     enum class TrialPhase : uint8_t { SelectedA, CandidateB, CandidateB2, SelectedA2 };
 
     bool valid_gpu_locked(int32_t gpu) const;
+    void set_effective_depth_range_locked(int32_t gpu, int32_t minimum,
+                                         int32_t maximum, uint64_t epoch);
     void process_epoch_locked(uint64_t epoch,
                               const std::vector<DistributedFMMDepthEpochTiming>& timings);
     void begin_next_trial_locked(uint64_t epoch);

@@ -3,6 +3,7 @@
 #include "../constant/command_line_interface.h"
 #include "../shear/shear_box.h"
 #include "../wall/wall.h"
+#include "body_fitted_fmm/shear_fmm_capacity.h"
 
 #include <cstdint>
 #include <limits>
@@ -96,6 +97,30 @@ __host__ __device__ inline void shear_gravity_image_indices(
         }
     }
     image_x = image_y = 0;
+}
+
+// Shared by the source builder and the admissible-depth census. The physical
+// box/ownership grid is distinct from this finite-image gravity envelope.
+inline int shear_fmm_effective_depth(const UnifiedFMMConfig& fmm,
+    const ShearGravityImages& images, const PeriodicBoundaryConfig& pbc)
+{
+    const double zspan = pbc.box_length_z > 0.0f
+        ? double(pbc.box_length_z) : std::min(images.length_x, images.length_y);
+    return std::max(fmm.tree_depth + shear_fmm_capacity::depth_offset(
+        images.length_x, images.length_y, zspan, images.layers_x, images.layers_y),
+        shear_fmm_capacity::alignment_level(images.length_x, images.length_y,
+            zspan, images.layers_x, images.layers_y));
+}
+
+inline double4 shear_fmm_static_root(const ShearGravityImages& images,
+    const PeriodicBoundaryConfig& pbc, const SimConfig& config)
+{
+    const double zmin = pbc.periodic_z ? pbc.box_min_z : config.domain.box_min.z;
+    const double zmax = pbc.periodic_z ? pbc.box_max_z : config.domain.box_max.z;
+    const double side = shear_fmm_capacity::root_side(images.length_x,
+        images.length_y, std::max(1.0e-30, zmax-zmin), images.layers_x, images.layers_y);
+    return make_double4(0.5*(pbc.box_min_x+pbc.box_max_x)-0.5*side,
+        0.5*(pbc.box_min_y+pbc.box_max_y)-0.5*side, 0.5*(zmin+zmax)-0.5*side, side);
 }
 
 } // namespace cudadem

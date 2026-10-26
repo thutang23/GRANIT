@@ -6,7 +6,8 @@ __global__ void fmm_p2p_remote_leaves_kernel(
     FMMRemoteP2PList list,const PersistentTreeMetadata* metadata,
     const UnifiedNode* nodes,const int* target_order,
     const double* pos_x,const double* pos_y,const double* pos_z,const float* mass,
-    double* out_x,double* out_y,double* out_z,Compute G,Compute softening) {
+    double* out_x,double* out_y,double* out_z,Compute G,Compute softening,
+    const int* target_clump_ids, double clump_exclusion_distance_sq) {
     __shared__ double sx[4][32],sy[4][32],sz[4][32];
     __shared__ Compute sm[4][32];
     const int lane=threadIdx.x&31,warp=threadIdx.x>>5;
@@ -24,6 +25,7 @@ __global__ void fmm_p2p_remote_leaves_kernel(
                 x=pos_x[original];y=pos_y[original];z=pos_z[original];mi=Compute(mass[original]);
                 fx=out_x[original];fy=out_y[original];fz=out_z[original];
             }
+            const int target_clump = active && target_clump_ids ? target_clump_ids[original] : 0;
             int peer=-1;Compute ax=0,ay=0,az=0;
             for(uint64_t i=list.offsets[leaf];i<list.offsets[leaf+1];++i) {
                 const auto ref=list.sources[i];
@@ -35,7 +37,8 @@ __global__ void fmm_p2p_remote_leaves_kernel(
                 const auto& source=list.peers[peer];
                 grouped_p2p_source_warp<OUTER>(ref.node,active,mask,-1,x,y,z,mi,ax,ay,az,
                     source.nodes,source.x,source.y,source.z,source.mass,source.order,lane,
-                    sx[warp],sy[warp],sz[warp],sm[warp],G,copysign(softening*softening, softening),cutoff_sq);
+                    sx[warp],sy[warp],sz[warp],sm[warp],G,copysign(softening*softening, softening),cutoff_sq,
+                    nullptr,target_clump,source.clump_ids,clump_exclusion_distance_sq);
             }
             if(active) {
                 out_x[original]=fx+double(ax);out_y[original]=fy+double(ay);out_z[original]=fz+double(az);
@@ -48,15 +51,16 @@ template<bool OUTER>
 inline void launch_p2p_remote_leaves(FMMRemoteP2PList list,const fmm::FMMDeviceData& dd,
     const PersistentTreeMetadata* metadata,const double* x,const double* y,const double* z,
     const float* mass,double* out_x,double* out_y,double* out_z,
-    double G,double softening,cudaStream_t stream) {
+    double G,double softening,cudaStream_t stream,const int* target_clump_ids = nullptr,
+    double clump_exclusion_distance_sq = 0.0) {
     if(!list.count)return;
     const int grid=std::min(2048,(list.count+3)/4);
     if (softening < 0) {
     fmm_p2p_remote_leaves_kernel<OUTER, double><<<grid,128,0,stream>>>(list,metadata,dd.unified_nodes,
-        dd.sorted_to_original,x,y,z,mass,out_x,out_y,out_z,double(G),double(softening));
+        dd.sorted_to_original,x,y,z,mass,out_x,out_y,out_z,double(G),double(softening),target_clump_ids,clump_exclusion_distance_sq);
     } else {
     fmm_p2p_remote_leaves_kernel<OUTER><<<grid,128,0,stream>>>(list,metadata,dd.unified_nodes,
-        dd.sorted_to_original,x,y,z,mass,out_x,out_y,out_z,p2p_real_t(G),p2p_real_t(softening));
+        dd.sorted_to_original,x,y,z,mass,out_x,out_y,out_z,p2p_real_t(G),p2p_real_t(softening),target_clump_ids,clump_exclusion_distance_sq);
     }
     CUDA_CHECK(cudaGetLastError());
 }

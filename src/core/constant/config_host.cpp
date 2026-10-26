@@ -1725,8 +1725,8 @@ SimConfig parse_yaml(const std::string& yaml_path) {
                 config.acceleration.unified_fmm.tree_dimension != 3)
                 throw std::runtime_error("multi-GPU shear_box requires a 3D gravity tree; ownership uses XY only");
         }
-        if (config.clump.num_instances > 0)
-            throw std::runtime_error("shear_box does not support clumps");
+        if (config.clump.num_instances > 0 && !config.multigpu.enabled)
+            throw std::runtime_error("single-GPU shear_box does not support clumps; use the common-tree multi-GPU runner");
         if (config.neighbor.method != NeighborMethod::LBVH &&
             config.neighbor.method != NeighborMethod::CELL_LINKED_LIST)
             throw std::runtime_error("shear_box requires neighbor.method: lbvh or cll");
@@ -2080,9 +2080,10 @@ SimConfig parse_yaml(const std::string& yaml_path) {
     }
     if (config.clump.num_instances > 0 &&
         config.acceleration.gravity_method == SelfGravityMethod::BFFMM &&
-        config.acceleration.unified_fmm.adaptive_depth.enabled) {
+        config.acceleration.unified_fmm.adaptive_depth.enabled &&
+        !(config.multigpu.enabled && morton_fmm)) {
         throw std::runtime_error(
-            "adaptive unified_fmm tree depth does not support clump gravity");
+            "adaptive clump gravity requires the controlled common-tree multi-GPU runner");
     }
 
     if (morton_fmm) {

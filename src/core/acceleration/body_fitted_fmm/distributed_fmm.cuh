@@ -73,6 +73,7 @@ struct FMMSourcePublication {
     int count = 0;
     const int32_t* global_ids = nullptr;
     int targets = 0;
+    const int* clump_ids = nullptr; // optional parallel membership payload
     int image_layers_y = 0, image_alignment_level = 0;
     double image_length_y = 0;
 };
@@ -115,8 +116,10 @@ struct FMMQueryPeer {
     FMMDeviceBuffer<double> halo_x, halo_y, halo_z;
     FMMDeviceBuffer<float> halo_mass;
     FMMDeviceBuffer<FMMSourceParticle> halo_particles;
+    FMMDeviceBuffer<int> particle_clump_ids, halo_clump_ids;
     uint64_t route_generation=~uint64_t{0};
     size_t particle_count=0;
+    bool has_clump_ids=false;
     ~FMMQueryPeer() {
         if (!stream) return;
         int saved = 0; cudaGetDevice(&saved); cudaSetDevice(device);
@@ -199,6 +202,8 @@ struct DistributedFMMState {
     std::vector<std::vector<int>> debug_node_members, debug_target_members;
     size_t debug_index_count = 0;
     bool enabled = false;
+    const int* gravity_clump_ids = nullptr; // valid only during this device epoch
+    double clump_exclusion_diameter = 0.0;
     int compute_depth = 0;
     FMMGpuPlan gpu_plan;
     cudaEvent_t phase_events[9]{};

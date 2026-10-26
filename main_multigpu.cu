@@ -42,6 +42,8 @@
 #include "src/domain/async_rebalance.h"
 #include "src/domain/multigpu_phase_coordinator.h"
 #include "src/domain/distributed_yorp_coordinator.h"
+#include "src/domain/distributed_clumps.cuh"
+#include "src/domain/fmm_depth_constraints.cuh"
 #include "src/domain/distributed_fmm_depth_controller.h"
 
 #include <cuda_runtime.h>
@@ -63,6 +65,7 @@
 #include <type_traits>
 #include <cstdlib>
 #include <mutex>
+#include <cstring>
 
 #ifndef CUDADEM_CPU_MOCK
 #include <thrust/device_ptr.h>
@@ -198,7 +201,8 @@ __global__ void compute_contact_forces_multigpu_kernel(
     int32_t num_local_particles,  // particles with index >= this are ghosts
     bool shear_enabled = false,
     float shear_length_x = 0.0f, float shear_length_y = 0.0f,
-    float shear_reduced_shift = 0.0f, float shear_velocity = 0.0f
+    float shear_reduced_shift = 0.0f, float shear_velocity = 0.0f,
+    bool canonical_pair_evaluation = false
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_contacts) return;
@@ -220,37 +224,47 @@ __global__ void compute_contact_forces_multigpu_kernel(
     // CRITICAL: Skip if owner is a ghost particle (only compute forces for locals)
     if (owner_idx >= num_local_particles) return;
 
+    // A clump scene evaluates both directed owner passes in the same stable
+    // global-ID order. Recomputing the reversed pair changes the FP32 contact
+    // arms Ap/An by ULPs and loses exact Newton force/torque correspondence.
+    // The directed history still belongs to owner_idx and migrates with it.
+    const bool reverse_evaluation = canonical_pair_evaluation &&
+        global_id[owner_idx] > global_id[partner_idx];
+    const int32_t evaluation_owner = reverse_evaluation ? partner_idx : owner_idx;
+    const int32_t evaluation_partner = reverse_evaluation ? owner_idx : partner_idx;
+
     // Load owner particle properties
-    float po_x = static_cast<float>(pos_x[owner_idx]);
-    float po_y = static_cast<float>(pos_y[owner_idx]);
-    float po_z = static_cast<float>(pos_z[owner_idx]);
-    float vo_x = vel_x[owner_idx], vo_y = vel_y[owner_idx], vo_z = vel_z[owner_idx];
-    float wo_x = omega_x[owner_idx], wo_y = omega_y[owner_idx], wo_z = omega_z[owner_idx];
-    float R_o = radius[owner_idx];
-    float m_o = mass[owner_idx];
-    float I_o = moment_of_inertia[owner_idx];
-    const int32_t material_o = material_id[owner_idx];
+    float po_x = static_cast<float>(pos_x[evaluation_owner]);
+    float po_y = static_cast<float>(pos_y[evaluation_owner]);
+    float po_z = static_cast<float>(pos_z[evaluation_owner]);
+    float vo_x = vel_x[evaluation_owner], vo_y = vel_y[evaluation_owner], vo_z = vel_z[evaluation_owner];
+    float wo_x = omega_x[evaluation_owner], wo_y = omega_y[evaluation_owner], wo_z = omega_z[evaluation_owner];
+    float R_o = radius[evaluation_owner];
+    float m_o = mass[evaluation_owner];
+    float I_o = moment_of_inertia[evaluation_owner];
+    const int32_t material_o = material_id[evaluation_owner];
     if (material_o < 0 || static_cast<uint32_t>(material_o) >= material_count) return;
 
     // Load partner particle properties
-    float pp_x = static_cast<float>(pos_x[partner_idx]);
-    float pp_y = static_cast<float>(pos_y[partner_idx]);
-    float pp_z = static_cast<float>(pos_z[partner_idx]);
-    float vp_x = vel_x[partner_idx], vp_y = vel_y[partner_idx], vp_z = vel_z[partner_idx];
+    float pp_x = static_cast<float>(pos_x[evaluation_partner]);
+    float pp_y = static_cast<float>(pos_y[evaluation_partner]);
+    float pp_z = static_cast<float>(pos_z[evaluation_partner]);
+    float vp_x = vel_x[evaluation_partner], vp_y = vel_y[evaluation_partner], vp_z = vel_z[evaluation_partner];
     if (shear_enabled) {
         // The pair stores the image of j relative to i.  The second pass
         // changes owner and therefore needs the inverse lattice transform.
-        const int ix = FlipParticles ? -contact.image_x : contact.image_x;
-        const int iy = FlipParticles ? -contact.image_y : contact.image_y;
+        const bool reverse_image=FlipParticles != reverse_evaluation;
+        const int ix = reverse_image ? -contact.image_x : contact.image_x;
+        const int iy = reverse_image ? -contact.image_y : contact.image_y;
         pp_x += ix * shear_length_x;
         pp_y += iy * shear_length_y - ix * shear_reduced_shift;
         vp_y -= ix * shear_velocity;
     }
-    float wp_x = omega_x[partner_idx], wp_y = omega_y[partner_idx], wp_z = omega_z[partner_idx];
-    float R_p = radius[partner_idx];
-    float m_p = mass[partner_idx];
-    float I_p = moment_of_inertia[partner_idx];
-    const int32_t material_p = material_id[partner_idx];
+    float wp_x = omega_x[evaluation_partner], wp_y = omega_y[evaluation_partner], wp_z = omega_z[evaluation_partner];
+    float R_p = radius[evaluation_partner];
+    float m_p = mass[evaluation_partner];
+    float I_p = moment_of_inertia[evaluation_partner];
+    const int32_t material_p = material_id[evaluation_partner];
     if (material_p < 0 || static_cast<uint32_t>(material_p) >= material_count) return;
     const DemInteractionProperties& pair = interactions[
         static_cast<size_t>(material_o) * material_count + material_p];
@@ -292,6 +306,15 @@ __global__ void compute_contact_forces_multigpu_kernel(
         }
     }
 
+    // Tangential spring force, rolling moment, and twisting moment histories
+    // are world-frame vectors. Swapping the two particles reverses all three;
+    // the tangent plane itself is unchanged under n -> -n.
+    if (reverse_evaluation) {
+        H_t_x=-H_t_x; H_t_y=-H_t_y; H_t_z=-H_t_z;
+        H_r_x=-H_r_x; H_r_y=-H_r_y; H_r_z=-H_r_z;
+        H_tw_x=-H_tw_x; H_tw_y=-H_tw_y; H_tw_z=-H_tw_z;
+    }
+
     // Compute contact forces
     ContactForceResult result = compute_contact_forces(
         po_x, po_y, po_z, vo_x, vo_y, vo_z, wo_x, wo_y, wo_z,
@@ -307,7 +330,26 @@ __global__ void compute_contact_forces_multigpu_kernel(
         pair.cohesion_enabled != 0, pair.cohesion_strength, dt
     );
 
-    // Update contact history (only for i-pass to avoid double updates)
+    if (reverse_evaluation) {
+        // Select the canonical partner's physical force and torque. Its arm
+        // is An, which is deliberately computed alongside Ap in one call.
+        result.force_x=-result.force_x;
+        result.force_y=-result.force_y;
+        result.force_z=-result.force_z;
+        result.torque_x=result.torque_j_x;
+        result.torque_y=result.torque_j_y;
+        result.torque_z=result.torque_j_z;
+        result.delta_t_x=-result.delta_t_x;
+        result.delta_t_y=-result.delta_t_y;
+        result.delta_t_z=-result.delta_t_z;
+        result.delta_r_x=-result.delta_r_x;
+        result.delta_r_y=-result.delta_r_y;
+        result.delta_r_z=-result.delta_r_z;
+        result.delta_tw_x=-result.delta_tw_x;
+        result.delta_tw_y=-result.delta_tw_y;
+        result.delta_tw_z=-result.delta_tw_z;
+    }
+
     // Update Contact History for the owner particle
     // =========================================================================
     // Each particle has its own independent history buffer.
@@ -360,8 +402,8 @@ __global__ void compute_contact_forces_multigpu_kernel(
     // Apply forces and torques to owner particle
     // compute_contact_forces(owner, partner, ...) returns force AND torque
     // on the owner particle. Both passes must apply their respective torques.
-    // The flipped pass swaps owner and partner before evaluating the contact,
-    // so compute_contact_forces already returns the reaction on that owner.
+    // Canonical evaluation selects the appropriate side explicitly; the
+    // established unclumped path retains its directed owner evaluation.
     atomicAdd(&force_x[owner_idx], result.force_x);
     atomicAdd(&force_y[owner_idx], result.force_y);
     atomicAdd(&force_z[owner_idx], result.force_z);
@@ -454,7 +496,7 @@ private:
             checkpoint.launch_depth<config_.acceleration.unified_fmm.adaptive_depth.min_depth ||
             checkpoint.launch_depth>config_.acceleration.unified_fmm.adaptive_depth.max_depth ||
             !std::isfinite(checkpoint.grid.size) || !(checkpoint.grid.size>0) ||
-            checkpoint.grid.dimension!=config_.acceleration.unified_fmm.tree_dimension ||
+            checkpoint.grid.dimension!=(config_.shear_box.enabled?2:config_.acceleration.unified_fmm.tree_dimension) ||
             checkpoint.grid.depth<2 || checkpoint.grid.depth>20)
             throw std::runtime_error("Invalid/mismatched common FMM checkpoint (backend/rank/configuration)");
         std::string bytes(header.payload_size-sizeof(checkpoint),'\0');
@@ -509,6 +551,12 @@ private:
     RCBWorkSampleMailbox rcb_sample_mailbox_;
     MultiGPUPhaseCoordinator phase_coordinator_;
     DistributedYorpCoordinator distributed_yorp_;
+    DistributedClumps distributed_clumps_;
+    FMMDepthConstraintCensus clump_depth_census_;
+    std::string clump_collective_error_;
+    int clump_logged_base_=-1,clump_logged_min_=-1,clump_logged_max_=-1;
+    double clump_logged_leaf_width_=-1.0;
+    std::vector<std::string> clump_depth_errors_;
     DistributedFMMDepthController distributed_fmm_depth_;
     static constexpr int32_t kTimingEventSlots = 4;
     // Flat [gpu * kTimingEventSlots + slot] rings.  Completed samples are
@@ -530,10 +578,196 @@ private:
         std::vector<double> omega_x,omega_y,omega_z,torque_x,torque_y,torque_z,energy;
         std::vector<double> density;
         std::vector<float> radius,mass,moi,smoothing_length,pressure,c_sound,damage;
+        std::vector<float> clump_off_x,clump_off_y,clump_off_z;
         std::vector<int32_t> global_id,material_id,clump_id;
         std::vector<int64_t> winding_x,winding_y,winding_z;
         int32_t size() const { return static_cast<int32_t>(clump_id.size()); }
     } dead_rows_;
+
+    struct DEMExactRow {
+        int32_t gid, wall_count;
+        double force[3], torque[3];
+    };
+    struct DEMClumpCheckpointHeader {
+        char magic[8];
+        uint32_t version, body_bytes, wall_bytes, contact_stride, wall_stride, bodies;
+        uint64_t particles, walls, clump_fingerprint, checkpoint_hash, payload_hash;
+        MortonGrid ownership_root;
+        uint64_t cuts[MAX_MULTI_GPUS+1];
+        double bounds[6];
+        uint32_t ranks;
+        int64_t step;
+        double time, dt;
+    };
+    std::vector<DistributedClumpBody> restored_bodies_;
+    std::vector<DEMExactRow> restored_exact_rows_;
+    std::vector<ContactHistory> restored_contacts_;
+    std::vector<int32_t> restored_contact_counts_, restored_contact_gids_;
+    std::vector<WallContactHistory> restored_wall_rows_;
+    std::vector<size_t> restored_wall_offsets_;
+    int restored_contact_stride_=16, restored_wall_stride_=16;
+    uint32_t restored_owner_ranks_=0;
+
+    static uint64_t checkpoint_bytes_hash(uint64_t hash,const void* bytes,size_t count) {
+        const auto* data=static_cast<const unsigned char*>(bytes);
+        for(size_t i=0;i<count;++i){hash^=data[i];hash*=1099511628211ULL;}
+        return hash;
+    }
+    static uint64_t checkpoint_file_hash(const std::string& path) {
+        std::ifstream file(path,std::ios::binary);
+        if(!file)throw std::runtime_error("Cannot read checkpoint for clump-sidecar binding: "+path);
+        uint64_t hash=1469598103934665603ULL;char bytes[65536];
+        while(file){file.read(bytes,sizeof(bytes));hash=checkpoint_bytes_hash(hash,bytes,file.gcount());}
+        return hash;
+    }
+    template<class T> static uint64_t checkpoint_vector_hash(uint64_t hash,const std::vector<T>& rows) {
+        return checkpoint_bytes_hash(hash,rows.data(),rows.size()*sizeof(T));
+    }
+    void restore_dem_clump_checkpoint(const std::string& path,SimulationState& global) {
+        DEMClumpCheckpointHeader header{};
+        std::ifstream file(path+".distributed_clumps",std::ios::binary);
+        file.read(reinterpret_cast<char*>(&header),sizeof(header));
+        if(!file||std::memcmp(header.magic,"MGCLMP1",8)!=0||header.version!=2||
+           header.body_bytes!=sizeof(DistributedClumpBody)||header.wall_bytes!=sizeof(WallContactHistory)||
+           header.bodies!=static_cast<uint32_t>(config_.clump.num_instances)||
+           header.particles!=static_cast<uint64_t>(global.particles.num_particles)||
+           header.step!=global.current_step||header.time!=global.current_time||header.dt!=global.dt||
+           header.clump_fingerprint!=config_.clump.clump_metadata_fingerprint||
+           header.ranks==0||header.ranks>MAX_MULTI_GPUS||
+           header.ownership_root.dimension!=(config_.shear_box.enabled?2:3)||
+           !(header.ownership_root.size>0)||!std::isfinite(header.ownership_root.size)||
+           header.ownership_root.depth<2||header.ownership_root.depth>20||
+           header.contact_stride==0||header.contact_stride>1024||header.wall_stride==0||header.wall_stride>1024||
+           header.walls>header.particles*header.wall_stride||header.checkpoint_hash!=checkpoint_file_hash(path))
+            throw std::runtime_error("Missing, corrupt or mismatched distributed-clump checkpoint sidecar: "+path);
+        const uint64_t expected_size=sizeof(header)+uint64_t(header.bodies)*sizeof(DistributedClumpBody)+
+            header.particles*sizeof(DEMExactRow)+header.walls*sizeof(WallContactHistory);
+        file.seekg(0,std::ios::end);
+        if(!file||static_cast<uint64_t>(file.tellg())!=expected_size)throw std::runtime_error("Corrupt distributed-clump checkpoint size: "+path);
+        file.seekg(sizeof(header));
+        restored_contact_stride_=header.contact_stride;restored_wall_stride_=header.wall_stride;
+        restored_owner_ranks_=header.ranks;
+        domain_params_.domain_min_x=header.bounds[0];domain_params_.domain_min_y=header.bounds[1];domain_params_.domain_min_z=header.bounds[2];
+        domain_params_.domain_max_x=header.bounds[3];domain_params_.domain_max_y=header.bounds[4];domain_params_.domain_max_z=header.bounds[5];
+        std::vector<uint64_t> cuts;
+        if(header.ranks==static_cast<uint32_t>(num_gpus_))cuts.assign(header.cuts,header.cuts+num_gpus_+1);
+        else {
+            const int n=global.particles.num_particles;std::vector<double> x(n),y(n),z(n);
+            CUDA_CHECK(cudaMemcpy(x.data(),global.particles.pos_x,n*sizeof(double),cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(y.data(),global.particles.pos_y,n*sizeof(double),cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(z.data(),global.particles.pos_z,n*sizeof(double),cudaMemcpyDeviceToHost));
+            std::vector<MortonLeafWeight> weights;weights.reserve(n);
+            for(int i=0;i<n;++i)weights.push_back({header.ownership_root.leaf_begin(header.ownership_root.key(x[i],y[i],z[i])),1.});
+            cuts=weighted_morton_cuts(std::move(weights),header.ownership_root,num_gpus_);
+        }
+        DomainManager::set_morton_partition(domain_params_,header.ownership_root,cuts);
+        domain_params_.restore_morton_partition=true;
+        restored_bodies_.resize(header.bodies);restored_exact_rows_.resize(header.particles);restored_wall_rows_.resize(header.walls);
+        auto read=[&](auto& rows){file.read(reinterpret_cast<char*>(rows.data()),rows.size()*sizeof(rows[0]));};
+        read(restored_bodies_);read(restored_exact_rows_);read(restored_wall_rows_);
+        const uint64_t expected_hash=header.payload_hash;header.payload_hash=0;
+        uint64_t hash=checkpoint_bytes_hash(1469598103934665603ULL,&header,sizeof(header));
+        hash=checkpoint_vector_hash(hash,restored_bodies_);
+        hash=checkpoint_vector_hash(hash,restored_exact_rows_);hash=checkpoint_vector_hash(hash,restored_wall_rows_);
+        if(!file||file.peek()!=std::char_traits<char>::eof()||hash!=expected_hash)
+            throw std::runtime_error("Corrupt distributed-clump checkpoint payload: "+path);
+        for(size_t c=0;c<restored_bodies_.size();++c){const auto& body=restored_bodies_[c];
+            if(body.cid!=static_cast<int32_t>(c+1)||!(body.mass>0)||!std::isfinite(body.mass))
+                throw std::runtime_error("Invalid authoritative clump body in checkpoint");
+            double norm=0;for(double q:body.pose.quat)norm+=q*q;
+            if(!std::isfinite(norm)||std::fabs(norm-1)>1.e-10)throw std::runtime_error("Invalid clump checkpoint orientation");
+            for(double x:body.pose.com)if(!std::isfinite(x))throw std::runtime_error("Invalid clump checkpoint COM");
+            for(double x:body.pose.vel)if(!std::isfinite(x))throw std::runtime_error("Invalid clump checkpoint velocity");
+            for(double x:body.pose.omega)if(!std::isfinite(x))throw std::runtime_error("Invalid clump checkpoint spin");
+            for(double x:body.inertia)if(!std::isfinite(x))throw std::runtime_error("Invalid clump checkpoint inertia");
+            for(double x:body.wrench.f)if(!std::isfinite(x))throw std::runtime_error("Invalid clump checkpoint force");
+            for(double x:body.wrench.t)if(!std::isfinite(x))throw std::runtime_error("Invalid clump checkpoint torque");
+        }
+        restored_wall_offsets_.assign(restored_exact_rows_.size()+1,0);
+        for(size_t i=0;i<restored_exact_rows_.size();++i){const auto& row=restored_exact_rows_[i];
+            if((i&&row.gid<=restored_exact_rows_[i-1].gid)||row.wall_count<0||row.wall_count>restored_wall_stride_)
+                throw std::runtime_error("Invalid particle IDs/wall counts in clump checkpoint");
+            restored_wall_offsets_[i+1]=restored_wall_offsets_[i]+row.wall_count;
+        }
+        if(restored_wall_offsets_.back()!=restored_wall_rows_.size())throw std::runtime_error("Invalid clump checkpoint wall-history payload");
+        const int n=global.particles.num_particles;
+        std::vector<int32_t> gids(n);CUDA_CHECK(cudaMemcpy(gids.data(),global.particles.global_id,n*sizeof(int32_t),cudaMemcpyDeviceToHost));
+        std::vector<double> fx(n),fy(n),fz(n),tx(n),ty(n),tz(n);
+        for(int i=0;i<n;++i){const auto& row=restored_exact_rows_[restart_exact_index(gids[i])];
+            fx[i]=row.force[0];fy[i]=row.force[1];fz[i]=row.force[2];tx[i]=row.torque[0];ty[i]=row.torque[1];tz[i]=row.torque[2];}
+        auto put=[&](auto* target,const auto& rows){CUDA_CHECK(cudaMemcpy(target,rows.data(),n*sizeof(rows[0]),cudaMemcpyHostToDevice));};
+        put(global.particles.force_x,fx);put(global.particles.force_y,fy);put(global.particles.force_z,fz);
+        put(global.particles.torque_x,tx);put(global.particles.torque_y,ty);put(global.particles.torque_z,tz);
+        if(!global.particles.input_has_clump_offset)throw std::runtime_error("Distributed DEM restart requires stored body-frame offsets");
+    }
+    size_t restart_exact_index(int32_t gid) const {
+        const auto row=std::lower_bound(restored_exact_rows_.begin(),restored_exact_rows_.end(),gid,
+            [](const DEMExactRow& row,int32_t value){return row.gid<value;});
+        if(row==restored_exact_rows_.end()||row->gid!=gid)throw std::runtime_error("Checkpoint particle global ID is missing");
+        return row-restored_exact_rows_.begin();
+    }
+    void stage_dem_checkpoint_contacts(const SimulationState& global) {
+        const int n=global.particles.num_particles;restored_contact_gids_.resize(n);restored_contact_counts_.resize(n);
+        CUDA_CHECK(cudaMemcpy(restored_contact_gids_.data(),global.particles.global_id,n*sizeof(int32_t),cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(restored_contact_counts_.data(),global.particles.num_contacts,n*sizeof(int32_t),cudaMemcpyDeviceToHost));
+        const int stride=global.contact_history.max_contacts_per_particle;
+        if(stride!=restored_contact_stride_&&std::any_of(restored_contact_counts_.begin(),restored_contact_counts_.end(),[](int x){return x>0;}))
+            throw std::runtime_error("DEM checkpoint contact stride does not match clump sidecar");
+        restored_contacts_.resize(static_cast<size_t>(n)*restored_contact_stride_);
+        if(stride==restored_contact_stride_)CUDA_CHECK(cudaMemcpy(restored_contacts_.data(),global.contact_history.data,
+            restored_contacts_.size()*sizeof(ContactHistory),cudaMemcpyDeviceToHost));
+    }
+    void restore_dem_rank_histories(GPUDomainState& state) {
+        const int n=state.subdomain.num_local_particles;std::vector<int32_t> gids(n),counts(n),wall_counts(n);
+        if(n)CUDA_CHECK(cudaMemcpy(gids.data(),state.local_state.particles.global_id,n*sizeof(int32_t),cudaMemcpyDeviceToHost));
+        std::vector<ContactHistory> contacts(static_cast<size_t>(n)*restored_contact_stride_);
+        std::vector<WallContactHistory> walls(static_cast<size_t>(n)*restored_wall_stride_);
+        std::vector<std::pair<int32_t,size_t>> lookup;lookup.reserve(restored_contact_gids_.size());
+        for(size_t i=0;i<restored_contact_gids_.size();++i)lookup.push_back({restored_contact_gids_[i],i});
+        std::sort(lookup.begin(),lookup.end());
+        for(int i=0;i<n;++i){const size_t exact=restart_exact_index(gids[i]);
+            const auto row=std::lower_bound(lookup.begin(),lookup.end(),std::make_pair(gids[i],size_t{0}));
+            if(row==lookup.end()||row->first!=gids[i])throw std::runtime_error("Missing checkpoint contact owner");
+            counts[i]=restored_contact_counts_[row->second];wall_counts[i]=restored_exact_rows_[exact].wall_count;
+            std::copy_n(restored_contacts_.data()+row->second*restored_contact_stride_,restored_contact_stride_,contacts.data()+static_cast<size_t>(i)*restored_contact_stride_);
+            if(wall_counts[i])std::copy_n(restored_wall_rows_.data()+restored_wall_offsets_[exact],wall_counts[i],walls.data()+static_cast<size_t>(i)*restored_wall_stride_);
+        }
+        if(n){CUDA_CHECK(cudaMemcpy(state.local_state.contact_history.data,contacts.data(),contacts.size()*sizeof(ContactHistory),cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(state.local_state.wall_contact_history.data,walls.data(),walls.size()*sizeof(WallContactHistory),cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(state.local_state.particles.num_contacts,counts.data(),n*sizeof(int32_t),cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(state.local_state.particles.num_wall_contacts,wall_counts.data(),n*sizeof(int32_t),cudaMemcpyHostToDevice));}
+        #pragma omp critical(clump_diagnostics)
+        std::cout<<"[clumps-restart] rank="<<state.gpu_id<<" restored_particles="<<n
+                 <<" contacts="<<std::accumulate(counts.begin(),counts.end(),int64_t{0})
+                 <<" wall_contacts="<<std::accumulate(wall_counts.begin(),wall_counts.end(),int64_t{0})<<'\n';
+    }
+
+    void save_dem_clump_sidecar(const std::string& path,const SimulationState& state,
+                               const std::vector<DEMExactRow>& exact,
+                               const std::vector<WallContactHistory>& walls,int contact_stride,int wall_stride) {
+        if(!domain_params_.morton_enabled||!domain_params_.morton_cuts)
+            throw std::runtime_error("Distributed clump checkpoints require an initialized Morton root and ownership cuts");
+        const auto bodies=distributed_clumps_.snapshot();DEMClumpCheckpointHeader header{};
+        std::memcpy(header.magic,"MGCLMP1",8);header.version=2;header.body_bytes=sizeof(DistributedClumpBody);
+        header.wall_bytes=sizeof(WallContactHistory);header.contact_stride=contact_stride;header.wall_stride=wall_stride;
+        header.bodies=bodies.size();header.particles=exact.size();header.walls=walls.size();
+        header.ownership_root=domain_params_.morton_grid;header.ranks=num_gpus_;
+        for(int rank=0;rank<=num_gpus_;++rank)header.cuts[rank]=domain_params_.morton_cuts[rank];
+        header.bounds[0]=domain_params_.domain_min_x;header.bounds[1]=domain_params_.domain_min_y;header.bounds[2]=domain_params_.domain_min_z;
+        header.bounds[3]=domain_params_.domain_max_x;header.bounds[4]=domain_params_.domain_max_y;header.bounds[5]=domain_params_.domain_max_z;
+        header.clump_fingerprint=config_.clump.clump_metadata_fingerprint;header.checkpoint_hash=checkpoint_file_hash(path);
+        header.step=state.current_step;header.time=state.current_time;header.dt=state.dt;
+        uint64_t hash=checkpoint_bytes_hash(1469598103934665603ULL,&header,sizeof(header));
+        hash=checkpoint_vector_hash(hash,bodies);hash=checkpoint_vector_hash(hash,exact);
+        header.payload_hash=checkpoint_vector_hash(hash,walls);
+        const std::string target=path+".distributed_clumps",temporary=target+".tmp";
+        std::ofstream file(temporary,std::ios::binary|std::ios::trunc);
+        file.write(reinterpret_cast<const char*>(&header),sizeof(header));
+        auto write=[&](const auto& rows){file.write(reinterpret_cast<const char*>(rows.data()),rows.size()*sizeof(rows[0]));};
+        write(bodies);write(exact);write(walls);file.close();
+        if(!file)throw std::runtime_error("Cannot write exact distributed-clump checkpoint: "+target);
+        std::filesystem::rename(temporary,target);
+    }
 
     int32_t num_gpus_;
     bool initialized_;
@@ -728,9 +962,6 @@ private:
             for (int32_t i = 0; i < live; ++i) seen[ids[i]] = 1;
             for (int32_t part = 0; part <= max_part_id; ++part)
                 if (!seen[part]) throw std::runtime_error("SPH Part IDs must be dense 0..K");
-        } else {
-            for (const int32_t id : ids) if (id > 0)
-                throw std::runtime_error("Multi-GPU does not support positive DEM clump_id values");
         }
         for (int32_t i = live; i < total; ++i)
             if (ids[i] != -1 && lifecycle[i] == 0)
@@ -738,7 +969,7 @@ private:
         if (live == 0) throw std::runtime_error("Multi-GPU input contains no live particles");
         const int32_t dead = total - live;
         if (dead == 0) return;
-        if (sph_mode_ && (resumed_ || config_.io.checkpoint_enabled))
+        if ((sph_mode_ || config_.clump.num_instances>0) && (resumed_ || config_.io.checkpoint_enabled))
             throw std::invalid_argument("Distributed SPH checkpoints require all rows live");
         auto copy_tail = [&](auto& dst, const auto* src) {
             using T = typename std::decay_t<decltype(dst)>::value_type;
@@ -755,6 +986,7 @@ private:
         copy_tail(dead_rows_.density,p.density); copy_tail(dead_rows_.pressure,p.pressure); copy_tail(dead_rows_.c_sound,p.c_sound);
         copy_tail(dead_rows_.damage,p.damage); copy_tail(dead_rows_.global_id,p.global_id);
         copy_tail(dead_rows_.material_id,p.material_id); copy_tail(dead_rows_.clump_id,p.clump_id);
+        copy_tail(dead_rows_.clump_off_x,p.clump_off_x); copy_tail(dead_rows_.clump_off_y,p.clump_off_y); copy_tail(dead_rows_.clump_off_z,p.clump_off_z);
         copy_tail(dead_rows_.winding_x,p.winding_x); copy_tail(dead_rows_.winding_y,p.winding_y);
         copy_tail(dead_rows_.winding_z,p.winding_z);
         if (sph_mode_) {
@@ -887,6 +1119,35 @@ public:
             }
         }
 
+        if (!sph_mode_ && config_.clump.num_instances > 0) {
+            auto clump_fail = [](const char* reason) {
+                throw std::invalid_argument(std::string("Distributed DEM clumps: ") + reason);
+            };
+            if (config_.neighbor.method != NeighborMethod::LBVH)
+                clump_fail("the initial distributed clump implementation requires neighbor.method: LBVH");
+            for (int wall=0; wall<config_.num_walls; ++wall)
+                if (!config_.shear_box.enabled && config_.walls[wall].enabled && config_.walls[wall].type == WallType::PERIODICAL)
+                    clump_fail("periodic boundaries are unsupported");
+            if (!config_.multigpu.morton_ownership) clump_fail("common Morton spatial ownership is required");
+            if (config_.acceleration.yorp.enabled || config_.acceleration.yorp.adaptive)
+                clump_fail("YORP is unsupported");
+            if (config_.damping.enabled) clump_fail("global damping is unsupported");
+            if (config_.acceleration.enable_accel_limit) clump_fail("acceleration limiting is unsupported");
+            if (!config_.shear_box.enabled && (config_.coord_system == CoordinateSystem::ROTATING || config_.acceleration.enable_inertial))
+                clump_fail("rotating and inertial frames are unsupported");
+            if (config_.acceleration.enable_self_gravity) {
+                const auto& fmm=config_.acceleration.unified_fmm;
+                if (config_.acceleration.gravity_update_rate != 1 || config_.acceleration.gravity_macro_dt != 0)
+                    clump_fail("self-gravity requires gravity_update_rate=1 and gravity_macro_dt=0");
+                if (fmm.tree_dimension!=3 ||
+                    (!fmm.adaptive_depth.enabled && fmm.tree_depth < 2))
+                    clump_fail("self-gravity requires depth>=2 and explicit 3D FMM topology");
+                if (fmm.enable_global_projection) clump_fail("self-gravity requires enable_global_projection=false");
+                if (fmm.direct_threshold_leaf != 0 || fmm.direct_threshold_internal != 0)
+                    clump_fail("self-gravity requires direct thresholds 0/0 to preserve M2L routing");
+            }
+        }
+
         // The released multi-GPU RESPA slice deliberately has a narrow
         // contract: isolated DEM/SPH with BFFMM only. Other force methods and the
         // distributed viscous-damping path have different force histories.
@@ -910,7 +1171,7 @@ public:
 
         resumed_ = config_.io.checkpoint_resume_from[0] != '\0';
         if (resumed_ || (sph_mode_ && config_.io.checkpoint_enabled)) {
-            if (!sph_mode_ || config_.shear_box.enabled) {
+            if ((!sph_mode_ && config_.clump.num_instances<=0) || (sph_mode_ && config_.shear_box.enabled)) {
                 throw std::invalid_argument(
                     "Multi-GPU checkpoints require isolated SPH");
             }
@@ -922,7 +1183,7 @@ public:
             : validate_particle_file(config_.io.input_particle_path, config_);
         if (!input_validation.success)
             throw std::runtime_error("Invalid multi-GPU input: " + input_validation.error_message);
-        if (resumed_) validate_sph_checkpoint_fields(config_.io.checkpoint_resume_from);
+        if (resumed_ && sph_mode_) validate_sph_checkpoint_fields(config_.io.checkpoint_resume_from);
 
         // Check multi-GPU configuration
         if (!config_.multigpu.enabled) {
@@ -955,6 +1216,9 @@ public:
         // Initialize domain manager
         domain_params_ = DomainManager::initialize(config_, num_gpus_, gpu_states_);
         morton_root_.initialize(num_gpus_);
+        if(config_.clump.num_instances>0&&config_.acceleration.enable_self_gravity&&
+            config_.acceleration.unified_fmm.adaptive_depth.enabled)
+            clump_depth_census_.initialize(num_gpus_);
         morton_balance_.initialize(num_gpus_);
         morton_work_collectors_.resize(num_gpus_);
         d_sph_hydro_owned_offsets_.resize(num_gpus_, nullptr);
@@ -962,6 +1226,7 @@ public:
         sph_hydro_offsets_valid_.resize(num_gpus_, 0);
         common_metrics_.resize(num_gpus_);
         common_depth_ceilings_.resize(num_gpus_);
+        clump_depth_errors_.resize(num_gpus_);
         common_work_totals_.resize(num_gpus_);
 
         // Initialize communicators
@@ -977,16 +1242,36 @@ public:
         SimulationState global_state = resumed_
             ? load_checkpoint(config_.io.checkpoint_resume_from, config_)
             : initialize_system(config_);
+        if(config_.shear_box.enabled && config_.clump.num_instances>0)
+            ShearBoxManager::initialize(global_state,config_);
+        ClumpStateSoA initial_clump_state;
+        ClumpSegmentOffsets initial_clump_segments;
         try {
+            if (resumed_ && !sph_mode_) {
+                restore_dem_clump_checkpoint(config_.io.checkpoint_resume_from,global_state);
+                canonicalize_particle_clump_order(global_state.particles,&global_state.contact_history);
+                stage_dem_checkpoint_contacts(global_state);
+            }
+            if (!sph_mode_ && !resumed_) {
+                const int capacity=std::max(1,config_.clump.num_instances);
+                initial_clump_state=allocate_clump_state(capacity);
+                initial_clump_segments=allocate_clump_segments(capacity);
+                initialize_clumps(config_,global_state.material_database,global_state.particles,
+                                  initial_clump_state,initial_clump_segments);
+            }
             capture_and_exclude_dead_rows(global_state);
         } catch (const std::exception& e) {
             std::cerr << "ERROR: " << e.what() << std::endl;
+            if (!sph_mode_ && !resumed_) {
+                free_clump_state(initial_clump_state);
+                free_clump_segments(initial_clump_segments);
+            }
             free_simulation_state(global_state);
             return false;
         }
         // initialize_system necessarily saw the on-disk total. Recompute the
         // DEM stability limit on the live canonical prefix only.
-        if (!sph_mode_) {
+        if (!sph_mode_ && !resumed_) {
             const MaterialDatabase materials = load_material_database(
                 config_.material_database.path, config_.dem_damping_model);
             global_state.dt = calculate_critical_timestep(
@@ -1024,7 +1309,7 @@ public:
         if (config_.shear_box.enabled) {
             // Convert input peculiar velocities once, then canonicalize the
             // physical box before ownership keys and initial scatter.
-            ShearBoxManager::initialize(global_state, config_);
+            if(config_.clump.num_instances<=0)ShearBoxManager::initialize(global_state, config_);
             ShearBoxManager::wrap(global_state, config_, WallManager::get_pbc_config(),
                                   global_state.current_time,
                                   global_state.particles.num_local);
@@ -1034,6 +1319,21 @@ public:
         if (resumed_ && adaptive_fmm_depth_checkpoint_requested(config_))
             restore_common_depth_checkpoint(config_.io.checkpoint_resume_from, global_state);
         DomainManager::distribute_particles(global_state, gpu_states_, domain_params_, config_);
+        if (initial_clump_state.num_clumps > 0 || !restored_bodies_.empty()) {
+            CUDA_CHECK(cudaSetDevice(0));
+            distributed_clumps_.initialize(initial_clump_state,global_state.particles,gpu_states_,domain_params_,
+                resumed_ ? &restored_bodies_ : nullptr,&config_,global_state.current_time,
+                resumed_&&restored_owner_ranks_==static_cast<uint32_t>(num_gpus_),
+                &WallManager::get_pbc_config());
+            if(config_.shear_box.enabled && !(2*distributed_clumps_.max_diameter()<
+                std::min(double(WallManager::get_pbc_config().box_length_x),double(WallManager::get_pbc_config().box_length_y))*(1-1.e-6)))
+                throw std::runtime_error("Shear clumps require twice maximum body diameter below both planar box lengths");
+        }
+        CUDA_CHECK(cudaSetDevice(0));
+        if (!sph_mode_ && !resumed_) {
+            free_clump_state(initial_clump_state);
+            free_clump_segments(initial_clump_segments);
+        }
         // The initial scatter preserves clump_id.  In SPH it is the exact
         // SPHSOL Part ID; in DEM it retains the existing clump semantics.
         // Distribution owns independent per-device copies.  Retaining the
@@ -1133,6 +1433,8 @@ public:
                 domain_params_.morton_enabled
             );
             body_fitted_fmm::UnifiedFMMDispatcher::set_distributed_partition(domain_params_);
+            if(distributed_clumps_.enabled())
+                body_fitted_fmm::UnifiedFMMDispatcher::set_distributed_clump_exclusion_diameter(distributed_clumps_.max_diameter());
             if (num_gpus_ > 1 && !domain_params_.morton_enabled && config_.acceleration.unified_fmm.adaptive_depth.enabled) {
                 body_fitted_fmm::UnifiedFMMDispatcher::
                     set_adaptive_fmm_depth_control_mode(
@@ -1153,8 +1455,8 @@ public:
             // Allocate contact history buffers for this GPU (was missing — caused
             // NULL-pointer write in compute_contact_forces_multigpu_kernel at
             // contact_history[hist_offset + new_slot].partner_global_id = ...)
-            allocate_contact_history(state.local_state.contact_history, capacity, 16);
-            allocate_wall_contact_history(state.local_state.wall_contact_history, capacity, 16);
+            allocate_contact_history(state.local_state.contact_history, capacity, resumed_&&!sph_mode_ ? restored_contact_stride_ : 16);
+            allocate_wall_contact_history(state.local_state.wall_contact_history, capacity, resumed_&&!sph_mode_ ? restored_wall_stride_ : 16);
 
             const int32_t contact_stride = state.local_state.contact_history.max_contacts_per_particle;
             const int32_t wall_stride = state.local_state.wall_contact_history.max_contacts_per_particle;
@@ -1168,6 +1470,8 @@ public:
             CUDA_CHECK(cudaMemset(state.local_state.particles.num_wall_contacts, 0,
                                   capacity * sizeof(int32_t)));
             CUDA_CHECK(cudaGetLastError());
+
+            if (resumed_ && !sph_mode_) restore_dem_rank_histories(state);
 
             // Migration payload rows must use the same configured strides as
             // the persistent histories they restore into.
@@ -1187,6 +1491,9 @@ public:
                           << state.subdomain.num_local_particles << " particles" << std::endl;
             }
         }
+
+        if(resumed_&&!sph_mode_){restored_bodies_.clear();restored_exact_rows_.clear();restored_contacts_.clear();
+            restored_contact_counts_.clear();restored_contact_gids_.clear();restored_wall_rows_.clear();restored_wall_offsets_.clear();}
 
         if (sph_mode_) {
             if (!(std::isfinite(sph_global_h_max_) && sph_global_h_max_ > 0.0f)) {
@@ -2038,7 +2345,8 @@ public:
                         dt, num_local);
                 } else if (!force_bootstrap_step && num_local > 0 && config_.shear_box.enabled) {
                     ShearBoxManager::drift_step1(
-                        my_state.local_state, config_, dt, num_local, stream);
+                        my_state.local_state, config_, dt, num_local, stream,
+                        distributed_clumps_.enabled()?my_state.local_state.particles.clump_id:nullptr);
                 } else if (!force_bootstrap_step && num_local > 0) {
                     LAUNCH_KERNEL(verlet_step1_fused_kernel, num_blocks_local, block_size, 0, stream,
                         my_state.local_state.particles.pos_x,
@@ -2062,8 +2370,17 @@ public:
                         my_state.local_state.particles.torque_z,
                         my_state.local_state.particles.mass,
                         my_state.local_state.particles.moment_of_inertia,
-                        dt, num_local
+                        dt, num_local,
+                        distributed_clumps_.enabled() ? my_state.local_state.particles.clump_id : nullptr
                     );
+                }
+                if (distributed_clumps_.enabled()) {
+                    if (!force_bootstrap_step)
+                        distributed_clumps_.integrate(gpu_id,dt,true,stream,force_evaluation_time);
+                    // Initialization can infer rigid spin from member velocities.
+                    // Publish that spin and the canonical body offsets before
+                    // the initial contact/friction force evaluation as well.
+                    distributed_clumps_.sync(gpu_id,my_state.local_state.particles,num_local,stream,force_evaluation_time);
                 }
                 calibration_event(false, timing_slot,
                                   CalibrationSegment::Verlet1, stream);
@@ -2104,7 +2421,7 @@ public:
                 }
 
                 if (domain_params_.morton_enabled) {
-                    const bool depth_preflight=config_.acceleration.enable_self_gravity &&
+                    const bool depth_preflight=config_.acceleration.enable_self_gravity && !distributed_clumps_.enabled() &&
                         config_.acceleration.unified_fmm.adaptive_depth.enabled &&
                         (common_completed_epoch_==0||common_fmm_command_.launch_depth!=common_launch_depth_);
                     if(depth_preflight)common_depth_ceilings_[gpu_id]=body_fitted_fmm::UnifiedFMMDispatcher::distributed_depth_ceiling(
@@ -2121,7 +2438,7 @@ public:
                             // SPH applies the combined memory/physical ceiling at
                             // each gravity endpoint. Raising it here would cancel
                             // a live trial before that physical limit is reapplied.
-                            if(!sph_mode_ && ceiling!=common_fmm_depth_.state_for_gpu(0).effective_max_depth)
+                            if(!sph_mode_ && !distributed_clumps_.enabled() && ceiling!=common_fmm_depth_.state_for_gpu(0).effective_max_depth)
                                 common_fmm_depth_.set_effective_max_depth(0,ceiling,common_completed_epoch_);
                             common_fmm_command_=common_fmm_depth_.command_for_gpu(0);
                         }
@@ -2229,6 +2546,101 @@ public:
                     // is to invalidate the borrowed spatial view and force f3.
                     body_fitted_fmm::UnifiedFMMDispatcher::
                         invalidate_current_gpu_workload();
+                }
+
+                if (distributed_clumps_.enabled())
+                    distributed_clumps_.refresh(gpu_id,my_state.local_state.particles,num_local,
+                        comm.particle_membership_changed(),stream,force_evaluation_time);
+
+                if(distributed_clumps_.enabled() && config_.acceleration.enable_self_gravity) {
+                    const auto& fmm=config_.acceleration.unified_fmm;
+                    const int minimum=fmm.adaptive_depth.enabled?fmm.adaptive_depth.min_depth:fmm.tree_depth;
+                    const int maximum=fmm.adaptive_depth.enabled?fmm.adaptive_depth.max_depth:fmm.tree_depth;
+                    FMMDepthSourceGeometry geometry;
+                    auto effective=fmm_identity_effective_depths();
+                    clump_depth_errors_[gpu_id].clear();
+                    try {
+                        geometry.root=domain_params_.morton_grid;
+                        geometry.root.dimension=3;
+                        if(config_.shear_box.enabled) {
+                            const auto& pbc=WallManager::get_pbc_config();
+                            geometry.images=make_shear_gravity_images(config_,pbc,force_evaluation_time);
+                            const double4 root=shear_fmm_static_root(geometry.images,pbc,config_);
+                            geometry.root.x=root.x;geometry.root.y=root.y;geometry.root.z=root.z;geometry.root.size=root.w;
+                            for(int base=minimum;base<=maximum;++base){auto candidate=fmm;candidate.tree_depth=base;
+                                effective[base]=shear_fmm_effective_depth(candidate,geometry.images,pbc);}
+                        }
+                        if(effective[minimum]>20)
+                            throw std::runtime_error("no feasible FMM depth: minimum base depth exceeds the actual source-tree depth limit 20");
+                        if(fmm.adaptive_depth.enabled) {
+                            SimulationState depth_state=my_state.local_state;
+                            depth_state.current_time=force_evaluation_time;
+                            common_depth_ceilings_[gpu_id]=body_fitted_fmm::UnifiedFMMDispatcher::distributed_depth_ceiling(
+                                config_,common_global_particles_,&depth_state,&WallManager::get_pbc_config(),stream);
+                        }
+                    }catch(const std::exception& error){clump_depth_errors_[gpu_id]=error.what();}
+                    catch(...){clump_depth_errors_[gpu_id]="unknown FMM geometry/memory preflight failure";}
+                    #pragma omp barrier
+                    #pragma omp single
+                    {
+                        clump_collective_error_.clear();
+                        for(int rank=0;rank<num_gpus_;++rank)if(!clump_depth_errors_[rank].empty()){
+                            clump_collective_error_="FMM depth preflight rank "+std::to_string(rank)+": "+clump_depth_errors_[rank];break;}
+                    }
+                    #pragma omp barrier
+                    if(!clump_collective_error_.empty())throw std::runtime_error(clump_collective_error_);
+                    if(fmm.adaptive_depth.enabled)
+                        clump_depth_census_.collect(gpu_id,my_state.local_state.particles,geometry,
+                            effective[minimum],std::min(20,effective[maximum]),stream);
+                    #pragma omp single
+                    {
+                        clump_collective_error_.clear();
+                        try {
+                            FMMDepthFeasibleRange feasible{};
+                            if(fmm.adaptive_depth.enabled) {
+                                const int memory=*std::min_element(common_depth_ceilings_.begin(),common_depth_ceilings_.end());
+                                feasible=fmm_feasible_depth_range(clump_depth_census_.maximum_leaf_counts(),minimum,maximum,
+                                    memory,distributed_clumps_.max_diameter(),geometry.root.size,effective);
+                                common_fmm_depth_.set_effective_depth_range(0,feasible.minimum_depth,feasible.maximum_depth,
+                                    gravity_evaluation_epoch_);
+                                common_fmm_command_=common_fmm_depth_.command_for_gpu(0);
+                                if(common_fmm_depth_.frozen() || common_fmm_command_.launch_depth<feasible.minimum_depth ||
+                                   common_fmm_command_.launch_depth>feasible.maximum_depth)
+                                    throw std::runtime_error("FMM depth controller cannot satisfy the current hard constraints: "+
+                                        common_fmm_depth_.failure_reason());
+                                common_launch_depth_=common_fmm_command_.launch_depth;
+                            }else distributed_clumps_.validate_leaf_width(geometry.root.size,effective[common_launch_depth_]);
+                            const int actual=effective[common_launch_depth_];
+                            const double leaf_width=std::ldexp(geometry.root.size,-actual);
+                            const char* depth_diagnostics=std::getenv("GRANIT_CLUMP_DIAGNOSTICS");
+                            if((depth_diagnostics && std::string(depth_diagnostics)=="1") || common_launch_depth_!=clump_logged_base_ ||
+                               feasible.minimum_depth!=clump_logged_min_ || feasible.maximum_depth!=clump_logged_max_ ||
+                               leaf_width!=clump_logged_leaf_width_) {
+                            std::ostringstream row;
+                            row<<std::setprecision(17)<<"[clumps-depth] epoch="<<gravity_evaluation_epoch_+1
+                               <<" step="<<my_state.local_state.current_step+(force_bootstrap_step?0:1)
+                               <<" time="<<force_evaluation_time<<" evaluation_time="<<force_evaluation_time
+                               <<" adaptive="<<fmm.adaptive_depth.enabled<<" selected_base="<<common_launch_depth_
+                               <<" actual_depth="<<actual<<" root_x="<<geometry.root.x
+                               <<" root_y="<<geometry.root.y<<" root_z="<<geometry.root.z<<" root_size="<<geometry.root.size
+                               <<" max_diameter="<<distributed_clumps_.max_diameter()
+                               <<" leaf_width="<<leaf_width;
+                            if(fmm.adaptive_depth.enabled)
+                                row<<" global_max_leaf="<<clump_depth_census_.maximum_leaf_counts()[actual]
+                                   <<" physical_particles="<<clump_depth_census_.physical_particles()
+                                   <<" stored_source_particles="<<clump_depth_census_.stored_source_particles()
+                                   <<" source_particles="<<clump_depth_census_.source_particles()
+                                   <<" feasible_min="<<feasible.minimum_depth<<" feasible_max="<<feasible.maximum_depth;
+                            std::cout<<row.str()<<std::endl;
+                            clump_logged_base_=common_launch_depth_;clump_logged_min_=feasible.minimum_depth;
+                            clump_logged_max_=feasible.maximum_depth;clump_logged_leaf_width_=leaf_width;
+                            }
+                        }catch(const std::exception& error){clump_collective_error_=error.what();}
+                        catch(...){clump_collective_error_="unknown FMM feasible-depth validation failure";}
+                    }
+                    #pragma omp barrier
+                    if(!clump_collective_error_.empty())throw std::runtime_error(clump_collective_error_);
+                    body_fitted_fmm::UnifiedFMMDispatcher::set_distributed_compute_depth(common_launch_depth_);
                 }
 
                 // =============================================================
@@ -2488,7 +2900,8 @@ public:
                         WallManager::get_pbc_config().box_length_x,
                         WallManager::get_pbc_config().box_length_y,
                         static_cast<float>(shear_phase.reduced_shift),
-                        static_cast<float>(shear_phase.shear_velocity)
+                        static_cast<float>(shear_phase.shear_velocity),
+                        distributed_clumps_.enabled()
                     );
                     
                     // Pass 2: Reaction forces on particle j (flipped perspective)
@@ -2529,7 +2942,8 @@ public:
                         WallManager::get_pbc_config().box_length_x,
                         WallManager::get_pbc_config().box_length_y,
                         static_cast<float>(shear_phase.reduced_shift),
-                        static_cast<float>(shear_phase.shear_velocity)
+                        static_cast<float>(shear_phase.shear_velocity),
+                        distributed_clumps_.enabled()
                     );
                 }
 
@@ -2639,6 +3053,9 @@ public:
                         refresh_sph_halos(true, SphHaloPayload::Full);
                     local.particles.num_particles = num_total;
                 }
+                if (distributed_clumps_.enabled())
+                    distributed_clumps_.diagnose_contacts(gpu_id,my_state.local_state.particles,
+                        my_contacts.pairs,h_num_contacts,num_local,my_state.local_state.current_step,stream,force_evaluation_time);
                 latest_contact_counts_[gpu_id] = h_num_contacts;
                 if (timing_slot >= 0) {
                     // SPH uses one base unit per current owner plus its CSR
@@ -2737,7 +3154,8 @@ public:
                             my_state.local_state.neighbor,
                             WallManager::get_pbc_config(), let_comms_[gpu_id],
                             local_gravity_epoch,
-                            my_state.local_state.current_time, stream);
+                            my_state.local_state.current_time, stream,
+                            distributed_clumps_.enabled() ? my_state.local_state.particles.clump_id : nullptr);
                         add_sph_gravity_softening_correction(my_state.local_state, config_, stream);
                     } else {
                         #pragma omp barrier
@@ -2749,7 +3167,8 @@ public:
                             my_state.local_state, config_,
                             my_state.local_state.current_time + dt,
                             local_gravity_epoch,
-                            &let_comms_[gpu_id], stream);
+                            &let_comms_[gpu_id], stream,
+                            distributed_clumps_.enabled() ? my_state.local_state.particles.clump_id : nullptr);
                     }
                 }
                 if (config_.acceleration.yorp.adaptive && !force_bootstrap_step) {
@@ -2785,7 +3204,8 @@ public:
                         dt, num_local);
                 } else if (!force_bootstrap_step && num_local > 0 && config_.shear_box.enabled) {
                     ShearBoxManager::kick_step2(
-                        my_state.local_state, config_, dt, num_local, stream);
+                        my_state.local_state, config_, dt, num_local, stream,
+                        distributed_clumps_.enabled()?my_state.local_state.particles.clump_id:nullptr);
                 } else if (!force_bootstrap_step && num_local > 0) {
                     LAUNCH_KERNEL(verlet_step2_fused_kernel, num_blocks_local, block_size, 0, stream,
                         my_state.local_state.particles.vel_x,
@@ -2802,8 +3222,14 @@ public:
                         my_state.local_state.particles.torque_z,
                         my_state.local_state.particles.mass,
                         my_state.local_state.particles.moment_of_inertia,
-                        static_cast<float>(dt), num_local
+                        static_cast<float>(dt), num_local,
+                        distributed_clumps_.enabled() ? my_state.local_state.particles.clump_id : nullptr
                     );
+                }
+                if (distributed_clumps_.enabled()) {
+                    distributed_clumps_.aggregate(gpu_id,my_state.local_state.particles,num_local,stream);
+                    if (!force_bootstrap_step) distributed_clumps_.integrate(gpu_id,dt,false,stream,force_evaluation_time);
+                    distributed_clumps_.sync(gpu_id,my_state.local_state.particles,num_local,stream,force_evaluation_time);
                 }
                 calibration_event(false, timing_slot,
                                   CalibrationSegment::Verlet2, stream);
@@ -3007,7 +3433,8 @@ public:
                                 aggregate.let_bytes=bytes;aggregate.local_owned_particles=owned;
                                 aggregate.yorp_transition=common_yorp_transition_pending_;
                                 aggregate.local_count_changed=counts_changed;
-                                if(!common_fmm_depth_.publish_timing(0,aggregate))throw std::runtime_error(common_fmm_depth_.failure_reason());
+                                if(!common_fmm_depth_.publish_timing(0,aggregate) && common_fmm_depth_.frozen())
+                                    throw std::runtime_error(common_fmm_depth_.failure_reason());
                                 common_fmm_depth_.process_ready_epochs();
                                 common_fmm_command_=common_fmm_depth_.command_for_gpu(0);
                             }
@@ -3369,7 +3796,7 @@ public:
                     }
                     nvtxRangePop();
                 }
-                if (sph_mode_ && !force_bootstrap_step && config_.io.checkpoint_enabled && (!respa_enabled || respa_macro_closing) &&
+                if ((sph_mode_ || distributed_clumps_.enabled()) && !force_bootstrap_step && config_.io.checkpoint_enabled && (!respa_enabled || respa_macro_closing) &&
                     my_state.local_state.current_step - checkpoint_cadence_step_ >= config_.io.checkpoint_interval) {
                     CUDA_CHECK(cudaStreamSynchronize(stream));
                     harvest_timing_samples();
@@ -3414,7 +3841,7 @@ public:
 
         if (last_output_step_ != gpu_states_[0].local_state.current_step)
             save_output();
-        if (sph_mode_ && config_.io.checkpoint_enabled &&
+        if ((sph_mode_ || distributed_clumps_.enabled()) && config_.io.checkpoint_enabled &&
             last_checkpoint_step_ != gpu_states_[0].local_state.current_step)
             save_output(true);
         write_distributed_fmm_diagnostics();
@@ -3530,8 +3957,18 @@ public:
         std::vector<float> h_smoothing_length(particle_count);
         std::vector<float> h_pressure(particle_count), h_c_sound(particle_count), h_damage(particle_count);
         std::vector<int32_t> h_global_id(particle_count), h_material_id(particle_count), h_clump_id(particle_count);
+        std::vector<float> h_clump_off_x(particle_count),h_clump_off_y(particle_count),h_clump_off_z(particle_count);
         std::vector<int64_t> h_winding_x(particle_count), h_winding_y(particle_count), h_winding_z(particle_count);
 
+        std::vector<double> h_checkpoint_qw(checkpoint?particle_count:0),h_checkpoint_qx(checkpoint?particle_count:0),
+            h_checkpoint_qy(checkpoint?particle_count:0),h_checkpoint_qz(checkpoint?particle_count:0);
+        std::vector<int32_t> h_checkpoint_contacts(checkpoint?particle_count:0),h_checkpoint_wall_counts(checkpoint?particle_count:0);
+        std::vector<ContactHistory> checkpoint_contact_blob;
+        std::vector<std::vector<WallContactHistory>> checkpoint_wall_by_row;
+        std::vector<DEMExactRow> checkpoint_exact_rows;
+        std::vector<WallContactHistory> checkpoint_wall_rows;
+        int checkpoint_contact_stride=0,checkpoint_wall_stride=0;
+        int32_t checkpoint_total_contacts=0;
         std::vector<double> h_checkpoint_gx(checkpoint ? particle_count : 0), h_checkpoint_gy(checkpoint ? particle_count : 0), h_checkpoint_gz(checkpoint ? particle_count : 0);
         std::vector<double> h_checkpoint_rho_rate(checkpoint ? particle_count : 0);
         std::vector<double> h_checkpoint_dedt(checkpoint ? particle_count : 0);
@@ -3599,11 +4036,42 @@ public:
         gather_field(h_global_id, &ParticleSoA::global_id);
         gather_field(h_material_id, &ParticleSoA::material_id);
         gather_field(h_clump_id, &ParticleSoA::clump_id);
+        gather_field(h_clump_off_x, &ParticleSoA::clump_off_x);
+        gather_field(h_clump_off_y, &ParticleSoA::clump_off_y);
+        gather_field(h_clump_off_z, &ParticleSoA::clump_off_z);
         gather_field(h_winding_x, &ParticleSoA::winding_x);
         gather_field(h_winding_y, &ParticleSoA::winding_y);
         gather_field(h_winding_z, &ParticleSoA::winding_z);
 
         if (checkpoint) {
+            gather_field(h_checkpoint_qw,&ParticleSoA::quat_w);gather_field(h_checkpoint_qx,&ParticleSoA::quat_x);
+            gather_field(h_checkpoint_qy,&ParticleSoA::quat_y);gather_field(h_checkpoint_qz,&ParticleSoA::quat_z);
+            gather_field(h_checkpoint_contacts,&ParticleSoA::num_contacts);
+            gather_field(h_checkpoint_wall_counts,&ParticleSoA::num_wall_contacts);
+            if(distributed_clumps_.enabled()) {
+                checkpoint_contact_stride=gpu_states_[0].local_state.contact_history.max_contacts_per_particle;
+                checkpoint_wall_stride=gpu_states_[0].local_state.wall_contact_history.max_contacts_per_particle;
+                const int64_t total=std::accumulate(h_checkpoint_contacts.begin(),h_checkpoint_contacts.end(),int64_t{0});
+                if(total>INT32_MAX)throw std::runtime_error("Checkpoint active contact count exceeds int32");
+                checkpoint_total_contacts=static_cast<int32_t>(total);
+                if(total)checkpoint_contact_blob.resize(static_cast<size_t>(particle_count)*checkpoint_contact_stride);
+                checkpoint_wall_by_row.resize(particle_count);
+                size_t offset=0;
+                for(int g=0;g<num_gpus_;++g){CUDA_CHECK(cudaSetDevice(g));const auto& local=gpu_states_[g].local_state;
+                    const int n=gpu_states_[g].subdomain.num_local_particles;
+                    if(local.contact_history.max_contacts_per_particle!=checkpoint_contact_stride||
+                       local.wall_contact_history.max_contacts_per_particle!=checkpoint_wall_stride)
+                        throw std::runtime_error("Checkpoint requires matching history strides on all ranks");
+                    if(total&&n)CUDA_CHECK(cudaMemcpy(checkpoint_contact_blob.data()+offset*checkpoint_contact_stride,
+                        local.contact_history.data,static_cast<size_t>(n)*checkpoint_contact_stride*sizeof(ContactHistory),cudaMemcpyDeviceToHost));
+                    for(int i=0;i<n;++i){const int count=h_checkpoint_wall_counts[offset+i];
+                        if(count<0||count>checkpoint_wall_stride)throw std::runtime_error("Invalid wall history count at checkpoint");
+                        auto& rows=checkpoint_wall_by_row[offset+i];rows.resize(count);
+                        if(count)CUDA_CHECK(cudaMemcpy(rows.data(),local.wall_contact_history.data+static_cast<size_t>(i)*checkpoint_wall_stride,
+                            count*sizeof(WallContactHistory),cudaMemcpyDeviceToHost));}
+                    offset+=n;
+                }
+            }
             gather_field(h_checkpoint_gx, &ParticleSoA::gravity_force_x);
             gather_field(h_checkpoint_gy, &ParticleSoA::gravity_force_y);
             gather_field(h_checkpoint_gz, &ParticleSoA::gravity_force_z);
@@ -3653,7 +4121,7 @@ public:
             }
         }
 
-        if (config_.shear_box.enabled) {
+        if (config_.shear_box.enabled && !checkpoint) {
             // Hill acceleration belongs to the output force view; the native
             // kick history must retain only the perturbing/contact force.
             for (int32_t i = 0; i < live_particle_count; ++i) {
@@ -3676,6 +4144,7 @@ public:
         append_dead(h_torque_x,dead_rows_.torque_x); append_dead(h_torque_y,dead_rows_.torque_y); append_dead(h_torque_z,dead_rows_.torque_z);
         append_dead(h_energy,dead_rows_.energy); append_dead(h_radius,dead_rows_.radius); append_dead(h_mass,dead_rows_.mass); append_dead(h_moi,dead_rows_.moi);
         append_dead(h_smoothing_length,dead_rows_.smoothing_length); append_dead(h_density,dead_rows_.density); append_dead(h_pressure,dead_rows_.pressure); append_dead(h_c_sound,dead_rows_.c_sound); append_dead(h_damage,dead_rows_.damage);
+        append_dead(h_clump_off_x,dead_rows_.clump_off_x); append_dead(h_clump_off_y,dead_rows_.clump_off_y); append_dead(h_clump_off_z,dead_rows_.clump_off_z);
         append_dead(h_global_id,dead_rows_.global_id); append_dead(h_material_id,dead_rows_.material_id); append_dead(h_clump_id,dead_rows_.clump_id);
         append_dead(h_winding_x,dead_rows_.winding_x); append_dead(h_winding_y,dead_rows_.winding_y); append_dead(h_winding_z,dead_rows_.winding_z);
 
@@ -3711,9 +4180,25 @@ public:
         reorder(h_smoothing_length); reorder(h_density); reorder(h_pressure);
         reorder(h_c_sound); reorder(h_damage);
         reorder(h_global_id); reorder(h_material_id); reorder(h_clump_id);
+        reorder(h_clump_off_x); reorder(h_clump_off_y); reorder(h_clump_off_z);
         reorder(h_winding_x); reorder(h_winding_y); reorder(h_winding_z);
 
         if (checkpoint) {
+            reorder(h_checkpoint_qw);reorder(h_checkpoint_qx);reorder(h_checkpoint_qy);reorder(h_checkpoint_qz);
+            reorder(h_checkpoint_contacts);reorder(h_checkpoint_wall_counts);
+            if(distributed_clumps_.enabled()) {
+                if(!checkpoint_contact_blob.empty()) {
+                    auto original=std::move(checkpoint_contact_blob);
+                    checkpoint_contact_blob.resize(original.size());
+                    for(int i=0;i<particle_count;++i)std::copy_n(original.data()+static_cast<size_t>(indices[i])*checkpoint_contact_stride,
+                        checkpoint_contact_stride,checkpoint_contact_blob.data()+static_cast<size_t>(i)*checkpoint_contact_stride);
+                }
+                checkpoint_exact_rows.resize(particle_count);
+                for(int i=0;i<particle_count;++i){auto& row=checkpoint_exact_rows[i];row.gid=h_global_id[i];
+                    row.wall_count=h_checkpoint_wall_counts[i];row.force[0]=h_force_x[i];row.force[1]=h_force_y[i];row.force[2]=h_force_z[i];
+                    row.torque[0]=h_torque_x[i];row.torque[1]=h_torque_y[i];row.torque[2]=h_torque_z[i];
+                    const auto& walls=checkpoint_wall_by_row[indices[i]];checkpoint_wall_rows.insert(checkpoint_wall_rows.end(),walls.begin(),walls.end());}
+            }
             reorder(h_checkpoint_gx); reorder(h_checkpoint_gy); reorder(h_checkpoint_gz);
             reorder(h_checkpoint_rho_rate);
             reorder(h_checkpoint_dedt);
@@ -3753,6 +4238,8 @@ public:
         output_state.particles.num_particles = particle_count;
         output_state.particles.num_local = particle_count;
         output_state.particles.num_ghost = 0;
+        output_state.particles.input_has_clump_offset=distributed_clumps_.enabled();
+        output_state.particles.input_has_winding=config_.shear_box.enabled;
         output_state.current_step = gpu_states_[0].local_state.current_step;
         output_state.current_time = gpu_states_[0].local_state.current_time;
         output_state.dt = gpu_states_[0].local_state.dt;
@@ -3798,11 +4285,18 @@ public:
         upload_field(&ParticleSoA::global_id, h_global_id);
         upload_field(&ParticleSoA::material_id, h_material_id);
         upload_field(&ParticleSoA::clump_id, h_clump_id);
+        upload_field(&ParticleSoA::clump_off_x, h_clump_off_x);
+        upload_field(&ParticleSoA::clump_off_y, h_clump_off_y);
+        upload_field(&ParticleSoA::clump_off_z, h_clump_off_z);
         upload_field(&ParticleSoA::winding_x, h_winding_x);
         upload_field(&ParticleSoA::winding_y, h_winding_y);
         upload_field(&ParticleSoA::winding_z, h_winding_z);
 
         if (checkpoint) {
+            upload_field(&ParticleSoA::quat_w,h_checkpoint_qw);upload_field(&ParticleSoA::quat_x,h_checkpoint_qx);
+            upload_field(&ParticleSoA::quat_y,h_checkpoint_qy);upload_field(&ParticleSoA::quat_z,h_checkpoint_qz);
+            upload_field(&ParticleSoA::num_contacts,h_checkpoint_contacts);
+            upload_field(&ParticleSoA::num_wall_contacts,h_checkpoint_wall_counts);
             upload_field(&ParticleSoA::gravity_force_x, h_checkpoint_gx);
             upload_field(&ParticleSoA::gravity_force_y, h_checkpoint_gy);
             upload_field(&ParticleSoA::gravity_force_z, h_checkpoint_gz);
@@ -3825,7 +4319,9 @@ public:
         if (checkpoint && adaptive_fmm_depth_checkpoint_requested(config_))
             std::filesystem::remove(adaptive_fmm_depth_checkpoint_sidecar_path(filepath));
         if (!write_unified_binary(filepath, output_state.particles,
-                                  output_state, config_, checkpoint)) {
+                                  output_state, config_, checkpoint,
+                                  checkpoint_contact_blob.empty()?nullptr:&checkpoint_contact_blob,
+                                  checkpoint_contact_stride,checkpoint_total_contacts)) {
             free_particle_soa(output_state.particles);
             throw std::runtime_error("Failed writing multi-GPU snapshot: " + filepath);
         }
@@ -3833,6 +4329,11 @@ public:
             write_sph_stage_checkpoint(filepath, output_state, config_);
             write_respa_checkpoint_sidecar(filepath, output_state, config_);
             save_common_depth_checkpoint(filepath, output_state);
+            if(distributed_clumps_.enabled()) {
+                write_shear_checkpoint_sidecar(filepath,output_state,config_);
+                save_dem_clump_sidecar(filepath,output_state,checkpoint_exact_rows,checkpoint_wall_rows,
+                                      checkpoint_contact_stride,checkpoint_wall_stride);
+            }
         }
         free_particle_soa(output_state.particles);
         if (checkpoint) {
@@ -3908,6 +4409,9 @@ public:
                 std::cerr << "WARNING: Cannot create gravity-force sidecar: " << gpath << std::endl;
             }
         }
+        if (distributed_clumps_.enabled())
+            distributed_clumps_.save(config_.io.output_directory,gpu_states_[0].local_state.current_step,
+                                     gpu_states_[0].local_state.current_time);
         last_output_step_ = gpu_states_[0].local_state.current_step;
     }
 
@@ -3916,6 +4420,8 @@ public:
 
         std::cout << "\nShutting down multi-GPU simulation..." << std::endl;
 
+        clump_depth_census_.shutdown();
+        distributed_clumps_.shutdown();
         distributed_yorp_.shutdown();
         AccelerationManager::shutdown();
 
@@ -4054,12 +4560,11 @@ int main(int argc, char* argv[]) {
 
     cudadem::MultiGPUSimulationRunner sim;
 
-    if (!sim.initialize(config_path)) {
-        std::cerr << "ERROR: Failed to initialize multi-GPU simulation" << std::endl;
-        return 1;
-    }
-
     try {
+        if (!sim.initialize(config_path)) {
+            std::cerr << "ERROR: Failed to initialize multi-GPU simulation" << std::endl;
+            return 1;
+        }
         sim.run();
     } catch (const std::exception& e) {
         std::cerr << "ERROR: Simulation failed - " << e.what() << std::endl;

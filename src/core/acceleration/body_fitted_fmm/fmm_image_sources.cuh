@@ -102,7 +102,7 @@ __global__ void fmm_refresh_image_replies_kernel(FMMSourcePublication source,
 __global__ void fmm_pack_image_particles_kernel(FMMSourcePublication source,
     const int* offsets, const FMMSourcePart* parts,
     const FMMParticleRequest* requests, FMMSourceParticle* particles, int count,
-    bool skip_central = false)
+    bool skip_central = false, int* packed_clump_ids = nullptr)
 {
     for (int i = blockIdx.x; i < count; i += gridDim.x) {
         const auto request = requests[i];
@@ -116,6 +116,7 @@ __global__ void fmm_pack_image_particles_kernel(FMMSourcePublication source,
                 const int original = source.sorted[node.begin + j];
                 particles[out + j] = {source.x[original], source.y[original] + part.image_y * source.image_length_y,
                     source.z[original], source.mass[original], original};
+                if (packed_clump_ids) packed_clump_ids[out + j] = source.clump_ids[original];
             }
             out += node.count;
         }

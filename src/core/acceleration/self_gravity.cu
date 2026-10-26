@@ -1930,7 +1930,8 @@ void AccelerationManager::compute_self_gravity_multigpu(
     double evaluation_time,
     uint64_t gravity_evaluation_epoch,
     class LETCommunicator* let_comm,
-    cudaStream_t stream
+    cudaStream_t stream,
+    const int* gravity_clump_ids
 ) {
     if (!self_gravity_config.enabled || !let_comm) return;
 
@@ -1949,7 +1950,7 @@ void AccelerationManager::compute_self_gravity_multigpu(
             }
             body_fitted_fmm::UnifiedFMMDispatcher::compute_multigpu(
                 state, config, state.neighbor, pbc, *let_comm,
-                gravity_evaluation_epoch, evaluation_time, stream);
+                gravity_evaluation_epoch, evaluation_time, stream, gravity_clump_ids);
             return;
         }
         case SelfGravityMethod::DIRECT:
@@ -1965,13 +1966,14 @@ void AccelerationManager::compute_all_multigpu(
     double current_time,
     uint64_t gravity_evaluation_epoch,
     class LETCommunicator* let_comm,
-    cudaStream_t stream
+    cudaStream_t stream,
+    const int* gravity_clump_ids
 ) {
     if (!initialized) { std::cerr << "ERROR: AccelerationManager not initialized" << std::endl; return; }
     if (config.acceleration.enable_self_gravity)
         compute_self_gravity_multigpu(
             state, config, current_time, gravity_evaluation_epoch,
-            let_comm, stream);
+            let_comm, stream, gravity_clump_ids);
     if (config.acceleration.enable_inertial)
         compute_inertial(state, config, current_time, stream);
     if (config.acceleration.enable_tidal)
