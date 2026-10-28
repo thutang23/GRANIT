@@ -278,6 +278,13 @@ if(BUILD_TESTING)
     target_link_libraries(granit_lbvh_contact_dedup_test PRIVATE yaml-cpp)
     add_test(NAME peer_transfer_gpu COMMAND granit_peer_transfer_routes_gpu_test)
     add_test(NAME lbvh_contact_dedup COMMAND granit_lbvh_contact_dedup_test)
+    add_executable(granit_distributed_contact_history_test
+        components/tests/unit_test/domain/test_distributed_contact_history.cu)
+    target_include_directories(granit_distributed_contact_history_test PRIVATE
+        ${GRANIT_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(granit_distributed_contact_history_test PRIVATE CUDA::cudart yaml-cpp)
+    add_test(NAME distributed_contact_history COMMAND granit_distributed_contact_history_test)
+    set_tests_properties(distributed_contact_history PROPERTIES LABELS "gpu" SKIP_RETURN_CODE 77)
     granit_solver(granit_cll_shear_contacts_test
         components/tests/unit_test/cll/shear_contacts.cu)
     add_test(NAME cll_shear_contacts COMMAND granit_cll_shear_contacts_test)
