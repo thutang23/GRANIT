@@ -43,6 +43,7 @@
 #include "src/domain/multigpu_phase_coordinator.h"
 #include "src/domain/distributed_yorp_coordinator.h"
 #include "src/domain/distributed_clumps.cuh"
+#include "src/domain/distributed_contact_history.cuh"
 #include "src/domain/fmm_depth_constraints.cuh"
 #include "src/domain/distributed_fmm_depth_controller.h"
 
@@ -164,253 +165,6 @@ __global__ void sph_verlet_step2_kernel(
 // OPTIMIZATION: Uses template parameter to avoid N3L atomic writes.
 // FlipParticles=false: process i, FlipParticles=true: process j
 // =============================================================================
-
-template<bool FlipParticles>
-__global__ void compute_contact_forces_multigpu_kernel(
-    const ContactPair* __restrict__ contacts,
-    int32_t num_contacts,
-    const double* __restrict__ pos_x,
-    const double* __restrict__ pos_y,
-    const double* __restrict__ pos_z,
-    const double* __restrict__ vel_x,
-    const double* __restrict__ vel_y,
-    const double* __restrict__ vel_z,
-    const double* __restrict__ omega_x,
-    const double* __restrict__ omega_y,
-    const double* __restrict__ omega_z,
-    const float* __restrict__ radius,
-    const float* __restrict__ mass,
-    const float* __restrict__ moment_of_inertia,
-    const int32_t* __restrict__ material_id,
-    const MaterialRecord* __restrict__ materials,
-    const DemInteractionProperties* __restrict__ interactions,
-    uint32_t material_count,
-    const int32_t* __restrict__ global_id,
-    double* __restrict__ force_x,
-    double* __restrict__ force_y,
-    double* __restrict__ force_z,
-    double* __restrict__ torque_x,
-    double* __restrict__ torque_y,
-    double* __restrict__ torque_z,
-    ContactHistory* __restrict__ contact_history,
-    const int32_t* __restrict__ contact_history_offset,
-    int32_t* __restrict__ num_contacts_per_particle,
-    int32_t max_contacts_per_particle,
-    bool use_visco,
-    float dt,
-    int32_t num_local_particles,  // particles with index >= this are ghosts
-    bool shear_enabled = false,
-    float shear_length_x = 0.0f, float shear_length_y = 0.0f,
-    float shear_reduced_shift = 0.0f, float shear_velocity = 0.0f,
-    bool canonical_pair_evaluation = false
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_contacts) return;
-
-    const ContactPair& contact = contacts[idx];
-    
-    // Select owner/partner based on template parameter
-    int32_t owner_idx, partner_idx;
-    if constexpr (!FlipParticles) {
-        owner_idx = contact.i;
-        partner_idx = contact.j;
-    } else {
-        owner_idx = contact.j;
-        partner_idx = contact.i;
-    }
-
-    if (owner_idx < 0 || partner_idx < 0) return;
-    
-    // CRITICAL: Skip if owner is a ghost particle (only compute forces for locals)
-    if (owner_idx >= num_local_particles) return;
-
-    // A clump scene evaluates both directed owner passes in the same stable
-    // global-ID order. Recomputing the reversed pair changes the FP32 contact
-    // arms Ap/An by ULPs and loses exact Newton force/torque correspondence.
-    // The directed history still belongs to owner_idx and migrates with it.
-    const bool reverse_evaluation = canonical_pair_evaluation &&
-        global_id[owner_idx] > global_id[partner_idx];
-    const int32_t evaluation_owner = reverse_evaluation ? partner_idx : owner_idx;
-    const int32_t evaluation_partner = reverse_evaluation ? owner_idx : partner_idx;
-
-    // Load owner particle properties
-    float po_x = static_cast<float>(pos_x[evaluation_owner]);
-    float po_y = static_cast<float>(pos_y[evaluation_owner]);
-    float po_z = static_cast<float>(pos_z[evaluation_owner]);
-    float vo_x = vel_x[evaluation_owner], vo_y = vel_y[evaluation_owner], vo_z = vel_z[evaluation_owner];
-    float wo_x = omega_x[evaluation_owner], wo_y = omega_y[evaluation_owner], wo_z = omega_z[evaluation_owner];
-    float R_o = radius[evaluation_owner];
-    float m_o = mass[evaluation_owner];
-    float I_o = moment_of_inertia[evaluation_owner];
-    const int32_t material_o = material_id[evaluation_owner];
-    if (material_o < 0 || static_cast<uint32_t>(material_o) >= material_count) return;
-
-    // Load partner particle properties
-    float pp_x = static_cast<float>(pos_x[evaluation_partner]);
-    float pp_y = static_cast<float>(pos_y[evaluation_partner]);
-    float pp_z = static_cast<float>(pos_z[evaluation_partner]);
-    float vp_x = vel_x[evaluation_partner], vp_y = vel_y[evaluation_partner], vp_z = vel_z[evaluation_partner];
-    if (shear_enabled) {
-        // The pair stores the image of j relative to i.  The second pass
-        // changes owner and therefore needs the inverse lattice transform.
-        const bool reverse_image=FlipParticles != reverse_evaluation;
-        const int ix = reverse_image ? -contact.image_x : contact.image_x;
-        const int iy = reverse_image ? -contact.image_y : contact.image_y;
-        pp_x += ix * shear_length_x;
-        pp_y += iy * shear_length_y - ix * shear_reduced_shift;
-        vp_y -= ix * shear_velocity;
-    }
-    float wp_x = omega_x[evaluation_partner], wp_y = omega_y[evaluation_partner], wp_z = omega_z[evaluation_partner];
-    float R_p = radius[evaluation_partner];
-    float m_p = mass[evaluation_partner];
-    float I_p = moment_of_inertia[evaluation_partner];
-    const int32_t material_p = material_id[evaluation_partner];
-    if (material_p < 0 || static_cast<uint32_t>(material_p) >= material_count) return;
-    const DemInteractionProperties& pair = interactions[
-        static_cast<size_t>(material_o) * material_count + material_p];
-    const DemMaterialProperties& dem_o = materials[material_o].dem;
-    const DemMaterialProperties& dem_p = materials[material_p].dem;
-    const float G_o = dem_o.youngs_modulus / (2.0f * (1.0f + dem_o.poisson_ratio));
-    const float G_p = dem_p.youngs_modulus / (2.0f * (1.0f + dem_p.poisson_ratio));
-    const float E_star = 1.0f /
-        ((1.0f - dem_o.poisson_ratio * dem_o.poisson_ratio) / dem_o.youngs_modulus +
-         (1.0f - dem_p.poisson_ratio * dem_p.poisson_ratio) / dem_p.youngs_modulus);
-    const float G_star = 1.0f /
-        ((2.0f - dem_o.poisson_ratio) / G_o +
-         (2.0f - dem_p.poisson_ratio) / G_p);
-
-    // Contact history lookup
-    float H_t_x = 0.0f, H_t_y = 0.0f, H_t_z = 0.0f;
-    float H_r_x = 0.0f, H_r_y = 0.0f, H_r_z = 0.0f;
-    float H_tw_x = 0.0f, H_tw_y = 0.0f, H_tw_z = 0.0f;
-
-    int32_t slot = -1;
-    int32_t gid_partner = global_id[partner_idx];
-    int32_t hist_offset = contact_history_offset[owner_idx];
-    int32_t num_hist = num_contacts_per_particle[owner_idx];
-
-    for (int32_t k = 0; k < num_hist && k < max_contacts_per_particle; ++k) {
-        const ContactHistory& hist = contact_history[hist_offset + k];
-        if (hist.partner_global_id == gid_partner && hist.is_active) {
-            H_t_x = hist.delta_t_x;
-            H_t_y = hist.delta_t_y;
-            H_t_z = hist.delta_t_z;
-            H_r_x = hist.delta_r_x;
-            H_r_y = hist.delta_r_y;
-            H_r_z = hist.delta_r_z;
-            H_tw_x = hist.delta_tw_x;
-            H_tw_y = hist.delta_tw_y;
-            H_tw_z = hist.delta_tw_z;
-            slot = k;
-            break;
-        }
-    }
-
-    // Tangential spring force, rolling moment, and twisting moment histories
-    // are world-frame vectors. Swapping the two particles reverses all three;
-    // the tangent plane itself is unchanged under n -> -n.
-    if (reverse_evaluation) {
-        H_t_x=-H_t_x; H_t_y=-H_t_y; H_t_z=-H_t_z;
-        H_r_x=-H_r_x; H_r_y=-H_r_y; H_r_z=-H_r_z;
-        H_tw_x=-H_tw_x; H_tw_y=-H_tw_y; H_tw_z=-H_tw_z;
-    }
-
-    // Compute contact forces
-    ContactForceResult result = compute_contact_forces(
-        po_x, po_y, po_z, vo_x, vo_y, vo_z, wo_x, wo_y, wo_z,
-        R_o, m_o, I_o,
-        pp_x, pp_y, pp_z, vp_x, vp_y, vp_z, wp_x, wp_y, wp_z,
-        R_p, m_p, I_p,
-        H_t_x, H_t_y, H_t_z, H_r_x, H_r_y, H_r_z, H_tw_x, H_tw_y, H_tw_z,
-        E_star, G_star, pair.restitution,
-        pair.friction_static, pair.friction_rolling, pair.friction_twisting,
-        pair.shape_parameter,
-        pair.cohesion_enabled ? pair.cohesion_cutoff_factor : 1.0f,
-        use_visco, pair.viscous_coefficient,
-        pair.cohesion_enabled != 0, pair.cohesion_strength, dt
-    );
-
-    if (reverse_evaluation) {
-        // Select the canonical partner's physical force and torque. Its arm
-        // is An, which is deliberately computed alongside Ap in one call.
-        result.force_x=-result.force_x;
-        result.force_y=-result.force_y;
-        result.force_z=-result.force_z;
-        result.torque_x=result.torque_j_x;
-        result.torque_y=result.torque_j_y;
-        result.torque_z=result.torque_j_z;
-        result.delta_t_x=-result.delta_t_x;
-        result.delta_t_y=-result.delta_t_y;
-        result.delta_t_z=-result.delta_t_z;
-        result.delta_r_x=-result.delta_r_x;
-        result.delta_r_y=-result.delta_r_y;
-        result.delta_r_z=-result.delta_r_z;
-        result.delta_tw_x=-result.delta_tw_x;
-        result.delta_tw_y=-result.delta_tw_y;
-        result.delta_tw_z=-result.delta_tw_z;
-    }
-
-    // Update Contact History for the owner particle
-    // =========================================================================
-    // Each particle has its own independent history buffer.
-    // Both passes must update their respective owner's history.
-    if (result.is_contact) {
-        if (slot >= 0) {
-            ContactHistory& hist = contact_history[hist_offset + slot];
-            hist.delta_t_x = result.delta_t_x;
-            hist.delta_t_y = result.delta_t_y;
-            hist.delta_t_z = result.delta_t_z;
-            hist.delta_r_x = result.delta_r_x;
-            hist.delta_r_y = result.delta_r_y;
-            hist.delta_r_z = result.delta_r_z;
-            hist.delta_tw_x = result.delta_tw_x;
-            hist.delta_tw_y = result.delta_tw_y;
-            hist.delta_tw_z = result.delta_tw_z;
-            hist.is_active = true;
-            hist.seen_this_step = true;
-        } else {
-            int32_t new_slot = atomicAdd(&num_contacts_per_particle[owner_idx], 1);
-            if (new_slot < max_contacts_per_particle) {
-                ContactHistory& hist = contact_history[hist_offset + new_slot];
-                hist.partner_global_id = gid_partner;
-                hist.partner_local_id = partner_idx;
-                hist.delta_t_x = result.delta_t_x;
-                hist.delta_t_y = result.delta_t_y;
-                hist.delta_t_z = result.delta_t_z;
-                hist.delta_r_x = result.delta_r_x;
-                hist.delta_r_y = result.delta_r_y;
-                hist.delta_r_z = result.delta_r_z;
-                hist.delta_tw_x = result.delta_tw_x;
-                hist.delta_tw_y = result.delta_tw_y;
-                hist.delta_tw_z = result.delta_tw_z;
-                hist.is_active = true;
-                hist.seen_this_step = true;
-            } else {
-                // Several contact-pair threads may reserve history slots for
-                // the same owner concurrently.  Keep the persistent row count
-                // saturated at its actual stride when those reservations
-                // overflow; otherwise a later migration would correctly
-                // diagnose the transient value as an invalid row length.
-                atomicMin(&num_contacts_per_particle[owner_idx],
-                          max_contacts_per_particle);
-            }
-        }
-    } else if (slot >= 0) {
-        contact_history[hist_offset + slot].is_active = false;
-    }
-
-    // Apply forces and torques to owner particle
-    // compute_contact_forces(owner, partner, ...) returns force AND torque
-    // on the owner particle. Both passes must apply their respective torques.
-    // Canonical evaluation selects the appropriate side explicitly; the
-    // established unclumped path retains its directed owner evaluation.
-    atomicAdd(&force_x[owner_idx], result.force_x);
-    atomicAdd(&force_y[owner_idx], result.force_y);
-    atomicAdd(&force_z[owner_idx], result.force_z);
-    atomicAdd(&torque_x[owner_idx], result.torque_x);
-    atomicAdd(&torque_y[owner_idx], result.torque_y);
-    atomicAdd(&torque_z[owner_idx], result.torque_z);
-}
 
 // =============================================================================
 // Multi-GPU Simulation Runner
@@ -1661,6 +1415,8 @@ public:
             static_cast<size_t>(num_gpus_));
         SPHTimestepResult global_sph_timestep_diagnostic;
         std::vector<float> sph_h_max_candidates(static_cast<size_t>(num_gpus_), 0.0f);
+        std::vector<ContactHistoryOverflow> contact_history_errors(num_gpus_);
+        bool contact_history_overflow = false;
         std::exception_ptr worker_failure;
         std::mutex worker_failure_mutex;
         const bool prepare_distributed_peer_routes = num_gpus_ > 1 &&
@@ -1673,6 +1429,7 @@ public:
         {
             try {
             int gpu_id = omp_get_thread_num();
+            ContactHistoryWorkspace contact_history_workspace;
             if (prepare_distributed_peer_routes) {
                 // The initialization region uses different OpenMP workers.
                 // Prepare routes here so copy_peer_payload sees this worker's
@@ -2850,12 +2607,18 @@ public:
                 const float force_dt = force_bootstrap_step ? 0.0f :
                     static_cast<float>(dt);
 
-                // Pair threads share owners, so epoch reset/retirement must
-                // bracket both passes in separate owner sweeps. These generic
-                // history helpers do not require shear to be enabled. Include
-                // every local owner even when no contact candidates exist.
+                // Retire ended contacts and reclaim their slots before births,
+                // including same-step turnover in a previously full owner row.
+                // Freeze the retained lookup prefix across both owner passes;
+                // newly reserved tail entries must never be read by peers.
                 if (!sph_mode_)
-                    ShearBoxManager::begin_contact_epoch(my_state.local_state, num_local, stream);
+                    prepare_distributed_contact_history(my_contacts.pairs, h_num_contacts,
+                        my_state.local_state, num_local, contact_history_workspace, stream,
+                        config_.shear_box.enabled,
+                        WallManager::get_pbc_config().box_length_x,
+                        WallManager::get_pbc_config().box_length_y,
+                        static_cast<float>(shear_phase.reduced_shift),
+                        distributed_clumps_.enabled());
 
                 if (h_num_contacts > 0) {
                     int contact_blocks = (h_num_contacts + block_size - 1) / block_size;
@@ -2893,6 +2656,8 @@ public:
                         my_state.local_state.particles.contact_history_offset,
                         my_state.local_state.particles.num_contacts,
                         my_state.local_state.contact_history.max_contacts_per_particle,
+                        contact_history_workspace.lookup_counts,
+                        contact_history_workspace.overflow,
                         use_visco,
                         force_dt,
                         num_local,  // Pass num_local for ghost detection
@@ -2935,6 +2700,8 @@ public:
                         my_state.local_state.particles.contact_history_offset,
                         my_state.local_state.particles.num_contacts,
                         my_state.local_state.contact_history.max_contacts_per_particle,
+                        contact_history_workspace.lookup_counts,
+                        contact_history_workspace.overflow,
                         use_visco,
                         force_dt,
                         num_local,  // Pass num_local for ghost detection
@@ -2947,8 +2714,35 @@ public:
                     );
                 }
 
-                if (!sph_mode_)
-                    ShearBoxManager::end_contact_epoch(my_state.local_state, num_local, stream);
+                if (!sph_mode_) {
+                    CUDA_CHECK(cudaMemcpyAsync(&contact_history_errors[gpu_id],
+                        contact_history_workspace.overflow, sizeof(ContactHistoryOverflow),
+                        cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    // All ranks finish force/history work before any rank may
+                    // kick, write a valid output, or checkpoint this step.
+                    #pragma omp barrier
+                    #pragma omp single
+                    {
+                        contact_history_overflow = false;
+                        for (int rank = 0; rank < num_gpus_; ++rank) {
+                            const auto& error = contact_history_errors[rank];
+                            if (!error.flag) continue;
+                            contact_history_overflow = true;
+                            std::cerr << "DEM contact-history capacity exceeded: rank=" << rank
+                                << " owner_global_id=" << error.owner_global_id
+                                << " partner_global_id=" << error.partner_global_id
+                                << " stride=" << error.stride
+                                << " required_count_at_least=" << error.required_count << std::endl;
+                        }
+                    }
+                    #pragma omp barrier
+                    // Every worker takes the same failure path after the
+                    // collective check. The outer catch joins all workers and
+                    // rethrows before run() can write final output/checkpoint.
+                    if (contact_history_overflow)
+                        throw std::runtime_error("DEM contact-history capacity exceeded; step aborted before integration/output/checkpoint");
+                }
 
                 if (sph_mode_) {
                     auto& local = my_state.local_state;
