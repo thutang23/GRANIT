@@ -206,6 +206,31 @@ message(STATUS "GRANIT production package: M2L=${FMM_M2L_MODE}, local P2P FP32=$
 include(CTest)
 if(BUILD_TESTING)
     find_package(Threads REQUIRED)
+    add_executable(granit_checkpoint_transaction_test
+        components/tests/unit_test/constant/checkpoint_transaction.cpp)
+    target_include_directories(granit_checkpoint_transaction_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME checkpoint_transaction COMMAND granit_checkpoint_transaction_test)
+    add_executable(granit_checkpoint_payload_test
+        components/tests/unit_test/constant/checkpoint_payload.cu)
+    target_include_directories(granit_checkpoint_payload_test PRIVATE ${GRANIT_INCLUDE_DIRS})
+    target_link_libraries(granit_checkpoint_payload_test PRIVATE CUDA::cudart yaml-cpp)
+    add_test(NAME checkpoint_payload COMMAND granit_checkpoint_payload_test)
+    set_tests_properties(checkpoint_payload PROPERTIES LABELS "gpu" SKIP_RETURN_CODE 77)
+    add_executable(granit_bonded_wall_checkpoint_test
+        components/tests/unit_test/constant/bonded_wall_checkpoint.cu
+        src/core/wall/bonded_rect_wall.cu)
+    target_include_directories(granit_bonded_wall_checkpoint_test PRIVATE ${GRANIT_INCLUDE_DIRS})
+    target_link_libraries(granit_bonded_wall_checkpoint_test PRIVATE CUDA::cudart yaml-cpp)
+    add_test(NAME bonded_wall_checkpoint COMMAND granit_bonded_wall_checkpoint_test)
+    set_tests_properties(bonded_wall_checkpoint PROPERTIES LABELS "gpu" SKIP_RETURN_CODE 77)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME cooperative_stop_harness
+            COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
+            -s "${CMAKE_CURRENT_SOURCE_DIR}/components/tests/integration_test/cooperative_stop"
+            -p "test_*.py")
+    endif()
     add_executable(granit_config_defaults_test
         components/tests/release_defaults/config_defaults.cpp
         src/core/constant/config_host.cpp

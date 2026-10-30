@@ -13,6 +13,11 @@ class AdaptiveFMMDepthLifecycle {
 public:
     AdaptiveFMMDepthLifecycle(const SimConfig& c, SimulationState& s, cudaStream_t& stream)
         : config_(c), state_(s), compute_stream_(stream) {}
+    // Distributed wrappers keep a separate CSV segment/watermark per rank.
+    uint64_t diagnostic_watermark() const { return adaptive_fmm_depth_persisted_sequence_; }
+    void set_diagnostic_watermark(uint64_t sequence) {
+        adaptive_fmm_depth_persisted_sequence_ = sequence;
+    }
     static uint64_t adaptive_fmm_depth_config_fingerprint(const SimConfig& config) {
         // Bind every knob that changes the controller or its timing population.
         // or the depth-dependent FMM work being compared.  The particle

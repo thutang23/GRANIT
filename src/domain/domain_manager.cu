@@ -602,7 +602,7 @@ void DomainManager::distribute_particles(
         for (int i = 0; i < total_particles; ++i)
             weights.push_back({grid.leaf_begin(grid.key(h_pos_x[i], h_pos_y[i], h_pos_z[i])), 1.0});
         set_morton_partition(params, grid, weighted_morton_cuts(std::move(weights), grid, num_gpus));
-    } else if (!params.morton_enabled)
+    } else if (!params.morton_enabled && !params.restore_morton_partition)
     // Step 3: Compute initial N-way splits with the same RCB math used at runtime.
     // (Unit-weight here; t=0 scatter below is host-staged, a one-time cost.)
     {

@@ -16,6 +16,8 @@
 #include "src/core/constant/command_line_interface.h"
 #include "src/core/constant/system_initialize.h"
 #include "src/core/constant/load_or_resume.h"
+#include "src/core/constant/cooperative_stop.h"
+#include "src/core/constant/yorp_checkpoint.h"
 #include "src/core/neighbor/neighbor_api.h"
 #include "src/core/wall/wall.h"
 #include "src/core/acceleration/acceleration.h"
@@ -67,6 +69,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <cstring>
+#include <memory>
 
 #ifndef CUDADEM_CPU_MOCK
 #include <thrust/device_ptr.h>
@@ -207,9 +210,209 @@ private:
         for (unsigned char byte : payload) { hash ^= byte; hash *= UINT64_C(1099511628211); }
         return hash;
     }
+    struct NonMortonDepthCheckpoint {
+        uint32_t ranks = 0;
+        uint32_t distributed_controller = 0;
+        uint64_t gravity_epoch = 0;
+        int64_t calibration_cursor = -1, pending_rebalance = -1;
+        uint64_t payload_checksum = 0;
+        DomainParamsGPU ownership{};
+        RebalanceController rebalance{};
+        uint8_t local_valid[MAX_MULTI_GPUS]{};
+        AdaptiveFMMDepthCheckpoint local[MAX_MULTI_GPUS]{};
+    };
+    std::vector<uint64_t> adaptive_rank_diagnostic_sequences_;
+    SimConfig adaptive_rank_diagnostic_config(int rank) const {
+        SimConfig rank_config = config_;
+        const std::filesystem::path base = config_.io.output_directory[0] != '\0'
+            ? std::filesystem::path(config_.io.output_directory) : std::filesystem::path(".");
+        const std::string directory = (base / ("adaptive_depth_rank_" + std::to_string(rank))).string();
+        if (directory.size() >= sizeof(rank_config.io.output_directory))
+            throw std::runtime_error("Per-rank adaptive diagnostic directory is too long");
+        std::memcpy(rank_config.io.output_directory, directory.c_str(), directory.size()+1);
+        return rank_config;
+    }
+    bool restored_non_morton_depth_ = false;
+    int64_t restored_pending_rebalance_ = -1;
+
+    struct RCBOwnershipCheckpoint {
+        char magic[8];
+        uint32_t version, ranks;
+        int64_t step;
+        double time;
+        uint64_t gravity_epoch, calibration_bytes, calibration_checksum;
+        int64_t calibration_cursor, pending_rebalance;
+        DomainParamsGPU ownership;
+        RebalanceController rebalance;
+    };
+    void save_rcb_ownership_checkpoint(const std::string& path, const SimulationState& state) {
+        if (domain_params_.morton_enabled) return;
+        if (num_gpus_ > MAX_MULTI_GPUS) throw std::runtime_error("RCB checkpoints support at most 8 GPUs");
+        RCBOwnershipCheckpoint header{};
+        std::memcpy(header.magic, "RCBOWN1", 8);
+        header.version = 1; header.ranks = num_gpus_;
+        header.step = state.current_step; header.time = state.current_time;
+        header.gravity_epoch = gravity_evaluation_epoch_;
+        header.calibration_cursor = common_calibration_cursor_;
+        header.pending_rebalance = rebalance_mailbox_.pending_epoch();
+        header.ownership = domain_params_;
+        header.ownership.morton_cuts = nullptr; header.ownership.morton_cells = nullptr;
+        header.rebalance = rebalance_ctl_;
+        std::ostringstream payload(std::ios::binary);
+        rcb_calibrator_.save_checkpoint(payload);
+        const auto bytes = payload.str();
+        header.calibration_bytes = bytes.size(); header.calibration_checksum = depth_payload_checksum(bytes);
+        std::ofstream out(path + ".rcb_ownership", std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        out.write(bytes.data(), bytes.size()); out.close();
+        if (!out) throw std::runtime_error("Cannot save RCB ownership checkpoint");
+    }
+    void restore_rcb_ownership_checkpoint(const std::string& path, const SimulationState& state) {
+        if (domain_params_.morton_enabled) return;
+        if (!std::filesystem::exists(path + ".rcb_ownership") &&
+            !checkpoint_detail::is_generation(std::filesystem::path(path))) return;
+        RCBOwnershipCheckpoint header{};
+        std::ifstream in(path + ".rcb_ownership", std::ios::binary);
+        in.read(reinterpret_cast<char*>(&header), sizeof(header));
+        if (!in || std::memcmp(header.magic, "RCBOWN1", 8) != 0 || header.version != 1 ||
+            header.ranks != uint32_t(num_gpus_) || header.ranks > MAX_MULTI_GPUS || header.step != state.current_step || header.time != state.current_time ||
+            header.ownership.num_gpus != num_gpus_ || header.ownership.morton_enabled ||
+            header.ownership.morton_cuts || header.ownership.morton_cells || header.calibration_bytes > 1048576)
+            throw std::runtime_error("Invalid RCB ownership checkpoint (rank/configuration/backend)");
+        for (int rank = 0; rank < num_gpus_; ++rank) {
+            if (!(header.ownership.gpu_box_min_x[rank] < header.ownership.gpu_box_max_x[rank]) ||
+                !(header.ownership.gpu_box_min_y[rank] < header.ownership.gpu_box_max_y[rank]) ||
+                !(header.ownership.gpu_box_min_z[rank] < header.ownership.gpu_box_max_z[rank]))
+                throw std::runtime_error("Invalid RCB checkpoint ownership bounds");
+        }
+        std::string bytes(header.calibration_bytes, '\0'); in.read(bytes.data(), bytes.size());
+        if (!in || in.peek() != std::char_traits<char>::eof() || depth_payload_checksum(bytes) != header.calibration_checksum)
+            throw std::runtime_error("Corrupt RCB ownership calibration checkpoint");
+        std::istringstream payload(bytes, std::ios::binary);
+        rcb_calibrator_.restore_checkpoint(payload);
+        if (payload.peek() != std::char_traits<char>::eof()) throw std::runtime_error("Trailing RCB calibration checkpoint data");
+        domain_params_ = header.ownership;
+        domain_params_.restore_morton_partition = true;
+        gravity_evaluation_epoch_ = header.gravity_epoch;
+        common_calibration_cursor_ = header.calibration_cursor;
+        restored_pending_rebalance_ = header.pending_rebalance;
+        rebalance_ctl_ = header.rebalance;
+    }
+
+    void save_non_morton_depth_checkpoint(const std::string& path, const SimulationState& state) {
+        CheckpointDeviceGuard device_guard;
+        NonMortonDepthCheckpoint checkpoint{};
+        checkpoint.ranks = num_gpus_;
+        checkpoint.distributed_controller = num_gpus_ > 1;
+        checkpoint.gravity_epoch = gravity_evaluation_epoch_;
+        checkpoint.calibration_cursor = common_calibration_cursor_;
+        checkpoint.pending_rebalance = rebalance_mailbox_.pending_epoch();
+        checkpoint.ownership = domain_params_;
+        // Persist ownership values; device allocations are reconstructed.
+        checkpoint.ownership.morton_cuts = nullptr;
+        checkpoint.ownership.morton_cells = nullptr;
+        checkpoint.rebalance = rebalance_ctl_;
+        adaptive_rank_diagnostic_sequences_.resize(num_gpus_, 0);
+        for (int rank = 0; rank < num_gpus_; ++rank) {
+            CUDA_CHECK(cudaSetDevice(rank));
+            auto rank_config = adaptive_rank_diagnostic_config(rank);
+            auto& rank_state = gpu_states_[rank];
+            AdaptiveFMMDepthLifecycle diagnostics(rank_config, rank_state.local_state, rank_state.compute_stream);
+            diagnostics.set_diagnostic_watermark(adaptive_rank_diagnostic_sequences_[rank]);
+            diagnostics.append_adaptive_fmm_depth_diagnostics();
+            adaptive_rank_diagnostic_sequences_[rank] = diagnostics.diagnostic_watermark();
+            checkpoint.local_valid[rank] = AccelerationManager::get_adaptive_fmm_depth_checkpoint(
+                &checkpoint.local[rank], rank_state.compute_stream);
+            if (!checkpoint.local_valid[rank] && rank_state.subdomain.num_local_particles > 0)
+                throw std::runtime_error("Cannot snapshot owned rank adaptive FMM runtime");
+            if (checkpoint.local_valid[rank] &&
+                (checkpoint.local[rank].producer_sequence != diagnostics.diagnostic_watermark() ||
+                 checkpoint.local[rank].persisted_csv_sequence != diagnostics.diagnostic_watermark()))
+                throw std::runtime_error("Per-rank adaptive checkpoint diagnostics were not persisted losslessly");
+        }
+        std::ostringstream payload(std::ios::binary);
+        if (checkpoint.distributed_controller) distributed_fmm_depth_.save_checkpoint(payload);
+        rcb_calibrator_.save_checkpoint(payload);
+        const std::string bytes = payload.str();
+        checkpoint.payload_checksum = depth_payload_checksum(bytes);
+        AdaptiveFMMDepthCheckpointSidecarHeader header{{'A','F','M','M','D','P','T','H'},4,
+            static_cast<uint32_t>(sizeof(checkpoint)+bytes.size()),state.current_step,state.current_time,
+            AdaptiveFMMDepthLifecycle::adaptive_fmm_depth_config_fingerprint(config_)};
+        std::ofstream out(adaptive_fmm_depth_checkpoint_sidecar_path(path), std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        out.write(reinterpret_cast<const char*>(&checkpoint), sizeof(checkpoint));
+        out.write(bytes.data(), bytes.size());
+        out.close();
+        if (!out) throw std::runtime_error("Cannot write non-Morton adaptive FMM checkpoint");
+        device_guard.restore();
+    }
+    void restore_non_morton_depth_checkpoint(const std::string& path, const SimulationState& state) {
+        AdaptiveFMMDepthCheckpointSidecarHeader header{};
+        NonMortonDepthCheckpoint checkpoint{};
+        std::ifstream in(adaptive_fmm_depth_checkpoint_sidecar_path(path), std::ios::binary);
+        in.read(reinterpret_cast<char*>(&header), sizeof(header));
+        in.read(reinterpret_cast<char*>(&checkpoint), sizeof(checkpoint));
+        if (!in || std::memcmp(header.magic, "AFMMDPTH", 8) != 0 || header.version != 4 ||
+            header.payload_size < sizeof(checkpoint) || header.payload_size > 1048576 ||
+            header.step != state.current_step || header.time != state.current_time ||
+            header.config_hash != AdaptiveFMMDepthLifecycle::adaptive_fmm_depth_config_fingerprint(config_) ||
+            checkpoint.ranks != uint32_t(num_gpus_) || checkpoint.ranks > MAX_MULTI_GPUS ||
+            checkpoint.distributed_controller != uint32_t(num_gpus_ > 1) ||
+            checkpoint.ownership.morton_enabled || checkpoint.ownership.num_gpus != num_gpus_ ||
+            checkpoint.ownership.morton_cuts || checkpoint.ownership.morton_cells || domain_params_.morton_enabled)
+            throw std::runtime_error("Invalid non-Morton adaptive FMM checkpoint (rank/configuration/backend)");
+        for (int rank = 0; rank < num_gpus_; ++rank) {
+            if (checkpoint.local_valid[rank] > 1 ||
+                !(checkpoint.ownership.gpu_box_min_x[rank] < checkpoint.ownership.gpu_box_max_x[rank]) ||
+                !(checkpoint.ownership.gpu_box_min_y[rank] < checkpoint.ownership.gpu_box_max_y[rank]) ||
+                !(checkpoint.ownership.gpu_box_min_z[rank] < checkpoint.ownership.gpu_box_max_z[rank]))
+                throw std::runtime_error("Invalid checkpoint rank ownership bounds");
+        }
+        std::string bytes(header.payload_size-sizeof(checkpoint), '\0');
+        in.read(bytes.data(), bytes.size());
+        if (!in || in.peek() != std::char_traits<char>::eof() ||
+            depth_payload_checksum(bytes) != checkpoint.payload_checksum)
+            throw std::runtime_error("Corrupt non-Morton adaptive FMM checkpoint payload");
+        std::istringstream payload(bytes, std::ios::binary);
+        if (checkpoint.distributed_controller) {
+            distributed_fmm_depth_.restore_checkpoint(payload, config_.acceleration.unified_fmm.adaptive_depth);
+            if (distributed_fmm_depth_.gpu_count() != num_gpus_)
+                throw std::runtime_error("Mismatched distributed FMM controller ranks");
+        }
+        rcb_calibrator_.restore_checkpoint(payload);
+        if (payload.peek() != std::char_traits<char>::eof())
+            throw std::runtime_error("Unexpected trailing non-Morton FMM controller state");
+        domain_params_ = checkpoint.ownership;
+        // Also prevents recomputing auto bounds and RCB boxes during scatter.
+        domain_params_.restore_morton_partition = true;
+        gravity_evaluation_epoch_ = checkpoint.gravity_epoch;
+        common_calibration_cursor_ = checkpoint.calibration_cursor;
+        rebalance_ctl_ = checkpoint.rebalance;
+        restored_pending_rebalance_ = checkpoint.pending_rebalance;
+        adaptive_rank_diagnostic_sequences_.assign(num_gpus_, 0);
+        for (int rank = 0; rank < num_gpus_; ++rank) {
+            if (!checkpoint.local_valid[rank]) continue;
+            adaptive_rank_diagnostic_sequences_[rank] = checkpoint.local[rank].persisted_csv_sequence;
+            auto rank_config = adaptive_rank_diagnostic_config(rank);
+            auto& rank_state = gpu_states_[rank];
+            AdaptiveFMMDepthLifecycle diagnostics(rank_config, rank_state.local_state, rank_state.compute_stream);
+            diagnostics.set_diagnostic_watermark(checkpoint.local[rank].persisted_csv_sequence);
+            diagnostics.rewind_adaptive_fmm_depth_csv_for_resume(checkpoint.local[rank].persisted_csv_sequence);
+            CUDA_CHECK(cudaSetDevice(rank));
+            if (!AccelerationManager::restore_adaptive_fmm_depth_checkpoint(checkpoint.local[rank]))
+                throw std::runtime_error("Cannot restore rank adaptive FMM runtime");
+        }
+        CUDA_CHECK(cudaSetDevice(0));
+        restored_non_morton_depth_ = true;
+    }
+
     void save_common_depth_checkpoint(const std::string& path, const SimulationState& state) {
         if (!adaptive_fmm_depth_checkpoint_requested(config_)) return;
-        if (!domain_params_.morton_enabled) throw std::runtime_error("Adaptive SPH checkpoint requires Morton ownership");
+        if (num_gpus_ > MAX_MULTI_GPUS) throw std::runtime_error("Checkpoints support at most 8 GPUs");
+        if (!domain_params_.morton_enabled) {
+            save_non_morton_depth_checkpoint(path, state);
+            return;
+        }
         if (num_gpus_ > MAX_MULTI_GPUS) throw std::runtime_error("SPH checkpoints support at most 8 GPUs");
         CommonDepthCheckpoint checkpoint{};
         checkpoint.ranks = num_gpus_; checkpoint.launch_depth = common_launch_depth_;
@@ -239,6 +442,10 @@ private:
         std::filesystem::rename(temporary,target);
     }
     void restore_common_depth_checkpoint(const std::string& path, const SimulationState& state) {
+        if (!domain_params_.morton_enabled) {
+            restore_non_morton_depth_checkpoint(path, state);
+            return;
+        }
         AdaptiveFMMDepthCheckpointSidecarHeader header{}; CommonDepthCheckpoint checkpoint{};
         std::ifstream in(adaptive_fmm_depth_checkpoint_sidecar_path(path),std::ios::binary);
         in.read(reinterpret_cast<char*>(&header),sizeof(header));
@@ -381,16 +588,17 @@ private:
         DEMClumpCheckpointHeader header{};
         std::ifstream file(path+".distributed_clumps",std::ios::binary);
         file.read(reinterpret_cast<char*>(&header),sizeof(header));
-        if(!file||std::memcmp(header.magic,"MGCLMP1",8)!=0||header.version!=2||
+        if(!file||std::memcmp(header.magic,"MGCLMP1",8)!=0||(header.version!=2&&header.version!=3)||
            header.body_bytes!=sizeof(DistributedClumpBody)||header.wall_bytes!=sizeof(WallContactHistory)||
            header.bodies!=static_cast<uint32_t>(config_.clump.num_instances)||
            header.particles!=static_cast<uint64_t>(global.particles.num_particles)||
            header.step!=global.current_step||header.time!=global.current_time||header.dt!=global.dt||
            header.clump_fingerprint!=config_.clump.clump_metadata_fingerprint||
            header.ranks==0||header.ranks>MAX_MULTI_GPUS||
-           header.ownership_root.dimension!=(config_.shear_box.enabled?2:3)||
-           !(header.ownership_root.size>0)||!std::isfinite(header.ownership_root.size)||
-           header.ownership_root.depth<2||header.ownership_root.depth>20||
+           (header.ownership_root.dimension != 0 &&
+            (header.ownership_root.dimension!=(config_.shear_box.enabled?2:3)||
+             !(header.ownership_root.size>0)||!std::isfinite(header.ownership_root.size)||
+             header.ownership_root.depth<2||header.ownership_root.depth>20))||
            header.contact_stride==0||header.contact_stride>1024||header.wall_stride==0||header.wall_stride>1024||
            header.walls>header.particles*header.wall_stride||header.checkpoint_hash!=checkpoint_file_hash(path))
             throw std::runtime_error("Missing, corrupt or mismatched distributed-clump checkpoint sidecar: "+path);
@@ -403,6 +611,9 @@ private:
         restored_owner_ranks_=header.ranks;
         domain_params_.domain_min_x=header.bounds[0];domain_params_.domain_min_y=header.bounds[1];domain_params_.domain_min_z=header.bounds[2];
         domain_params_.domain_max_x=header.bounds[3];domain_params_.domain_max_y=header.bounds[4];domain_params_.domain_max_z=header.bounds[5];
+        if ((header.ownership_root.dimension != 0) != domain_params_.morton_enabled)
+            throw std::runtime_error("Checkpoint ownership backend does not match current configuration");
+        if (domain_params_.morton_enabled) {
         std::vector<uint64_t> cuts;
         if(header.ranks==static_cast<uint32_t>(num_gpus_))cuts.assign(header.cuts,header.cuts+num_gpus_+1);
         else {
@@ -416,6 +627,7 @@ private:
         }
         DomainManager::set_morton_partition(domain_params_,header.ownership_root,cuts);
         domain_params_.restore_morton_partition=true;
+        }
         restored_bodies_.resize(header.bodies);restored_exact_rows_.resize(header.particles);restored_wall_rows_.resize(header.walls);
         auto read=[&](auto& rows){file.read(reinterpret_cast<char*>(rows.data()),rows.size()*sizeof(rows[0]));};
         read(restored_bodies_);read(restored_exact_rows_);read(restored_wall_rows_);
@@ -452,7 +664,7 @@ private:
         auto put=[&](auto* target,const auto& rows){CUDA_CHECK(cudaMemcpy(target,rows.data(),n*sizeof(rows[0]),cudaMemcpyHostToDevice));};
         put(global.particles.force_x,fx);put(global.particles.force_y,fy);put(global.particles.force_z,fz);
         put(global.particles.torque_x,tx);put(global.particles.torque_y,ty);put(global.particles.torque_z,tz);
-        if(!global.particles.input_has_clump_offset)throw std::runtime_error("Distributed DEM restart requires stored body-frame offsets");
+        if(header.bodies && !global.particles.input_has_clump_offset)throw std::runtime_error("Distributed DEM restart requires stored body-frame offsets");
     }
     size_t restart_exact_index(int32_t gid) const {
         const auto row=std::lower_bound(restored_exact_rows_.begin(),restored_exact_rows_.end(),gid,
@@ -499,14 +711,18 @@ private:
     void save_dem_clump_sidecar(const std::string& path,const SimulationState& state,
                                const std::vector<DEMExactRow>& exact,
                                const std::vector<WallContactHistory>& walls,int contact_stride,int wall_stride) {
-        if(!domain_params_.morton_enabled||!domain_params_.morton_cuts)
-            throw std::runtime_error("Distributed clump checkpoints require an initialized Morton root and ownership cuts");
+        CheckpointDeviceGuard device_guard;
+        if(domain_params_.morton_enabled && !domain_params_.morton_cuts)
+            throw std::runtime_error("Distributed checkpoints require initialized Morton ownership cuts");
         const auto bodies=distributed_clumps_.snapshot();DEMClumpCheckpointHeader header{};
-        std::memcpy(header.magic,"MGCLMP1",8);header.version=2;header.body_bytes=sizeof(DistributedClumpBody);
+        std::memcpy(header.magic,"MGCLMP1",8);header.version=3;header.body_bytes=sizeof(DistributedClumpBody);
         header.wall_bytes=sizeof(WallContactHistory);header.contact_stride=contact_stride;header.wall_stride=wall_stride;
         header.bodies=bodies.size();header.particles=exact.size();header.walls=walls.size();
-        header.ownership_root=domain_params_.morton_grid;header.ranks=num_gpus_;
-        for(int rank=0;rank<=num_gpus_;++rank)header.cuts[rank]=domain_params_.morton_cuts[rank];
+        header.ranks=num_gpus_;
+        if (domain_params_.morton_enabled) {
+            header.ownership_root=domain_params_.morton_grid;
+            for(int rank=0;rank<=num_gpus_;++rank)header.cuts[rank]=domain_params_.morton_cuts[rank];
+        } else { header.ownership_root.dimension = 0; }
         header.bounds[0]=domain_params_.domain_min_x;header.bounds[1]=domain_params_.domain_min_y;header.bounds[2]=domain_params_.domain_min_z;
         header.bounds[3]=domain_params_.domain_max_x;header.bounds[4]=domain_params_.domain_max_y;header.bounds[5]=domain_params_.domain_max_z;
         header.clump_fingerprint=config_.clump.clump_metadata_fingerprint;header.checkpoint_hash=checkpoint_file_hash(path);
@@ -521,12 +737,15 @@ private:
         write(bodies);write(exact);write(walls);file.close();
         if(!file)throw std::runtime_error("Cannot write exact distributed-clump checkpoint: "+target);
         std::filesystem::rename(temporary,target);
+        device_guard.restore();
     }
 
     int32_t num_gpus_;
     bool initialized_;
     bool sph_mode_;
     bool resumed_ = false;
+    bool restored_yorp_runtime_ = false;
+    std::vector<double> next_yorp_checks_;
     int64_t last_checkpoint_step_ = -1;
     int64_t checkpoint_cadence_step_ = 0;
     double dt_;
@@ -723,8 +942,7 @@ private:
         if (live == 0) throw std::runtime_error("Multi-GPU input contains no live particles");
         const int32_t dead = total - live;
         if (dead == 0) return;
-        if ((sph_mode_ || config_.clump.num_instances>0) && (resumed_ || config_.io.checkpoint_enabled))
-            throw std::invalid_argument("Distributed SPH checkpoints require all rows live");
+        throw std::invalid_argument("Distributed cooperative checkpoints require all rows live; inactive input rows are unsupported");
         auto copy_tail = [&](auto& dst, const auto* src) {
             using T = typename std::decay_t<decltype(dst)>::value_type;
             dst.resize(dead);
@@ -923,13 +1141,15 @@ public:
             return false;
         }
 
+        for (int wall = 0; wall < config_.num_walls; ++wall)
+            if (config_.walls[wall].enabled && config_.walls[wall].type == WallType::BONDED_RECT)
+                throw std::invalid_argument("Distributed bonded-wall dynamics and cooperative checkpoint state are unsupported");
         resumed_ = config_.io.checkpoint_resume_from[0] != '\0';
-        if (resumed_ || (sph_mode_ && config_.io.checkpoint_enabled)) {
-            if ((!sph_mode_ && config_.clump.num_instances<=0) || (sph_mode_ && config_.shear_box.enabled)) {
-                throw std::invalid_argument(
-                    "Multi-GPU checkpoints require isolated SPH");
-            }
-        }
+        // Cooperative stop can checkpoint even when periodic writes are off.
+        // Distributed SPH does not persist/reconstruct shearing-box state.
+        if (sph_mode_ && config_.shear_box.enabled)
+            throw std::invalid_argument(
+                "Distributed SPH cooperative checkpoints require isolated SPH; shearing boxes are unsupported");
         if (resumed_ && config_.io.checkpoint_force_fresh)
             throw std::invalid_argument("checkpoint force_fresh conflicts with resume_from");
         const ValidationResult input_validation = resumed_
@@ -1002,7 +1222,7 @@ public:
         ClumpSegmentOffsets initial_clump_segments;
         try {
             if (resumed_ && !sph_mode_) {
-                restore_dem_clump_checkpoint(config_.io.checkpoint_resume_from,global_state);
+                restore_dem_clump_checkpoint(loaded_checkpoint_path(),global_state);
                 canonicalize_particle_clump_order(global_state.particles,&global_state.contact_history);
                 stage_dem_checkpoint_contacts(global_state);
             }
@@ -1069,9 +1289,11 @@ public:
                                   global_state.particles.num_local);
         }
 
+        // Reuse the exact ownership geometry before assigning restart rows.
+        if (resumed_) restore_rcb_ownership_checkpoint(loaded_checkpoint_path(), global_state);
         // Distribute particles across GPUs
         if (resumed_ && adaptive_fmm_depth_checkpoint_requested(config_))
-            restore_common_depth_checkpoint(config_.io.checkpoint_resume_from, global_state);
+            restore_common_depth_checkpoint(loaded_checkpoint_path(), global_state);
         DomainManager::distribute_particles(global_state, gpu_states_, domain_params_, config_);
         if (initial_clump_state.num_clumps > 0 || !restored_bodies_.empty()) {
             CUDA_CHECK(cudaSetDevice(0));
@@ -1097,6 +1319,17 @@ public:
 
         std::vector<int> device_ids(static_cast<size_t>(num_gpus_));
         std::iota(device_ids.begin(), device_ids.end(), 0);
+        next_yorp_checks_.assign(num_gpus_, config_.acceleration.yorp.start_time);
+        if (resumed_ && config_.acceleration.yorp.enabled) {
+            std::vector<cudaStream_t> streams;
+            for (const auto& rank : gpu_states_) streams.push_back(rank.compute_stream);
+            const auto runtime = restore_yorp_runtime_checkpoint(loaded_checkpoint_path(),
+                gpu_states_[0].local_state, config_, device_ids, streams, &next_yorp_checks_);
+            restored_yorp_runtime_ = true;
+            if (config_.acceleration.yorp.adaptive && !runtime.empty())
+                rewind_yorp_diagnostic_csv(std::string(config_.io.output_directory)+"/adaptive_yorp_multigpu.csv",
+                    "metric_time", runtime[0].device_state.diagnostic.time);
+        }
         if (!phase_coordinator_.initialize(device_ids)) {
             std::cerr << "ERROR: Failed to initialize multi-GPU phase coordinator: "
                       << phase_coordinator_.error_message() << std::endl;
@@ -1119,7 +1352,7 @@ public:
             }
         }
 
-        if (num_gpus_ > 1 && !domain_params_.morton_enabled && config_.acceleration.unified_fmm.adaptive_depth.enabled &&
+        if (!restored_non_morton_depth_ && num_gpus_ > 1 && !domain_params_.morton_enabled && config_.acceleration.unified_fmm.adaptive_depth.enabled &&
             !distributed_fmm_depth_.initialize(
                 config_.acceleration.unified_fmm.adaptive_depth,
                 num_gpus_, {})) {
@@ -1320,6 +1553,7 @@ public:
         rebalance_ctl_.configure(config_.multigpu.rebalance_threshold,
                                  config_.multigpu.rebalance_min_interval);
         rebalance_mailbox_.initialize(num_gpus_);
+        if (restored_pending_rebalance_ >= 0) rebalance_mailbox_.schedule(restored_pending_rebalance_);
         rcb_calibrator_.set_half_life(config_.multigpu.rcb_calibration_half_life);
         std::vector<RCBWorkKey> required_calibration{{RCBWorkPhase::Integration,
             RCBFmmMode::NotApplicable, RCBLinkClass::PCIe}};
@@ -1417,6 +1651,8 @@ public:
         std::vector<float> sph_h_max_candidates(static_cast<size_t>(num_gpus_), 0.0f);
         std::vector<ContactHistoryOverflow> contact_history_errors(num_gpus_);
         bool contact_history_overflow = false;
+        bool collective_stop = false;
+        bool checkpoint_failed = false;
         std::exception_ptr worker_failure;
         std::mutex worker_failure_mutex;
         const bool prepare_distributed_peer_routes = num_gpus_ > 1 &&
@@ -1793,11 +2029,21 @@ public:
             // first increment.  All workers execute the same sparse protocol
             // epoch; directed acknowledgements protect its shared buffers.
             uint64_t yorp_observation_epoch = 1;
-            double next_yorp_check = config_.acceleration.yorp.start_time;
+            double& next_yorp_check = next_yorp_checks_[gpu_id];
             bool local_adaptive_yorp_stop = false;
             double local_last_yorp_transition_time =
                 -std::numeric_limits<double>::infinity();
-            if (config_.acceleration.yorp.adaptive &&
+            if (restored_yorp_runtime_ && config_.acceleration.yorp.adaptive &&
+                my_state.local_state.current_time >= config_.acceleration.yorp.start_time) {
+                AdaptiveYorpDiagnostic diagnostic{};
+                if (!AccelerationManager::yorp_manager_for_gpu(gpu_id)->consume_adaptive_diagnostic(&diagnostic, stream))
+                    throw std::runtime_error("Restored distributed adaptive YORP state is unavailable");
+                local_adaptive_yorp_stop = diagnostic.fatal != 0 ||
+                    diagnostic.state == static_cast<int32_t>(AdaptiveYorpState::COMPLETE);
+                local_last_yorp_transition_time = diagnostic.transition_time;
+                if (gpu_id == 0) adaptive_yorp_fatal_ = diagnostic.fatal != 0;
+            }
+            if (!restored_yorp_runtime_ && config_.acceleration.yorp.adaptive &&
                 my_state.local_state.current_time + 1e-12 >= next_yorp_check) {
                 require_phase(distributed_yorp_.observe(
                     gpu_id, my_state.local_state.particles,
@@ -1865,8 +2111,8 @@ public:
             };
 
             // Main simulation loop
-            while (force_bootstrap_pending || (my_state.local_state.current_time < config_.time.stop_time &&
-                   !local_adaptive_yorp_stop)) {
+            while (!collective_stop && (force_bootstrap_pending || (my_state.local_state.current_time < config_.time.stop_time &&
+                   !local_adaptive_yorp_stop))) {
                 #ifdef CUDADEM_ENABLE_PROFILING
                 nvtxRangePushA("SimulationStep");
                 #endif
@@ -3590,31 +3836,46 @@ public:
                     }
                     nvtxRangePop();
                 }
-                if ((sph_mode_ || distributed_clumps_.enabled()) && !force_bootstrap_step && config_.io.checkpoint_enabled && (!respa_enabled || respa_macro_closing) &&
+                if (!force_bootstrap_step && config_.io.checkpoint_enabled && (!respa_enabled || respa_macro_closing) &&
                     my_state.local_state.current_step - checkpoint_cadence_step_ >= config_.io.checkpoint_interval) {
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    CUDA_CHECK(cudaDeviceSynchronize());
                     harvest_timing_samples();
+                    harvest_distributed_fmm_samples();
                     #pragma omp barrier
                     #pragma omp single
                     {
+                        distributed_fmm_depth_.process_ready_epochs();
                         int64_t epoch; std::vector<RCBActiveSample> samples;
                         while (rcb_sample_mailbox_.try_collect_next(common_calibration_cursor_,epoch,samples)) {
                             common_calibration_cursor_=epoch; rcb_calibrator_.observe_global_epoch(epoch,samples); samples.clear();
                         }
-                        save_output(true);
+                        try { save_output(true); }
+                        catch (...) {
+                            worker_failure = std::current_exception();
+                            checkpoint_failed = true;
+                        }
                     }
                     #pragma omp barrier
+                    if (checkpoint_failed) std::rethrow_exception(worker_failure);
                     CUDA_CHECK(cudaSetDevice(gpu_id));
                 }
 
+                // Only this collective closed-boundary sample reads the signal
+                // flag. Every worker sees the same exit decision after single's
+                // implicit barrier, so none skips a later rank barrier alone.
+                if (force_bootstrap_step || !respa_enabled || respa_macro_closing) {
+                    #pragma omp barrier
+                    #pragma omp single
+                    { collective_stop = cooperative_stop_requested(); }
+                }
                 ++particle_exchange_epoch;
                 #ifdef CUDADEM_ENABLE_PROFILING
                 nvtxRangePop(); // SimulationStep
                 #endif
             }
 
-            // Sync this GPU
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            // Drain every device before the host gathers the stop checkpoint.
+            CUDA_CHECK(cudaDeviceSynchronize());
             harvest_timing_samples();
             harvest_distributed_fmm_samples();
             #pragma omp barrier
@@ -3632,12 +3893,22 @@ public:
         }
 
         if (worker_failure) std::rethrow_exception(worker_failure);
+        collective_stop = collective_stop || cooperative_stop_requested();
 
-        if (last_output_step_ != gpu_states_[0].local_state.current_step)
-            save_output();
-        if ((sph_mode_ || distributed_clumps_.enabled()) && config_.io.checkpoint_enabled &&
+        if ((collective_stop || config_.io.checkpoint_enabled) &&
             last_checkpoint_step_ != gpu_states_[0].local_state.current_step)
             save_output(true);
+        collective_stop = collective_stop || cooperative_stop_requested();
+        if (collective_stop) {
+            if (last_checkpoint_step_ != gpu_states_[0].local_state.current_step) save_output(true);
+            std::cout << "[cooperative-stop] signal=" << cooperative_stop_signal.load(std::memory_order_relaxed)
+                      << " checkpoint=" << generate_checkpoint_path(config_, gpu_states_[0].local_state.current_step)
+                      << " step=" << gpu_states_[0].local_state.current_step
+                      << " time=" << gpu_states_[0].local_state.current_time << std::endl;
+            return;
+        }
+        if (last_output_step_ != gpu_states_[0].local_state.current_step)
+            save_output();
         write_distributed_fmm_diagnostics();
 
         if (config_.io.output_directory[0] != '\0' || config_.io.timing_receipt_path[0] != '\0') {
@@ -3842,7 +4113,7 @@ public:
             gather_field(h_checkpoint_qy,&ParticleSoA::quat_y);gather_field(h_checkpoint_qz,&ParticleSoA::quat_z);
             gather_field(h_checkpoint_contacts,&ParticleSoA::num_contacts);
             gather_field(h_checkpoint_wall_counts,&ParticleSoA::num_wall_contacts);
-            if(distributed_clumps_.enabled()) {
+            if(!sph_mode_) {
                 checkpoint_contact_stride=gpu_states_[0].local_state.contact_history.max_contacts_per_particle;
                 checkpoint_wall_stride=gpu_states_[0].local_state.wall_contact_history.max_contacts_per_particle;
                 const int64_t total=std::accumulate(h_checkpoint_contacts.begin(),h_checkpoint_contacts.end(),int64_t{0});
@@ -3856,12 +4127,32 @@ public:
                     if(local.contact_history.max_contacts_per_particle!=checkpoint_contact_stride||
                        local.wall_contact_history.max_contacts_per_particle!=checkpoint_wall_stride)
                         throw std::runtime_error("Checkpoint requires matching history strides on all ranks");
-                    if(total&&n)CUDA_CHECK(cudaMemcpy(checkpoint_contact_blob.data()+offset*checkpoint_contact_stride,
-                        local.contact_history.data,static_cast<size_t>(n)*checkpoint_contact_stride*sizeof(ContactHistory),cudaMemcpyDeviceToHost));
-                    for(int i=0;i<n;++i){const int count=h_checkpoint_wall_counts[offset+i];
-                        if(count<0||count>checkpoint_wall_stride)throw std::runtime_error("Invalid wall history count at checkpoint");
+                    std::vector<int32_t> contact_offsets(n), wall_offsets(n);
+                    if (n) {
+                        CUDA_CHECK(cudaMemcpy(contact_offsets.data(), local.particles.contact_history_offset,
+                            n*sizeof(int32_t), cudaMemcpyDeviceToHost));
+                        CUDA_CHECK(cudaMemcpy(wall_offsets.data(), local.particles.wall_history_offset,
+                            n*sizeof(int32_t), cudaMemcpyDeviceToHost));
+                    }
+                    std::vector<ContactHistory> contact_pool;
+                    if (total && n) {
+                        contact_pool.resize(local.contact_history.capacity);
+                        CUDA_CHECK(cudaMemcpy(contact_pool.data(), local.contact_history.data,
+                            contact_pool.size()*sizeof(ContactHistory), cudaMemcpyDeviceToHost));
+                    }
+                    for(int i=0;i<n;++i){
+                        const int contact_count=h_checkpoint_contacts[offset+i];
+                        const int count=h_checkpoint_wall_counts[offset+i];
+                        if(contact_count<0||contact_count>checkpoint_contact_stride||
+                           contact_offsets[i]<0||int64_t(contact_offsets[i])+checkpoint_contact_stride>local.contact_history.capacity)
+                            throw std::runtime_error("Invalid particle contact row at checkpoint");
+                        if(total)std::copy_n(contact_pool.data()+contact_offsets[i], checkpoint_contact_stride,
+                            checkpoint_contact_blob.data()+(offset+i)*checkpoint_contact_stride);
+                        if(count<0||count>checkpoint_wall_stride||wall_offsets[i]<0||
+                           int64_t(wall_offsets[i])+checkpoint_wall_stride>local.wall_contact_history.capacity)
+                            throw std::runtime_error("Invalid particle wall-history row at checkpoint");
                         auto& rows=checkpoint_wall_by_row[offset+i];rows.resize(count);
-                        if(count)CUDA_CHECK(cudaMemcpy(rows.data(),local.wall_contact_history.data+static_cast<size_t>(i)*checkpoint_wall_stride,
+                        if(count)CUDA_CHECK(cudaMemcpy(rows.data(),local.wall_contact_history.data+wall_offsets[i],
                             count*sizeof(WallContactHistory),cudaMemcpyDeviceToHost));}
                     offset+=n;
                 }
@@ -3980,7 +4271,7 @@ public:
         if (checkpoint) {
             reorder(h_checkpoint_qw);reorder(h_checkpoint_qx);reorder(h_checkpoint_qy);reorder(h_checkpoint_qz);
             reorder(h_checkpoint_contacts);reorder(h_checkpoint_wall_counts);
-            if(distributed_clumps_.enabled()) {
+            if(!sph_mode_) {
                 if(!checkpoint_contact_blob.empty()) {
                     auto original=std::move(checkpoint_contact_blob);
                     checkpoint_contact_blob.resize(original.size());
@@ -4018,6 +4309,13 @@ public:
             ? generate_checkpoint_path(config_, gpu_states_[0].local_state.current_step)
             : oss.str();
 
+        std::unique_ptr<CheckpointTransaction> transaction;
+        if (checkpoint) {
+            if (dead_rows_.size() != 0)
+                throw std::runtime_error("Distributed checkpoints require all rows live");
+            transaction.reset(new CheckpointTransaction(filepath));
+            filepath = transaction->staging_path();
+        }
         std::filesystem::path output_dir = std::filesystem::path(filepath).parent_path();
         if (!std::filesystem::exists(output_dir)) {
             std::filesystem::create_directories(output_dir);
@@ -4110,8 +4408,6 @@ public:
             upload_field(&ParticleSoA::flaws_m0, h_checkpoint_flaws_m0);
         }
 
-        if (checkpoint && adaptive_fmm_depth_checkpoint_requested(config_))
-            std::filesystem::remove(adaptive_fmm_depth_checkpoint_sidecar_path(filepath));
         if (!write_unified_binary(filepath, output_state.particles,
                                   output_state, config_, checkpoint,
                                   checkpoint_contact_blob.empty()?nullptr:&checkpoint_contact_blob,
@@ -4122,13 +4418,22 @@ public:
         if (checkpoint) {
             write_sph_stage_checkpoint(filepath, output_state, config_);
             write_respa_checkpoint_sidecar(filepath, output_state, config_);
+            write_wall_history_checkpoint(filepath, output_state);
+            std::vector<int> yorp_devices(num_gpus_);
+            std::iota(yorp_devices.begin(), yorp_devices.end(), 0);
+            std::vector<cudaStream_t> yorp_streams;
+            for (const auto& rank : gpu_states_) yorp_streams.push_back(rank.compute_stream);
+            write_yorp_runtime_checkpoint(filepath, output_state, config_, yorp_devices, yorp_streams, next_yorp_checks_);
+            save_rcb_ownership_checkpoint(filepath, output_state);
             save_common_depth_checkpoint(filepath, output_state);
-            if(distributed_clumps_.enabled()) {
+            if(!sph_mode_) {
                 write_shear_checkpoint_sidecar(filepath,output_state,config_);
                 save_dem_clump_sidecar(filepath,output_state,checkpoint_exact_rows,checkpoint_wall_rows,
                                       checkpoint_contact_stride,checkpoint_wall_stride);
             }
+            transaction->commit();
         }
+        CUDA_CHECK(cudaSetDevice(0));
         free_particle_soa(output_state.particles);
         if (checkpoint) {
             last_checkpoint_step_ = gpu_states_[0].local_state.current_step;
@@ -4318,6 +4623,7 @@ public:
 // =============================================================================
 
 int main(int argc, char* argv[]) {
+    cudadem::CooperativeStopSignals cooperative_stop_signals;
     // See the single-GPU entry point: every module must be loaded before any
     // per-GPU persistent scheduler becomes resident.
     setenv("CUDA_MODULE_LOADING", "EAGER", 1);

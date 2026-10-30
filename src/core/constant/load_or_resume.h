@@ -5,6 +5,7 @@
 #include "system_initialize.h"
 #include "binary_format.h"
 #include "binary_reader.h"
+#include "checkpoint_transaction.h"
 #include "../acceleration/external_bodies.h"
 #include "../neighbor/neighbor_api.h"
 #include <cuda_runtime.h>
@@ -113,8 +114,9 @@ inline ValidationResult validate_particle_file(const std::string& filepath,
         return ValidationResult(false, "Cannot open file: " + filepath);
     }
 
-    UnifiedHeader header;
+    UnifiedHeader header{};
     file.read(reinterpret_cast<char*>(&header), sizeof(header));
+    if (!file) return ValidationResult(false, "Truncated binary header: " + filepath);
     file.close();
 
     // Check magic number
@@ -148,15 +150,19 @@ inline ValidationResult validate_particle_file(const std::string& filepath,
 }
 
 // Validate checkpoint file
-inline ValidationResult validate_checkpoint_file(const std::string& filepath,
+inline ValidationResult validate_checkpoint_file(const std::string& requested_path,
                                                   const SimConfig& config) {
+    std::string filepath;
+    try { filepath = resolve_checkpoint_path(requested_path); }
+    catch (const std::exception& error) { return ValidationResult(false, error.what()); }
     std::ifstream file(filepath, std::ios::binary);
     if (!file.is_open()) {
         return ValidationResult(false, "Cannot open checkpoint: " + filepath);
     }
 
-    UnifiedHeader header;
+    UnifiedHeader header{};
     file.read(reinterpret_cast<char*>(&header), sizeof(header));
+    if (!file) return ValidationResult(false, "Truncated binary header: " + filepath);
     file.close();
 
     // Check magic
@@ -186,9 +192,18 @@ inline ValidationResult validate_checkpoint_file(const std::string& filepath,
 // Checkpoint Generation Path
 // =============================================================================
 
+inline std::string checkpoint_directory(const SimConfig& config) {
+    if (config.io.checkpoint_path[0] != '\0') return config.io.checkpoint_path;
+    // A signal must still persist a checkpoint when periodic checkpointing is
+    // disabled and its optional path was omitted from the configuration.
+    const std::filesystem::path output = config.io.output_directory[0] != '\0'
+        ? std::filesystem::path(config.io.output_directory) : std::filesystem::path(".");
+    return (output / "checkpoints").string();
+}
+
 inline std::string generate_checkpoint_path(const SimConfig& config, int64_t step) {
     std::ostringstream oss;
-    oss << config.io.checkpoint_path << "/checkpoint_step_"
+    oss << checkpoint_directory(config) << "/checkpoint_step_"
         << std::setfill('0') << std::setw(10) << step << ".bin";
     return oss.str();
 }
@@ -279,6 +294,7 @@ inline void write_respa_checkpoint_sidecar(
     if (!file) throw std::runtime_error("Cannot write RESPA synchronization sidecar: " + path);
     file.write(reinterpret_cast<const char*>(&header), sizeof(header));
     if (config.physics == SimulationPhysics::SPH) file << sph_respa_signature(config) << '\n';
+    file.flush(); file.close();
     if (!file) throw std::runtime_error("Failed writing RESPA synchronization sidecar: " + path);
 }
 
@@ -352,7 +368,7 @@ inline bool has_adaptive_fmm_depth_checkpoint_sidecar(
     const char expected_magic[8] = {'A','F','M','M','D','P','T','H'};
     return file.read(reinterpret_cast<char*>(&header), sizeof(header)) &&
         std::memcmp(header.magic, expected_magic, sizeof(expected_magic)) == 0 &&
-        (header.version == 2 || header.version == 3) && header.payload_size > 0;
+        (header.version == 2 || header.version == 3 || header.version == 4) && header.payload_size > 0;
 }
 
 inline uint32_t adaptive_fmm_depth_checkpoint_sidecar_version(
@@ -378,6 +394,7 @@ inline void write_shear_checkpoint_sidecar(
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     if (!file) throw std::runtime_error("Cannot write shear checkpoint sidecar: " + path);
     file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    file.flush(); file.close();
     if (!file) throw std::runtime_error("Failed writing shear checkpoint sidecar: " + path);
 }
 
@@ -408,8 +425,20 @@ inline bool shear_checkpoint_mode_matches(
         checkpoint_path, expected_step, expected_time, config);
 }
 
+inline bool has_yorp_checkpoint_sidecar(const std::string& path) {
+    // Distributed checkpoints store the full runtime in .yorp_runtime;
+    // older single-device adaptive checkpoints use .adaptive_yorp.
+    for (const char* suffix : {".yorp_runtime", ".adaptive_yorp"}) {
+        std::error_code error;
+        const std::filesystem::path sidecar(path + suffix);
+        if (std::filesystem::is_regular_file(sidecar, error) && !error &&
+            std::filesystem::file_size(sidecar, error) > 0 && !error) return true;
+    }
+    return false;
+}
+
 inline std::string get_latest_checkpoint_path(const SimConfig& config) {
-    std::string checkpoint_dir = config.io.checkpoint_path;
+    std::string checkpoint_dir = checkpoint_directory(config);
 
     if (!std::filesystem::exists(checkpoint_dir)) {
         return "";
@@ -417,6 +446,7 @@ inline std::string get_latest_checkpoint_path(const SimConfig& config) {
 
     std::string latest_path;
     int64_t latest_step = -1;
+    bool found_incomplete_generation = false;
     bool found_unsynchronized_respa_checkpoint = false;
     bool found_invalid_sph_checkpoint = false;
     bool found_invalid_shear_checkpoint = false;
@@ -426,7 +456,7 @@ inline std::string get_latest_checkpoint_path(const SimConfig& config) {
     int64_t newest_legacy_adaptive_step = -1;
 
     for (const auto& entry : std::filesystem::directory_iterator(checkpoint_dir)) {
-        if (entry.is_regular_file()) {
+        if (entry.is_regular_file() || entry.is_symlink()) {
             std::string filename = entry.path().filename().string();
             constexpr const char* prefix = "checkpoint_step_";
             constexpr const char* suffix = ".bin";
@@ -435,19 +465,20 @@ inline std::string get_latest_checkpoint_path(const SimConfig& config) {
             if (filename.size() > prefix_size + suffix_size &&
                 filename.compare(0, prefix_size, prefix) == 0 &&
                 filename.compare(filename.size() - suffix_size, suffix_size, suffix) == 0) {
+                std::string checkpoint_path;
+                try { checkpoint_path = resolve_checkpoint_path(entry.path().string()); }
+                catch (const std::exception& error) {
+                    found_incomplete_generation = true;
+                    std::cerr << "Skipping incomplete checkpoint: " << entry.path() << ": " << error.what() << '\n';
+                    continue;
+                }
                 // Adaptive checkpoints are published as a required pair.  If
                 // a process stopped between the binary and sidecar writes,
                 // skip that orphan and resume the newest complete pair.
-                if (config.acceleration.yorp.adaptive) {
-                    const std::filesystem::path sidecar(entry.path().string() + ".adaptive_yorp");
-                    std::error_code ec;
-                    if (!std::filesystem::is_regular_file(sidecar, ec) || ec ||
-                        std::filesystem::file_size(sidecar, ec) == 0 || ec) {
-                        continue;
-                    }
-                }
+                if (config.acceleration.yorp.adaptive && !has_yorp_checkpoint_sidecar(checkpoint_path))
+                    continue;
                 if (adaptive_fmm_depth_checkpoint_requested(config) &&
-                    !has_adaptive_fmm_depth_checkpoint_sidecar(entry.path().string())) {
+                    !has_adaptive_fmm_depth_checkpoint_sidecar(checkpoint_path)) {
                     found_incomplete_adaptive_fmm_depth_checkpoint = true;
                     try {
                         const int64_t step = static_cast<int64_t>(std::stoll(filename.substr(
@@ -455,7 +486,7 @@ inline std::string get_latest_checkpoint_path(const SimConfig& config) {
                         newest_incomplete_adaptive_step = std::max(
                             newest_incomplete_adaptive_step, step);
                         if (adaptive_fmm_depth_checkpoint_sidecar_version(
-                                entry.path().string()) == 1) {
+                                checkpoint_path) == 1) {
                             newest_legacy_adaptive_step = std::max(
                                 newest_legacy_adaptive_step, step);
                         }
@@ -463,37 +494,37 @@ inline std::string get_latest_checkpoint_path(const SimConfig& config) {
                     continue;
                 }
                 if (respa_checkpoint_requested(config)) {
-                    std::ifstream checkpoint(entry.path(), std::ios::binary);
+                    std::ifstream checkpoint(checkpoint_path, std::ios::binary);
                     UnifiedHeader header{};
                     checkpoint.read(reinterpret_cast<char*>(&header), sizeof(header));
                     if (!checkpoint || !valid_respa_checkpoint_sidecar(
-                            entry.path().string(), header.current_step,
+                            checkpoint_path, header.current_step,
                             header.current_time, config)) {
                         found_unsynchronized_respa_checkpoint = true;
                         continue;
                     }
                 }
                 if (config.shear_box.enabled || std::filesystem::exists(
-                        shear_checkpoint_sidecar_path(entry.path().string()))) {
-                    std::ifstream checkpoint(entry.path(), std::ios::binary);
+                        shear_checkpoint_sidecar_path(checkpoint_path))) {
+                    std::ifstream checkpoint(checkpoint_path, std::ios::binary);
                     UnifiedHeader header{};
                     checkpoint.read(reinterpret_cast<char*>(&header), sizeof(header));
                     if (!checkpoint || !shear_checkpoint_mode_matches(
-                            entry.path().string(), header.current_step,
+                            checkpoint_path, header.current_step,
                             header.current_time, config)) {
                         found_invalid_shear_checkpoint = true;
                         continue;
                     }
                 }
                 if (config.acceleration.external_bodies.enabled) {
-                    std::ifstream checkpoint(entry.path(), std::ios::binary); UnifiedHeader header{};
+                    std::ifstream checkpoint(checkpoint_path, std::ios::binary); UnifiedHeader header{};
                     checkpoint.read(reinterpret_cast<char*>(&header), sizeof(header));
-                    if (!checkpoint || !ExternalBodyManager::checkpoint_sidecar_matches(entry.path().string(), header.current_step, header.current_time, config)) { found_incomplete_external_bodies_checkpoint=true; continue; }
+                    if (!checkpoint || !ExternalBodyManager::checkpoint_sidecar_matches(checkpoint_path, header.current_step, header.current_time, config)) { found_incomplete_external_bodies_checkpoint=true; continue; }
                 }
                 {
-                    std::ifstream checkpoint(entry.path(), std::ios::binary); UnifiedHeader header{};
+                    std::ifstream checkpoint(checkpoint_path, std::ios::binary); UnifiedHeader header{};
                     checkpoint.read(reinterpret_cast<char*>(&header), sizeof(header));
-                    if (!checkpoint || !valid_sph_stage_checkpoint(entry.path().string(), config,
+                    if (!checkpoint || !valid_sph_stage_checkpoint(checkpoint_path, config,
                             header.current_step, header.current_time)) {
                         found_invalid_sph_checkpoint = true;
                         continue;
@@ -507,7 +538,7 @@ inline std::string get_latest_checkpoint_path(const SimConfig& config) {
                     int64_t step = std::stoll(step_str);
                     if (step > latest_step) {
                         latest_step = step;
-                        latest_path = entry.path().string();
+                        latest_path = checkpoint_path;
                     }
                 } catch (...) {
                     continue;
@@ -516,6 +547,8 @@ inline std::string get_latest_checkpoint_path(const SimConfig& config) {
         }
     }
 
+    if (latest_path.empty() && found_incomplete_generation)
+        throw std::runtime_error("Only incomplete or damaged checkpoint generations were found; refusing a fresh start");
     if (latest_path.empty() && found_invalid_sph_checkpoint)
         throw std::runtime_error("No matching SPH stage checkpoint found; choose force_fresh only for a new run");
     if (latest_path.empty() && found_unsynchronized_respa_checkpoint) {
@@ -553,37 +586,146 @@ inline std::string get_latest_checkpoint_path(const SimConfig& config) {
 // Save Checkpoint
 // =============================================================================
 
-inline void save_checkpoint(const SimulationState& state,
-                           const SimConfig& config) {
+struct WallHistoryCheckpointHeader {
+    char magic[8];
+    uint32_t version;
+    uint32_t record_size;
+    int64_t step;
+    double time;
+    int32_t particles;
+    int32_t capacity;
+    int32_t stride;
+};
+
+// Preserve the spring memory and its per-particle indexing. A spatial reorder
+// can permute offsets, so reconstructing offsets as i*stride loses history.
+inline void write_wall_history_checkpoint(const std::string& path, const SimulationState& state) {
+    static_assert(sizeof(WallContactHistory) == 44, "Wall history checkpoint ABI changed");
+    const int32_t n = state.particles.num_particles;
+    const auto& buffer = state.wall_contact_history;
+    const int32_t stored_capacity = buffer.data ? buffer.capacity : 0;
+    const int32_t stride = stored_capacity ? buffer.max_contacts_per_particle : 0;
+    const int32_t live = std::min(n, std::max(0, state.particles.num_local));
+    const int64_t padded_capacity = std::max<int64_t>(stored_capacity, static_cast<int64_t>(n) * stride);
+    if (stored_capacity < 0 || padded_capacity > std::numeric_limits<int32_t>::max() ||
+        (stored_capacity && (stride <= 0 || static_cast<int64_t>(live) * stride > stored_capacity)))
+        throw std::runtime_error("Invalid wall history checkpoint dimensions");
+    const int32_t capacity = static_cast<int32_t>(padded_capacity);
+    std::vector<WallContactHistory> history(capacity);
+    std::vector<int32_t> offsets(capacity ? n : 0), counts(capacity ? n : 0, 0);
+    if (capacity) {
+        // WallManager allocates only the live prefix. Serialize inert tail rows
+        // as empty slots while retaining the live pool and its exact offsets.
+        for (int32_t row = 0; row < n; ++row) offsets[row] = row * stride;
+        CUDA_CHECK(cudaMemcpy(history.data(), buffer.data, static_cast<size_t>(stored_capacity) * sizeof(WallContactHistory), cudaMemcpyDeviceToHost));
+        if (live) {
+            CUDA_CHECK(cudaMemcpy(offsets.data(), state.particles.wall_history_offset, static_cast<size_t>(live) * sizeof(int32_t), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(counts.data(), state.particles.num_wall_contacts, static_cast<size_t>(live) * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        }
+    }
+    for (int32_t row = 0; row < live && capacity; ++row)
+        if (offsets[row] < 0 || static_cast<int64_t>(offsets[row]) + stride > stored_capacity ||
+            counts[row] < 0 || counts[row] > stride)
+            throw std::runtime_error("Invalid live particle wall history index");
+    const WallHistoryCheckpointHeader header{{'W','A','L','L','H','I','S','T'}, 1,
+        sizeof(WallContactHistory), state.current_step, state.current_time, n, capacity, stride};
+    std::ofstream out(path + ".wall_history", std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    out.write(reinterpret_cast<const char*>(offsets.data()), offsets.size() * sizeof(int32_t));
+    out.write(reinterpret_cast<const char*>(counts.data()), counts.size() * sizeof(int32_t));
+    out.write(reinterpret_cast<const char*>(history.data()), history.size() * sizeof(WallContactHistory));
+    out.flush(); out.close();
+    if (!out) throw std::runtime_error("Cannot write wall history checkpoint: " + path);
+}
+
+inline void read_wall_history_checkpoint(const std::string& path, SimulationState& state) {
+    const std::string sidecar = path + ".wall_history";
+    if (!std::filesystem::exists(sidecar)) {
+        if (checkpoint_detail::is_generation(std::filesystem::path(path)))
+            throw std::runtime_error("Complete checkpoint is missing wall history: " + sidecar);
+        // Legacy files did not preserve wall springs. Retain their old fresh
+        // wall initialization behavior while accepting those checkpoints.
+        return;
+    }
+    std::ifstream in(sidecar, std::ios::binary);
+    WallHistoryCheckpointHeader header{};
+    in.read(reinterpret_cast<char*>(&header), sizeof(header));
+    const char magic[8] = {'W','A','L','L','H','I','S','T'};
+    if (!in || std::memcmp(header.magic, magic, 8) || header.version != 1 ||
+        header.record_size != sizeof(WallContactHistory) || header.step != state.current_step ||
+        header.time != state.current_time || header.particles != state.particles.num_particles ||
+        header.capacity < 0 || (header.capacity == 0 && header.stride != 0) ||
+        (header.capacity && (header.stride <= 0 || static_cast<int64_t>(header.particles) * header.stride > header.capacity)))
+        throw std::runtime_error("Invalid wall history checkpoint header: " + sidecar);
+    const uintmax_t expected_size = sizeof(header) + (header.capacity ?
+        static_cast<uintmax_t>(header.particles) * 2 * sizeof(int32_t) +
+        static_cast<uintmax_t>(header.capacity) * sizeof(WallContactHistory) : 0);
+    if (std::filesystem::file_size(sidecar) != expected_size)
+        throw std::runtime_error("Truncated wall history checkpoint: " + sidecar);
+    if (!header.capacity) return;
+    std::vector<int32_t> offsets(header.particles), counts(header.particles);
+    std::vector<WallContactHistory> history(header.capacity);
+    in.read(reinterpret_cast<char*>(offsets.data()), offsets.size() * sizeof(int32_t));
+    in.read(reinterpret_cast<char*>(counts.data()), counts.size() * sizeof(int32_t));
+    in.read(reinterpret_cast<char*>(history.data()), history.size() * sizeof(WallContactHistory));
+    if (!in) throw std::runtime_error("Failed reading wall history checkpoint: " + sidecar);
+    for (int32_t i = 0; i < header.particles; ++i)
+        if (offsets[i] < 0 || static_cast<int64_t>(offsets[i]) + header.stride > header.capacity ||
+            counts[i] < 0 || counts[i] > header.stride)
+            throw std::runtime_error("Invalid particle wall history index: " + sidecar);
+    auto& buffer = state.wall_contact_history;
+    if (buffer.data) CUDA_CHECK(cudaFree(buffer.data));
+    buffer.capacity = header.capacity;
+    buffer.max_contacts_per_particle = header.stride;
+    CUDA_CHECK(cudaMalloc(&buffer.data, history.size() * sizeof(WallContactHistory)));
+    CUDA_CHECK(cudaMemcpy(buffer.data, history.data(), history.size() * sizeof(WallContactHistory), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(state.particles.wall_history_offset, offsets.data(), offsets.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(state.particles.num_wall_contacts, counts.data(), counts.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+}
+
+inline void save_checkpoint_to_path(const SimulationState& state,
+                                    const SimConfig& config,
+                                    const std::string& filepath) {
     // Create checkpoint directory if needed
-    std::string checkpoint_dir = config.io.checkpoint_path;
+    std::string checkpoint_dir = checkpoint_directory(config);
     if (!std::filesystem::exists(checkpoint_dir)) {
         std::filesystem::create_directories(checkpoint_dir);
     }
 
-    std::string filepath = generate_checkpoint_path(config, state.current_step);
-
     int32_t num_particles = state.particles.num_particles;
 
-    // Count total contacts from GPU
-    std::vector<int32_t> h_num_contacts(num_particles);
+    // Serialize rows in particle order. CLL sorting permutes the offsets while
+    // keeping the backing contact pool fixed; the loader reconstructs i*stride.
+    std::vector<int32_t> h_num_contacts(num_particles), h_offsets(num_particles);
     CUDA_CHECK(cudaMemcpy(h_num_contacts.data(), state.particles.num_contacts,
-                          num_particles * sizeof(int32_t), cudaMemcpyDeviceToHost));
-
-    int32_t total_contacts = 0;
-    for (int32_t i = 0; i < num_particles; ++i) {
-        total_contacts += h_num_contacts[i];
+                          static_cast<size_t>(num_particles) * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    const int32_t max_contacts = state.contact_history.max_contacts_per_particle;
+    int64_t contact_count = 0;
+    for (int32_t count : h_num_contacts) {
+        if (count < 0 || count > max_contacts)
+            throw std::runtime_error("Checkpoint particle contact count exceeds its stride");
+        contact_count += count;
     }
-
-    int32_t max_contacts = state.contact_history.max_contacts_per_particle;
-
-    // Read contact history from GPU if any
+    if (contact_count > std::numeric_limits<int32_t>::max())
+        throw std::runtime_error("Checkpoint total contact count exceeds supported range");
+    const int32_t total_contacts = static_cast<int32_t>(contact_count);
     std::vector<ContactHistory> h_contact_history;
     if (total_contacts > 0) {
-        int32_t history_size = num_particles * max_contacts;
+        if (!state.contact_history.data || max_contacts <= 0 || state.contact_history.capacity < 0)
+            throw std::runtime_error("Checkpoint contact history buffer is missing");
+        const size_t history_size = static_cast<size_t>(num_particles) * max_contacts;
+        std::vector<ContactHistory> pool(state.contact_history.capacity);
         h_contact_history.resize(history_size);
-        CUDA_CHECK(cudaMemcpy(h_contact_history.data(), state.contact_history.data,
-                              history_size * sizeof(ContactHistory), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(pool.data(), state.contact_history.data,
+                              pool.size() * sizeof(ContactHistory), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_offsets.data(), state.particles.contact_history_offset,
+                              h_offsets.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        for (int32_t i = 0; i < num_particles; ++i) {
+            if (h_offsets[i] < 0 || static_cast<int64_t>(h_offsets[i]) + max_contacts > state.contact_history.capacity)
+                throw std::runtime_error("Checkpoint particle contact row is outside its buffer");
+            std::copy_n(pool.data() + h_offsets[i], max_contacts,
+                        h_contact_history.data() + static_cast<size_t>(i) * max_contacts);
+        }
     }
 
     // Write unified binary checkpoint
@@ -595,19 +737,27 @@ inline void save_checkpoint(const SimulationState& state,
     write_sph_stage_checkpoint(filepath, state, config);
     write_respa_checkpoint_sidecar(filepath, state, config);
     write_shear_checkpoint_sidecar(filepath, state, config);
+    write_wall_history_checkpoint(filepath, state);
+}
 
+inline void save_checkpoint(const SimulationState& state, const SimConfig& config) {
+    const std::string filepath = generate_checkpoint_path(config, state.current_step);
+    CheckpointTransaction transaction(filepath);
+    save_checkpoint_to_path(state, config, transaction.staging_path());
+    transaction.commit();
     std::cout << "Checkpoint saved: " << filepath << std::endl;
     std::cout << "  Step: " << state.current_step
               << ", Time: " << state.current_time << " s"
-              << ", Particles: " << num_particles << std::endl;
+              << ", Particles: " << state.particles.num_particles << std::endl;
 }
 
 // =============================================================================
 // Load Checkpoint / Resume Simulation
 // =============================================================================
 
-inline SimulationState load_checkpoint(const std::string& filepath,
+inline SimulationState load_checkpoint(const std::string& requested_path,
                                        const SimConfig& config) {
+    const std::string filepath = resolve_checkpoint_path(requested_path);
     SimulationState state;
 
     if (adaptive_fmm_depth_checkpoint_requested(config) &&
@@ -709,6 +859,8 @@ inline SimulationState load_checkpoint(const std::string& filepath,
     );
     CUDA_CHECK(cudaGetLastError());
 
+    // WallManager initialization preserves a pre-restored history buffer.
+    read_wall_history_checkpoint(filepath, state);
     // Initialize walls
     initialize_walls(state.walls, config);
 
@@ -818,7 +970,7 @@ inline SimulationState load_or_resume(const SimConfig& config,
             }
             std::cout << "Resuming from specific checkpoint: " << options.checkpoint_path << std::endl;
             if (!adaptive_fmm_depth_checkpoint_requested(config) &&
-                adaptive_fmm_depth_checkpoint_sidecar_version(options.checkpoint_path) != 0) {
+                adaptive_fmm_depth_checkpoint_sidecar_version(resolve_checkpoint_path(options.checkpoint_path)) != 0) {
                 std::cerr << "WARNING: resuming the base particle checkpoint at fixed "
                           << "BFFMM depth; adaptive controller state is ignored\n";
             }
@@ -837,7 +989,7 @@ inline SimulationState load_or_resume(const SimConfig& config,
 
 // Keep only the N most recent checkpoints
 inline void cleanup_old_checkpoints(const SimConfig& config, int keep_count = 5) {
-    std::string checkpoint_dir = config.io.checkpoint_path;
+    std::string checkpoint_dir = checkpoint_directory(config);
 
     if (!std::filesystem::exists(checkpoint_dir)) {
         return;
@@ -859,28 +1011,22 @@ inline void cleanup_old_checkpoints(const SimConfig& config, int keep_count = 5)
                 const size_t end = filename.size() - suffix_size;
                 try {
                     int64_t step = std::stoll(filename.substr(start, end - start));
+                    const std::string resolved_path = resolve_checkpoint_path(entry.path().string());
                     // Incomplete publish-on-sidecar checkpoints are not
                     // recovery points and therefore must not evict an older
                     // complete pair from the retention set.
                     if (adaptive_fmm_depth_checkpoint_requested(config) &&
                         !has_adaptive_fmm_depth_checkpoint_sidecar(
-                            entry.path().string())) {
+                            resolved_path)) {
                         continue;
                     }
-                    if (config.acceleration.yorp.adaptive) {
-                        const std::filesystem::path sidecar(
-                            entry.path().string() + ".adaptive_yorp");
-                        std::error_code ec;
-                        if (!std::filesystem::is_regular_file(sidecar, ec) || ec ||
-                            std::filesystem::file_size(sidecar, ec) == 0 || ec) {
-                            continue;
-                        }
-                    }
+                    if (config.acceleration.yorp.adaptive && !has_yorp_checkpoint_sidecar(resolved_path))
+                        continue;
                     if (config.acceleration.external_bodies.enabled) {
-                        std::ifstream checkpoint(entry.path(), std::ios::binary); UnifiedHeader header{};
+                        std::ifstream checkpoint(resolved_path, std::ios::binary); UnifiedHeader header{};
                         checkpoint.read(reinterpret_cast<char*>(&header), sizeof(header));
                         if (!checkpoint || !ExternalBodyManager::checkpoint_sidecar_matches(
-                                entry.path().string(), header.current_step,
+                                resolved_path, header.current_step,
                                 header.current_time, config)) {
                             continue;
                         }
@@ -900,10 +1046,14 @@ inline void cleanup_old_checkpoints(const SimConfig& config, int keep_count = 5)
     // Remove old checkpoints beyond keep_count
     for (size_t i = keep_count; i < checkpoints.size(); ++i) {
         const std::string& path = checkpoints[i].second;
+        // Retain immutable generation directories for readers that resolved them
+        // before alias removal; offline garbage collection can reclaim them.
         std::filesystem::remove(path + ".sph_stage");
         std::filesystem::remove(path);
         std::error_code ignored;
         std::filesystem::remove(path + ".respa_sync", ignored);
+        std::filesystem::remove(path + ".wall_history", ignored);
+        std::filesystem::remove(path + ".dem_clumps", ignored);
         std::filesystem::remove(path + ".adaptive_yorp", ignored);
         std::filesystem::remove(path + ".adaptive_fmm_depth", ignored);
         std::filesystem::remove(path + ".adaptive_fmm_depth.tmp", ignored);

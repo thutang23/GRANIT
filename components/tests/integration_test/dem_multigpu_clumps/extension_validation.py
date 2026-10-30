@@ -50,7 +50,12 @@ def read_record(path):
             0x17: (2, 1), 0x18: (2, 1), 0x19: (0, 3),
             0x1a: (6, 1), 0x1b: (6, 1), 0x1c: (6, 1), 0x1d: (4, 1)}
         if fid in schema:
-            assert (dtype, count) == schema[fid], (fid, dtype, count)
+            if fid in (0x14, 0x15):
+                # New exact checkpoints retain F64 forces/torques. Legacy
+                # checkpoints and ordinary outputs remain readable as F32.
+                assert dtype in (0, 1) and count == 3, (fid, dtype, count)
+            else:
+                assert (dtype, count) == schema[fid], (fid, dtype, count)
         fmt = base.TYPES[dtype]
         values = struct.unpack_from(f'<{n*count}{fmt}', blob, tier2+offset)
         assert all(math.isfinite(x) for x in values), (path, fid)
@@ -751,7 +756,7 @@ class Campaign:
         # or introduce an extra residual step through binary floating arithmetic.
         checkpoint = full/'checkpoints'/'checkpoint_step_0000000020.bin'
         assert checkpoint.exists(), 'missing scheduled midpoint checkpoint'
-        assert Path(str(checkpoint)+'.distributed_clumps').exists(), 'missing mandatory exact body/F64 sidecar'
+        assert Path(str(checkpoint.resolve(strict=True))+'.distributed_clumps').exists(), 'missing mandatory exact body/F64 sidecar'
         resumed = self.run(stem+'-resumed', fixture, ranks, resume=checkpoint)
         self.check(stem+'-resumed', validate_run(resumed, require_seam=False))
         self.check(stem+'-trajectory-restart', compare_saved_runs(full, resumed))
@@ -780,6 +785,7 @@ class Campaign:
             update_config(directory, apply)
         if corrupt:
             checkpoint, mode = corrupt
+            checkpoint = checkpoint.resolve(strict=True)
             copied = directory/'checkpoint-copy.bin'
             shutil.copy2(checkpoint, copied)
             for sidecar in checkpoint.parent.glob(checkpoint.name+'.*'):

@@ -27,6 +27,8 @@
 #include "src/core/constant/command_line_interface.h"
 #include "src/core/constant/system_initialize.h"
 #include "src/core/constant/load_or_resume.h"
+#include "src/core/constant/cooperative_stop.h"
+#include "src/core/constant/yorp_checkpoint.h"
 #include "src/core/constant/binary_format.h"
 #include "src/core/constant/final_output_tracker.h"
 #include "src/core/constant/time_step_schedule.h"
@@ -34,6 +36,7 @@
 #include "src/core/neighbor/contact_geometry.cuh"
 #include "src/core/wall/wall.h"
 #include "src/core/wall/bonded_rect_wall.h"
+#include "src/core/wall/bonded_wall_checkpoint.h"
 #include "src/core/wall/sphere_wall.h"
 #include "src/core/acceleration/acceleration.h"
 #include "src/core/acceleration/external_bodies.h"
@@ -639,6 +642,7 @@ private:
 
     // Status
     bool initialized_;
+    int64_t last_checkpoint_step_ = -1;
 
     // Clump (multi-sphere rigid body) state
     ClumpStateSoA       clump_state_;
@@ -953,7 +957,13 @@ public:
         try {
             // Preserve the existing automatic-resume policy.  Unified-v3
             // checkpoint fingerprints are validated before any state is used.
-            state_ = load_or_resume(config_);
+            if (config_.io.checkpoint_resume_from[0] != '\0') {
+                if (config_.io.checkpoint_force_fresh)
+                    throw std::invalid_argument("checkpoint force_fresh conflicts with resume_from");
+                state_ = load_checkpoint(config_.io.checkpoint_resume_from, config_);
+            } else {
+                state_ = load_or_resume(config_);
+            }
         } catch (const std::exception& e) {
             std::cerr << "ERROR: Failed to initialize system - " << e.what() << std::endl;
             return false;
@@ -971,6 +981,8 @@ public:
             clump_segments_ = allocate_clump_segments(clump_capacity);
             initialize_clumps(config_, state_.material_database, state_.particles,
                               clump_state_, clump_segments_);
+            if (state_.particles.source_record_kind == static_cast<uint8_t>(BinaryRecordKind::CHECKPOINT))
+                restore_single_clump_checkpoint(loaded_checkpoint_path());
             num_free_particles_ = clump_segments_.normal_end;
             const int32_t num_members = clump_segments_.member_end - clump_segments_.member_begin;
             clump_staging_ = allocate_clump_staging(std::max<int32_t>(num_members, 1));
@@ -1034,6 +1046,7 @@ public:
 
         // Wall manager (periodic boundaries + wall contacts, includes sphere wall init)
         WallManager::initialize(state_, config_);
+        if (resumed) restore_bonded_wall_checkpoint(loaded_checkpoint_path(), state_);
         ShearBoxManager::initialize(state_, config_, compute_stream_);
         if (config_.shear_box.enabled) {
             ShearBoxManager::wrap(state_,config_,WallManager::get_pbc_config(),
@@ -1078,10 +1091,19 @@ public:
         // Acceleration manager
         AccelerationManager::initialize(config_);
         AccelerationManager::set_clump_runtime(&clump_state_, &clump_segments_);
-        if (resumed && config_.acceleration.yorp.adaptive) {
-            // load_or_resume selects the latest checkpoint for this runner;
-            // fail closed if its adaptive state sidecar was not preserved.
+        if (resumed && config_.acceleration.yorp.enabled &&
+            std::filesystem::exists(loaded_checkpoint_path() + ".yorp_runtime")) {
+            const auto runtime = restore_yorp_runtime_checkpoint(loaded_checkpoint_path(), state_, config_,
+                {config_.gpu.device_id}, {compute_stream_});
+            if (config_.acceleration.yorp.adaptive)
+                rewind_adaptive_yorp_csv_for_resume(runtime[0].device_state.diagnostic.time);
+        } else if (resumed && config_.acceleration.yorp.adaptive &&
+                   !checkpoint_detail::is_generation(std::filesystem::path(loaded_checkpoint_path()))) {
+            // Legacy adaptive-only sidecars remain readable. New generations
+            // require the complete host/device runtime, including legacy modes.
             restore_adaptive_yorp_checkpoint_sidecar(loaded_checkpoint_path());
+        } else if (resumed && config_.acceleration.yorp.enabled) {
+            throw std::runtime_error("Complete YORP runtime checkpoint is missing");
         } else if (config_.acceleration.yorp.adaptive) {
             reset_adaptive_yorp_csv_for_fresh_start();
         }
@@ -1229,6 +1251,7 @@ public:
         // Metrics and persistence must observe a fully closed velocity state.
         AccelerationManager::observe_adaptive_yorp(
             state_, config_, state_.current_time, compute_stream_);
+        if (cooperative_stop_requested()) return;
         if(config_.shear_box.enabled && state_.current_step % 100 == 0) {
             const ShearDiagnostics d=ShearBoxManager::compute_diagnostics(
                 state_,config_,state_.particles.num_local,compute_stream_);
@@ -1351,14 +1374,8 @@ public:
                          /*force_only=*/true);
         }
 
-        if(resumed && clump_state_.num_clumps>0 &&
-           config_.acceleration.enable_self_gravity && !respa_enabled){
-            AccelerationManager::restore_checkpoint_clump_gravity(
-                state_,config_,state_.current_time,compute_stream_);
-            ++self_gravity_evaluations_;
-        }
-
-        if (respa_enabled) {
+        if (respa_enabled && (!resumed || !checkpoint_detail::is_generation(
+                std::filesystem::path(loaded_checkpoint_path())))) {
             // Bootstrap the outer force at the current configuration. The
             // cached normal acceleration and clump gravity wrench remain
             // separate from the inner contact-force Verlet state.
@@ -1374,7 +1391,7 @@ public:
             record_scalar_receipt(/*force=*/true);
         }
 
-        while (!should_terminate()) {
+        while (!cooperative_stop_requested() && !should_terminate()) {
             #ifdef CUDADEM_ENABLE_PROFILING
             nvtxRangePushA("SimulationStep");
             #endif
@@ -1407,8 +1424,20 @@ public:
             #endif
         }
 
-        // Final synchronization
-        CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+        // A signal observed here belongs to a fully closed step / RESPA range.
+        CUDA_CHECK(cudaDeviceSynchronize());
+        bool stopped = cooperative_stop_requested();
+        if ((stopped || config_.io.checkpoint_enabled) && last_checkpoint_step_ != state_.current_step)
+            save_checkpoint();
+        // A signal can arrive while an ordinary terminal checkpoint drains.
+        stopped = stopped || cooperative_stop_requested();
+        if (stopped) {
+            if (last_checkpoint_step_ != state_.current_step) save_checkpoint();
+            std::cout << "[cooperative-stop] signal=" << cooperative_stop_signal.load(std::memory_order_relaxed)
+                      << " checkpoint=" << generate_checkpoint_path(config_, state_.current_step)
+                      << " step=" << state_.current_step << " time=" << state_.current_time << std::endl;
+            return;
+        }
 
         // Persist the exact terminating state unless the regular interval
         // output path already wrote this step. This also covers an immediate
@@ -2436,35 +2465,123 @@ public:
         std::cout << "Clump states saved: " << filepath << std::endl;
     }
 
-    void save_checkpoint() {
-        // Call the full implementation from load_or_resume.h
-        const std::string checkpoint_path =
-            generate_checkpoint_path(config_, state_.current_step);
-        adaptive_depth_io_.append_adaptive_fmm_depth_diagnostics();
-        if (adaptive_fmm_depth_checkpoint_requested(config_)) {
-            // Remove any controller state from an earlier write of this step
-            // before replacing the particle binary.  The new binary is not a
-            // published adaptive checkpoint until its new sidecar is renamed.
-            for (const std::string& stale : {
-                     adaptive_fmm_depth_checkpoint_sidecar_path(checkpoint_path),
-                     adaptive_fmm_depth_checkpoint_sidecar_path(checkpoint_path) + ".tmp"}) {
-                std::error_code ec;
-                std::filesystem::remove(stale, ec);
-                if (ec) {
-                    throw std::runtime_error(
-                        "Cannot remove stale adaptive FMM depth sidecar: " +
-                        stale + ": " + ec.message());
-                }
-            }
+    // Every authoritative rigid-body field is retained without reconstruction
+    // from rounded member offsets or reductions in a different order.
+    std::vector<double*> single_clump_checkpoint_fields() {
+        std::vector<double*> fields = {
+            clump_state_.com_x,
+            clump_state_.com_y,
+            clump_state_.com_z,
+            clump_state_.vel_x,
+            clump_state_.vel_y,
+            clump_state_.vel_z,
+            clump_state_.omega_x,
+            clump_state_.omega_y,
+            clump_state_.omega_z,
+            clump_state_.quat_w,
+            clump_state_.quat_x,
+            clump_state_.quat_y,
+            clump_state_.quat_z,
+            clump_state_.mass,
+            clump_state_.inertia_xx,
+            clump_state_.inertia_xy,
+            clump_state_.inertia_xz,
+            clump_state_.inertia_yy,
+            clump_state_.inertia_yz,
+            clump_state_.inertia_zz,
+            clump_state_.net_force_x,
+            clump_state_.net_force_y,
+            clump_state_.net_force_z,
+            clump_state_.net_torque_x,
+            clump_state_.net_torque_y,
+            clump_state_.net_torque_z};
+        const int64_t checkpoint_gravity_rate = config_.acceleration.gravity_macro_dt > 0.0
+            ? std::max<int64_t>(1, static_cast<int64_t>(std::floor(
+                config_.acceleration.gravity_macro_dt / state_.dt + 1.0e-12)))
+            : config_.acceleration.gravity_update_rate;
+        if (config_.acceleration.enable_self_gravity && checkpoint_gravity_rate > 1) {
+            fields.push_back(clump_state_.gravity_force_x);
+            fields.push_back(clump_state_.gravity_force_y);
+            fields.push_back(clump_state_.gravity_force_z);
+            fields.push_back(clump_state_.gravity_torque_x);
+            fields.push_back(clump_state_.gravity_torque_y);
+            fields.push_back(clump_state_.gravity_torque_z);
         }
+        for (int i = 0; i < 19; ++i) fields.push_back(clump_state_.multipole_p3[i]);
+        return fields;
+    }
+    struct SingleClumpCheckpointHeader {
+        char magic[8];
+        uint32_t version, fields;
+        int32_t bodies;
+        uint64_t fingerprint;
+        int64_t step;
+        double time, dt;
+    };
+    void save_single_clump_checkpoint(const std::string& path) {
+        if (clump_state_.num_clumps == 0) return;
+        const auto fields = single_clump_checkpoint_fields();
+        SingleClumpCheckpointHeader header{};
+        std::memcpy(header.magic, "SGCLMP1", 8);
+        header.version = 1; header.fields = fields.size();
+        header.bodies = clump_state_.num_clumps;
+        header.fingerprint = config_.clump.clump_metadata_fingerprint;
+        header.step = state_.current_step; header.time = state_.current_time; header.dt = state_.dt;
+        std::ofstream file(path + ".single_clumps", std::ios::binary | std::ios::trunc);
+        file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        std::vector<double> values(header.bodies);
+        for (const auto field : fields) {
+            CUDA_CHECK(cudaMemcpy(values.data(), field, values.size()*sizeof(double), cudaMemcpyDeviceToHost));
+            file.write(reinterpret_cast<const char*>(values.data()), values.size()*sizeof(double));
+        }
+        file.close();
+        if (!file) throw std::runtime_error("Cannot write authoritative single-GPU clump checkpoint: " + path);
+    }
+    void restore_single_clump_checkpoint(const std::string& path) {
+        if (clump_state_.num_clumps == 0) return;
+        const auto fields = single_clump_checkpoint_fields();
+        SingleClumpCheckpointHeader header{};
+        std::ifstream file(path + ".single_clumps", std::ios::binary);
+        file.read(reinterpret_cast<char*>(&header), sizeof(header));
+        if (!file || std::memcmp(header.magic, "SGCLMP1", 8) != 0 || header.version != 1 ||
+            header.fields != fields.size() || header.bodies != clump_state_.num_clumps ||
+            header.fingerprint != config_.clump.clump_metadata_fingerprint ||
+            header.step != state_.current_step || header.time != state_.current_time || header.dt != state_.dt)
+            throw std::runtime_error("Missing or mismatched authoritative single-GPU clump checkpoint: " + path);
+        std::vector<double> values(header.bodies);
+        for (const auto field : fields) {
+            file.read(reinterpret_cast<char*>(values.data()), values.size()*sizeof(double));
+            if (!file || !std::all_of(values.begin(), values.end(), [](double value){return std::isfinite(value);}))
+                throw std::runtime_error("Invalid authoritative single-GPU clump checkpoint: " + path);
+            CUDA_CHECK(cudaMemcpy(field, values.data(), values.size()*sizeof(double), cudaMemcpyHostToDevice));
+        }
+        if (file.peek() != std::char_traits<char>::eof())
+            throw std::runtime_error("Trailing data in single-GPU clump checkpoint: " + path);
+    }
+
+    void save_checkpoint() {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CheckpointTransaction transaction(generate_checkpoint_path(config_, state_.current_step));
+        const std::string checkpoint_path = transaction.staging_path();
+        adaptive_depth_io_.append_adaptive_fmm_depth_diagnostics();
         const int32_t live_particles = state_.particles.num_particles;
         state_.particles.num_particles = num_total_particles_;
-        cudadem::save_checkpoint(state_, config_);
+        try {
+            cudadem::save_checkpoint_to_path(state_, config_, checkpoint_path);
+        } catch (...) {
+            state_.particles.num_particles = live_particles;
+            throw;
+        }
         state_.particles.num_particles = live_particles;
-        save_adaptive_yorp_checkpoint_sidecar(
-            checkpoint_path);
+        save_single_clump_checkpoint(checkpoint_path);
+        save_bonded_wall_checkpoint(checkpoint_path, state_);
+        save_adaptive_yorp_checkpoint_sidecar(checkpoint_path);
+        write_yorp_runtime_checkpoint(checkpoint_path, state_, config_,
+            {config_.gpu.device_id}, {compute_stream_});
         adaptive_depth_io_.save_adaptive_fmm_depth_checkpoint_sidecar(checkpoint_path);
         ExternalBodyManager::write_checkpoint_sidecar(checkpoint_path, state_, config_);
+        transaction.commit();
+        last_checkpoint_step_ = state_.current_step;
     }
 
     // =========================================================================
@@ -2577,6 +2694,7 @@ public:
 // =============================================================================
 
 int main(int argc, char* argv[]) {
+    cudadem::CooperativeStopSignals cooperative_stop_signals;
     // Load application kernels eagerly before CUDA work begins.  This avoids a
     // lazy-load context synchronization racing the brief scheduler wait used
     // to hand an FMM command to its device-launched build graph.

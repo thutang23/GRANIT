@@ -77,6 +77,18 @@ struct YorpDeviceState {
     int baseline_recorded;
 };
 
+// Complete closed-boundary runtime, including legacy prescribed-spin modes.
+// Reduction buffers and the next-increment scratch value are reconstructed.
+struct YorpRuntimeCheckpoint {
+    uint32_t version = 1, has_device_state = 0;
+    uint32_t have_last_diagnostic = 0, reserved = 0;
+    double next_time = 0.0, next_check_time = 0.0, accumulated_omega = 0.0;
+    int64_t step_counter = 0;
+    double mode3_start_time = -1.0, mode3_omega_init = 0.0;
+    AdaptiveYorpDiagnostic last_diagnostic{};
+    YorpDeviceState device_state{};
+};
+
 __device__ inline bool yorp_finite(double x) { return isfinite(x); }
 
 __host__ __device__ inline double yorp_effective_epsilon(
@@ -299,6 +311,8 @@ public:
     bool adaptive_should_terminate(cudaStream_t=0) const;
     bool get_adaptive_checkpoint(AdaptiveYorpCheckpoint*, cudaStream_t=0) const;
     bool restore_adaptive_checkpoint(const AdaptiveYorpCheckpoint&, cudaStream_t=0);
+    bool get_runtime_checkpoint(YorpRuntimeCheckpoint*, cudaStream_t=0) const;
+    bool restore_runtime_checkpoint(const YorpRuntimeCheckpoint&, cudaStream_t=0);
     double get_accumulated_omega() const { return accumulated_omega_; }
 
     // These are deliberately count-based: multi-GPU callers must pass their
@@ -394,6 +408,41 @@ inline bool YorpManager::consume_adaptive_diagnostic(AdaptiveYorpDiagnostic* out
 inline bool YorpManager::adaptive_should_terminate(cudaStream_t) const { return have_last_diagnostic_ && (last_diagnostic_.state==static_cast<int>(AdaptiveYorpState::COMPLETE)||last_diagnostic_.state==static_cast<int>(AdaptiveYorpState::FATAL)); }
 inline bool YorpManager::get_adaptive_checkpoint(AdaptiveYorpCheckpoint* out,cudaStream_t stream) const { if(!d_state_||!out)return false; YorpDeviceState h{}; CUDA_CHECK(cudaMemcpyAsync(&h,d_state_,sizeof(h),cudaMemcpyDeviceToHost,stream)); CUDA_CHECK(cudaStreamSynchronize(stream)); const_cast<YorpManager*>(this)->last_diagnostic_=h.diagnostic;const_cast<YorpManager*>(this)->have_last_diagnostic_=true; out->diagnostic=h.diagnostic;out->baseline_axis_ratio=h.baseline_axis_ratio;out->com_x=h.com_x;out->com_y=h.com_y;out->com_z=h.com_z;out->baseline_recorded=h.baseline_recorded;out->next_check_time=next_check_time_;return true; }
 inline bool YorpManager::restore_adaptive_checkpoint(const AdaptiveYorpCheckpoint& in,cudaStream_t stream){if(in.version!=1)return false;ensure(1,stream);YorpDeviceState h{};h.diagnostic=in.diagnostic;h.baseline_axis_ratio=in.baseline_axis_ratio;h.com_x=in.com_x;h.com_y=in.com_y;h.com_z=in.com_z;h.baseline_recorded=in.baseline_recorded;next_check_time_=in.next_check_time;CUDA_CHECK(cudaMemcpyAsync(d_state_,&h,sizeof(h),cudaMemcpyHostToDevice,stream));return true;}
+
+inline bool YorpManager::get_runtime_checkpoint(YorpRuntimeCheckpoint* out, cudaStream_t stream) const {
+    if (!initialized_ || !out) return false;
+    *out = YorpRuntimeCheckpoint{};
+    out->next_time=next_time_; out->next_check_time=next_check_time_;
+    out->accumulated_omega=accumulated_omega_; out->step_counter=step_counter_;
+    out->mode3_start_time=mode3_start_time_; out->mode3_omega_init=mode3_omega_init_;
+    out->last_diagnostic=last_diagnostic_; out->have_last_diagnostic=have_last_diagnostic_;
+    out->has_device_state=d_state_ != nullptr;
+    if (d_state_) {
+        CUDA_CHECK(cudaMemcpyAsync(&out->device_state, d_state_, sizeof(YorpDeviceState), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    return true;
+}
+inline bool YorpManager::restore_runtime_checkpoint(const YorpRuntimeCheckpoint& in, cudaStream_t stream) {
+    if (!initialized_ || in.version != 1 || in.has_device_state > 1 || in.have_last_diagnostic > 1 ||
+        in.step_counter < 0 || !std::isfinite(in.next_time) || !std::isfinite(in.next_check_time) ||
+        !std::isfinite(in.accumulated_omega) || !std::isfinite(in.mode3_start_time) || !std::isfinite(in.mode3_omega_init))
+        return false;
+    next_time_=in.next_time; next_check_time_=in.next_check_time;
+    accumulated_omega_=in.accumulated_omega; step_counter_=in.step_counter;
+    mode3_start_time_=in.mode3_start_time; mode3_omega_init_=in.mode3_omega_init;
+    last_diagnostic_=in.last_diagnostic; have_last_diagnostic_=in.have_last_diagnostic;
+    if (in.has_device_state) {
+        ensure_state();
+        CUDA_CHECK(cudaMemcpyAsync(d_state_, &in.device_state, sizeof(YorpDeviceState), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    } else if (d_state_) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaFree(d_state_)); d_state_=nullptr;
+        CUDA_CHECK(cudaFree(d_increment_)); d_increment_=nullptr;
+    }
+    return true;
+}
 
 } // namespace cudadem
 #endif

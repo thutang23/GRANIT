@@ -434,7 +434,7 @@ def main():
         if ref.current_time != 8.5*replay.DT: raise AssertionError('terminal time not exact')
 
         # Continuation contracts must fail closed if history or stage metadata is lost.
-        original = work/'stages-gpu4/checkpoints/checkpoint_step_0000000004.bin'
+        original = (work/'stages-gpu4/checkpoints/checkpoint_step_0000000004.bin').resolve(strict=True)
         broken = work/'missing-stage.bin'; broken.write_bytes(original.read_bytes())
         broken.with_suffix('.bin.respa_sync').write_bytes(
             original.with_suffix('.bin.respa_sync').read_bytes())

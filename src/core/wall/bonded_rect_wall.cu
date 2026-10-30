@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 #include <vector>
 
 namespace cudadem {
@@ -459,16 +460,52 @@ int32_t bonded_rect_wall_get_states(
     if (!s_bonded_initialized || s_num_bonded_walls == 0) return 0;
     
     if (host_states) {
-        cudaMemcpy(host_states, d_bonded_states,
+        CUDA_CHECK(cudaMemcpy(host_states, d_bonded_states,
                    s_num_bonded_walls * sizeof(BondedRectWallState),
-                   cudaMemcpyDeviceToHost);
+                   cudaMemcpyDeviceToHost));
     }
     if (host_reactions) {
-        cudaMemcpy(host_reactions, d_bonded_reactions,
+        CUDA_CHECK(cudaMemcpy(host_reactions, d_bonded_reactions,
                    s_num_bonded_walls * sizeof(BondedRectReaction),
-                   cudaMemcpyDeviceToHost);
+                   cudaMemcpyDeviceToHost));
     }
     return s_num_bonded_walls;
+}
+
+void bonded_rect_wall_restore_states(
+    const BondedRectWallState* host_states,
+    const BondedRectReaction* host_reactions,
+    int32_t count
+) {
+    if (count != bonded_rect_wall_get_states(nullptr, nullptr) ||
+        count < 0 || count > MAX_BONDED_RECT_WALLS ||
+        (count && (!host_states || !host_reactions)))
+        throw std::runtime_error("Bonded wall checkpoint count does not match initialized walls");
+    if (!count) return;
+    std::vector<BondedRectWallState> configured(count);
+    bonded_rect_wall_get_states(configured.data(), nullptr);
+    for (int32_t i = 0; i < count; ++i) {
+        const auto& a = configured[i];
+        const auto& b = host_states[i];
+        if (a.id != b.id || a.material_id != b.material_id || a.enabled != b.enabled ||
+            a.half_x != b.half_x || a.half_y != b.half_y || a.half_z != b.half_z ||
+            a.mass != b.mass || a.inertia_x != b.inertia_x ||
+            a.inertia_y != b.inertia_y || a.inertia_z != b.inertia_z)
+            throw std::runtime_error("Bonded wall checkpoint geometry/material/inertia mismatch");
+        for (double value : {b.pos_x, b.pos_y, b.pos_z, b.vel_x, b.vel_y, b.vel_z,
+                             double(b.omega_x), double(b.omega_y), double(b.omega_z)})
+            if (!std::isfinite(value)) throw std::runtime_error("Nonfinite bonded wall checkpoint state");
+        for (float value : b.rot)
+            if (!std::isfinite(value)) throw std::runtime_error("Nonfinite bonded wall checkpoint rotation");
+        const auto& r = host_reactions[i];
+        for (double value : {r.force_x, r.force_y, r.force_z,
+                             r.torque_x, r.torque_y, r.torque_z})
+            if (!std::isfinite(value)) throw std::runtime_error("Nonfinite bonded wall checkpoint reaction");
+    }
+    CUDA_CHECK(cudaMemcpy(d_bonded_states, host_states,
+                         count * sizeof(BondedRectWallState), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_bonded_reactions, host_reactions,
+                         count * sizeof(BondedRectReaction), cudaMemcpyHostToDevice));
 }
 
 void bonded_rect_wall_initialize(

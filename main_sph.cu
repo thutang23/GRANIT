@@ -31,6 +31,8 @@
 #include "src/core/constant/command_line_interface.h"
 #include "src/core/constant/system_initialize.h"
 #include "src/core/constant/load_or_resume.h"
+#include "src/core/constant/cooperative_stop.h"
+#include "src/core/constant/yorp_checkpoint.h"
 #include "src/core/constant/time_step_schedule.h"
 #include "src/core/constant/binary_format.h"
 #include "src/core/neighbor/neighbor_api.h"
@@ -826,6 +828,9 @@ public:
 
         // Acceleration manager
         AccelerationManager::initialize(config_);
+        if (resumed_ && config_.acceleration.yorp.enabled)
+            restore_yorp_runtime_checkpoint(loaded_checkpoint_path(), state_, config_,
+                {config_.gpu.device_id}, {compute_stream_});
 
         // Establish the epoch before force bootstrap because acceleration
         // providers may be explicitly time dependent.
@@ -835,7 +840,7 @@ public:
         }
 
         if (resumed_)
-            adaptive_depth_io_.restore_adaptive_fmm_depth_checkpoint_sidecar(config_.io.checkpoint_resume_from);
+            adaptive_depth_io_.restore_adaptive_fmm_depth_checkpoint_sidecar(loaded_checkpoint_path());
         else
             adaptive_depth_io_.reset_adaptive_fmm_depth_csv_for_fresh_start();
 
@@ -1154,7 +1159,7 @@ public:
         // -------------------------------------------------------------------------
         // Main time stepping loop
         // -------------------------------------------------------------------------
-        while (sph_inner_remaining_ > 0 || !should_terminate()) {
+        while (sph_inner_remaining_ > 0 || (!cooperative_stop_requested() && !should_terminate())) {
             const int stage_index = sph_stage_index(config_.sph.stages, config_.sph.stage_count, state_.current_time);
             if (stage_index != last_sph_stage_) {
                 if (last_sph_stage_ != -2) bootstrap_sph_forces();
@@ -1398,7 +1403,7 @@ public:
             // -----------------------------------------------------------------
             // Output and Visualization (common to both modes)
             // -----------------------------------------------------------------
-            if (sph_inner_remaining_ == 0 && state_.current_time >= next_output_time) {
+            if (sph_inner_remaining_ == 0 && !cooperative_stop_requested() && state_.current_time >= next_output_time) {
                 nvtxRangePushA("Output Data");
                 save_output();
                 record_sph_scalar_receipt(/*force=*/true);
@@ -1417,11 +1422,11 @@ public:
             // -----------------------------------------------------------------
             // Checkpoint (at configured intervals)
             // -----------------------------------------------------------------
-            if (sph_inner_remaining_ == 0 && config_.io.checkpoint_enabled &&
+            if (sph_inner_remaining_ == 0 && !cooperative_stop_requested() && config_.io.checkpoint_enabled &&
                 state_.current_step - checkpoint_cadence_step_ >= config_.io.checkpoint_interval) {
                 save_checkpoint();
             }
-            if (sph_inner_remaining_ == 0) record_sph_scalar_receipt(/*force=*/false);
+            if (sph_inner_remaining_ == 0 && !cooperative_stop_requested()) record_sph_scalar_receipt(/*force=*/false);
             #ifdef CUDADEM_ENABLE_PROFILING
             nvtxRangePop(); // SimulationStep
             #endif
@@ -1429,9 +1434,18 @@ public:
 
         // Final synchronization and a complete terminal checkpoint, including
         // a zero-step load/save or a terminal step outside the output cadence.
-        CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-        if (config_.io.checkpoint_enabled && last_checkpoint_step_ != state_.current_step)
+        CUDA_CHECK(cudaDeviceSynchronize());
+        bool stopped = cooperative_stop_requested();
+        if ((stopped || config_.io.checkpoint_enabled) && last_checkpoint_step_ != state_.current_step)
             save_checkpoint();
+        stopped = stopped || cooperative_stop_requested();
+        if (stopped) {
+            if (last_checkpoint_step_ != state_.current_step) save_checkpoint();
+            std::cout << "[cooperative-stop] signal=" << cooperative_stop_signal.load(std::memory_order_relaxed)
+                      << " checkpoint=" << generate_checkpoint_path(config_, state_.current_step)
+                      << " step=" << state_.current_step << " time=" << state_.current_time << std::endl;
+            return;
+        }
         record_sph_scalar_receipt(/*force=*/true);
 
         adaptive_depth_io_.append_adaptive_fmm_depth_diagnostics();
@@ -1578,14 +1592,19 @@ public:
     void save_checkpoint() {
         if (sph_inner_remaining_ != 0) throw std::logic_error("SPH checkpoint requires a closed macro");
         adaptive_depth_io_.append_adaptive_fmm_depth_diagnostics();
-        const std::string path = generate_checkpoint_path(config_, state_.current_step);
-        std::filesystem::remove(adaptive_fmm_depth_checkpoint_sidecar_path(path));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CheckpointTransaction transaction(generate_checkpoint_path(config_, state_.current_step));
+        const std::string path = transaction.staging_path();
         const int32_t live_particles = state_.particles.num_particles;
         prepare_inactive_sph_tail_for_serialization();
         state_.particles.num_particles = num_total_particles_;
-        cudadem::save_checkpoint(state_, config_);
+        try { cudadem::save_checkpoint_to_path(state_, config_, path); }
+        catch (...) { state_.particles.num_particles = live_particles; throw; }
         state_.particles.num_particles = live_particles;
         adaptive_depth_io_.save_adaptive_fmm_depth_checkpoint_sidecar(path);
+        write_yorp_runtime_checkpoint(path, state_, config_,
+            {config_.gpu.device_id}, {compute_stream_});
+        transaction.commit();
         last_checkpoint_step_ = state_.current_step;
         checkpoint_cadence_step_ = state_.current_step;
     }
@@ -1669,6 +1688,7 @@ public:
 // =============================================================================
 
 int main(int argc, char* argv[]) {
+    cudadem::CooperativeStopSignals cooperative_stop_signals;
     // Parse command line arguments
     std::string config_path = "config.yaml";
 

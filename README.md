@@ -91,6 +91,11 @@ references and require suitable particle inputs and paths. See the
 [binary input/output formats](docs/io_formats.md), and
 [SPH physics stages](docs/SPH_Physics_Stages.md).
 
+For Slurm pause or time-limit warnings, send `SIGUSR1` to request a checkpoint
+at the next complete integration boundary and exit. See
+[cooperative checkpoint stop](docs/Cooperative_Checkpoint_Stop.md) for signals,
+atomic checkpoint storage, and resume instructions.
+
 Self-gravity, prescribed inertial/tidal acceleration, and global damping are
 disabled until requested. Enabling self-gravity selects unified FMM with
 θ=0.8, global force/torque projection, adaptive depth, and RESPA with two inner
