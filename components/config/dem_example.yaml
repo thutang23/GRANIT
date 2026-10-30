@@ -3,7 +3,7 @@ material_database: materials_example.yaml
 simulation:
   name: DEM multi-material example
   physics: dem
-  time: {start: 0.0, stop: 1.0, output_step: 0.1, dt_factor: 0.2}
+  time: {start: 0.0, stop: 1.0, output_step: 0.1, dt: 1.0e-6}  # seconds
 
 dem:
   damping_model: restitution

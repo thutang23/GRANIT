@@ -64,6 +64,50 @@ dem:
 
 All database interaction records must use the corresponding coefficient.
 
+## Timestep in seconds
+
+For DEM, set `simulation.time.dt` to a positive finite duration in seconds:
+
+```yaml
+simulation:
+  physics: dem
+  time:
+    start: 0.0
+    stop: 1.0
+    output_step: 0.1
+    dt: 1.0e-6                 # one microsecond per integration step
+```
+
+Both DEM executables use this value directly. It is the inner step when RESPA
+is enabled; an outer step contains `gravity_update_rate` inner steps. The final
+step can shorten to reach the requested stop time. Checkpoints retain the base
+timestep, including when the last step was shortened.
+
+GRANIT still computes the material/particle contact critical timestep and the
+shearing-box orbital limit. A requested `dt` above either limit fails with an
+error rather than silently reducing the step. A value below these estimates
+still needs timestep-convergence checks for the intended experiment.
+
+For older configurations, `dt_factor` remains a deprecated alternative used
+only when `dt` is absent. Its old behavior is preserved: the factor multiplies
+the contact critical timestep and the result is bounded by the orbital limit.
+If neither key is supplied, the automatic factor remains 0.2. Supplying both
+keys is an error. To migrate a factor-based run without changing its step,
+copy the timestep stored in its checkpoint into `dt` and remove `dt_factor`.
+Console timestep values may be rounded; use the checkpoint value for an exact
+restart match.
+
+Previously, `dt` was only a ceiling and could silently yield a smaller step.
+For an existing configuration that relied on that behavior, use its actual
+timestep as the new `dt`. On checkpoint resume, retain the saved timestep:
+an explicit `dt` must match the checkpoint, and omitting it preserves the saved
+value subject to the current limits.
+
+SPH continues to choose an adaptive timestep using CFL and its seconds-valued
+`sph_parameters.dt_min` / `dt_max` bounds. DEM's `simulation.time.dt` and
+`dt_factor` keys are rejected in SPH configurations so they cannot be silently
+ignored.
+
 ## SPH numerical controls
 
 The `sph_parameters` block contains numerical controls only:

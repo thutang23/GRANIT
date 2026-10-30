@@ -156,12 +156,12 @@ struct TimeConfig {
     double start_time;           // Simulation start (seconds from epoch)
     double stop_time;            // Simulation end
     double output_step;          // Output interval (seconds)
-    double dt_factor;            // Verlet timestep = dt_factor * dt_critical (typically 0.1-0.2)
-    double dt_upper_bound;       // Optional explicit ceiling; <= 0 means no ceiling
+    double dt_factor;            // Deprecated automatic timestep safety factor
+    double dt;                  // Exact DEM base timestep in seconds; 0 selects legacy automatic mode
 
     __host__ __device__ TimeConfig()
         : start_time(0), stop_time(0), output_step(60.0), dt_factor(0.2),
-          dt_upper_bound(0.0) {}
+          dt(0.0) {}
 };
 
 // -----------------------------------------------------------------------------

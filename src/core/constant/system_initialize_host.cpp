@@ -6,6 +6,7 @@
 // =============================================================================
 
 #include "system_initialize.h"
+#include "dem_timestep_selection.h"
 #include "particle_clump_order.h"
 #include "command_line_interface.h"
 #include "binary_reader.h"
@@ -812,7 +813,6 @@ double calculate_critical_timestep(const SimConfig& config,
 
     if (!std::isfinite(dt_crit) || !(dt_crit > 0.0))
         throw std::runtime_error("Unable to derive a positive DEM critical timestep");
-    const double contact_dt = config.time.dt_factor * dt_crit;
     double orbital_dt = std::numeric_limits<double>::infinity();
     if (config.shear_box.enabled) {
         const double omega = std::fabs(config.shear_box.omega);
@@ -823,16 +823,11 @@ double calculate_critical_timestep(const SimConfig& config,
         if (fastest > 0.0)
             orbital_dt = config.shear_box.orbital_dt_factor / fastest;
     }
-    const double explicit_dt = config.time.dt_upper_bound > 0.0
-        ? config.time.dt_upper_bound : std::numeric_limits<double>::infinity();
-    const double dt = std::min({contact_dt, orbital_dt, explicit_dt});
+    const double dt = select_dem_timestep(config.time.dt, config.time.dt_factor, dt_crit, orbital_dt);
 
     std::cout << "Critical timestep: " << dt_crit << " s" << std::endl;
-    std::cout << "Contact timestep candidate: " << contact_dt << " s" << std::endl;
     if (std::isfinite(orbital_dt))
-        std::cout << "Orbital timestep candidate: " << orbital_dt << " s" << std::endl;
-    if (std::isfinite(explicit_dt))
-        std::cout << "Explicit timestep ceiling: " << explicit_dt << " s" << std::endl;
+        std::cout << "Orbital timestep limit: " << orbital_dt << " s" << std::endl;
     std::cout << "Actual timestep: " << dt << " s" << std::endl;
 
     return dt;

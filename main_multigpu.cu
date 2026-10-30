@@ -15,6 +15,7 @@
 
 #include "src/core/constant/command_line_interface.h"
 #include "src/core/constant/system_initialize.h"
+#include "src/core/constant/dem_timestep_selection.h"
 #include "src/core/constant/load_or_resume.h"
 #include "src/core/constant/cooperative_stop.h"
 #include "src/core/constant/yorp_checkpoint.h"
@@ -1245,12 +1246,19 @@ public:
         }
         // initialize_system necessarily saw the on-disk total. Recompute the
         // DEM stability limit on the live canonical prefix only.
-        if (!sph_mode_ && !resumed_) {
+        if (!sph_mode_) {
             const MaterialDatabase materials = load_material_database(
                 config_.material_database.path, config_.dem_damping_model);
-            global_state.dt = calculate_critical_timestep(
-                config_, global_state.particles, materials,
+            auto timestep_config = config_;
+            // Resume keeps the saved base step; validate it against physical
+            // limits rather than reapplying the legacy automatic safety factor.
+            if (resumed_ && timestep_config.time.dt == 0.0)
+                timestep_config.time.dt = global_state.dt;
+            const double allowed_dt = calculate_critical_timestep(
+                timestep_config, global_state.particles, materials,
                 global_state.particles.num_particles);
+            if (!resumed_) global_state.dt = allowed_dt;
+            else validate_dem_checkpoint_timestep(global_state.dt, allowed_dt, config_.time.dt);
         }
         if (!sph_mode_) {
             const auto radius_bounds = derive_particle_radius_bounds(
@@ -4334,7 +4342,8 @@ public:
         output_state.particles.input_has_winding=config_.shear_box.enabled;
         output_state.current_step = gpu_states_[0].local_state.current_step;
         output_state.current_time = gpu_states_[0].local_state.current_time;
-        output_state.dt = gpu_states_[0].local_state.dt;
+        // DEM checkpoints preserve the base step even after a terminal shortened step.
+        output_state.dt = sph_mode_ ? gpu_states_[0].local_state.dt : dt_;
 
         auto upload_field = [&](auto particle_member, const auto& host) {
             using Value = typename std::decay_t<decltype(host)>::value_type;

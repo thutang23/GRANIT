@@ -344,8 +344,14 @@ SimConfig parse_yaml(const std::string& yaml_path) {
                 }
             }
             if (time["output_step"]) config.time.output_step = time["output_step"].as<double>();
+            if (time["dt"] && time["dt_factor"])
+                throw std::runtime_error("simulation.time.dt and dt_factor are mutually exclusive");
+            if (config.physics == SimulationPhysics::SPH && (time["dt"] || time["dt_factor"]))
+                throw std::runtime_error("SPH uses sph_parameters.dt_min and sph_parameters.dt_max; simulation.time.dt and dt_factor are DEM-only");
+            if (time["dt_factor"])
+                std::cerr << "Warning: simulation.time.dt_factor is deprecated; use simulation.time.dt in seconds\n";
             if (time["dt_factor"]) config.time.dt_factor = time["dt_factor"].as<double>();
-            if (time["dt"]) config.time.dt_upper_bound = time["dt"].as<double>();
+            if (time["dt"]) config.time.dt = time["dt"].as<double>();
         }
 
         // Termination
@@ -1813,11 +1819,11 @@ SimConfig parse_yaml(const std::string& yaml_path) {
             config.acceleration.unified_fmm.enable_global_projection = false;
         }
     }
-    if (!std::isfinite(config.time.dt_upper_bound) ||
-        config.time.dt_upper_bound < 0.0 ||
+    if (!std::isfinite(config.time.dt) ||
+        config.time.dt < 0.0 ||
         (root["simulation"] && root["simulation"]["time"] &&
          root["simulation"]["time"]["dt"] &&
-         !(config.time.dt_upper_bound > 0.0)))
+         !(config.time.dt > 0.0)))
         throw std::runtime_error("simulation.time.dt must be finite and > 0 when supplied");
     if (!std::isfinite(config.time.dt_factor) || !(config.time.dt_factor > 0.0))
         throw std::runtime_error("simulation.time.dt_factor must be finite and > 0");

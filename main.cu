@@ -26,6 +26,7 @@
 
 #include "src/core/constant/command_line_interface.h"
 #include "src/core/constant/system_initialize.h"
+#include "src/core/constant/dem_timestep_selection.h"
 #include "src/core/constant/load_or_resume.h"
 #include "src/core/constant/cooperative_stop.h"
 #include "src/core/constant/yorp_checkpoint.h"
@@ -1018,11 +1019,15 @@ public:
             config_.particle.radius_max = bounds.second;
             const MaterialDatabase materials = load_material_database(
                 config_.material_database.path, config_.dem_damping_model);
+            auto timestep_config = config_;
+            // Resume keeps the saved base step; validate it against physical
+            // limits rather than reapplying the legacy automatic safety factor.
+            if (resumed && timestep_config.time.dt == 0.0)
+                timestep_config.time.dt = state_.dt;
             const double allowed_dt = calculate_critical_timestep(
-                config_, state_.particles, materials, state_.particles.num_particles);
+                timestep_config, state_.particles, materials, state_.particles.num_particles);
             if (!resumed) state_.dt = allowed_dt;
-            else if (!(state_.dt > 0.0) || state_.dt > allowed_dt * (1.0 + 1.0e-12))
-                throw std::runtime_error("checkpoint timestep exceeds current contact/orbital/configured limit");
+            else validate_dem_checkpoint_timestep(state_.dt, allowed_dt, config_.time.dt);
             copy_config_to_device(config_);
         }
 

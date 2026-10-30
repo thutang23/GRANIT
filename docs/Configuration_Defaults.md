@@ -59,7 +59,7 @@ See [SPH RESPA and restart](SPH_RESPA.md).
 
 | Group | Defaults retained after tracing consumers |
 | --- | --- |
-| DEM time | `dt_factor=0.2`; no explicit `dt` ceiling; start/stop 0 and output interval 60 s (a real run must supply its duration) |
+| DEM time | `simulation.time.dt` selects the step in seconds; if omitted, legacy automatic factor 0.2; start/stop 0 and output interval 60 s (a real run must supply its duration) |
 | FMM physics | `G=6.67430e-11`; softening `0.01 × minimum radius`; direct-gravity G has the same default |
 | FMM allocation | particle headroom 1.2; minimum node estimate 65,536 |
 | FMM direct work | leaf threshold 16; internal threshold 64; both have active kernel consumers |
@@ -75,6 +75,11 @@ See [SPH RESPA and restart](SPH_RESPA.md).
 | SPH state | damage seed 12,345,678; history off; zero stages/fixed parts; symmetry off; relaxation overrides off |
 | I/O | strict input-type checks; checkpoint enabled every 1,000 steps; no forced fresh start, rebootstrap, scalar stream, timing receipt, or gravity-force sidecar by default |
 | Optional driving/geometry | shear, rotating frame, external bodies, YORP, acceleration fields, walls and clumps remain explicitly configured; defaults do not prescribe a physical experiment |
+
+Explicit DEM `dt` is checked against the contact critical and orbital limits;
+it is used directly or rejected, without factor scaling. The deprecated
+`dt_factor` alternative cannot be combined with `dt`. SPH uses its adaptive
+seconds-valued bounds. See [timestep migration](YAML_Configuration_Guide.md#timestep-in-seconds).
 
 The SPH example intentionally overrides several numerical defaults for its
 lattice; those overrides remain visible. Constitutive properties are required
