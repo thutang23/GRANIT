@@ -169,7 +169,7 @@ bool read_unified_binary(
             desc.dtype == static_cast<uint8_t>(DType::F32);
         if (desc.reserved != 0 || !field_ids.insert(desc.field_id).second ||
             !field_layout(field_id, &expected_dtype, &expected_count) ||
-            (desc.dtype != static_cast<uint8_t>(expected_dtype) && !legacy_f32_density && !(field_id == FieldID::FORCE &&
+            (desc.dtype != static_cast<uint8_t>(expected_dtype) && !legacy_f32_density && !((field_id == FieldID::FORCE || field_id == FieldID::TORQUE) &&
                 desc.dtype == static_cast<uint8_t>(DType::F64))) ||
             desc.count != expected_count) {
             std::cerr << "ERROR: Invalid, duplicate, or unsupported field descriptor" << std::endl;
@@ -477,14 +477,18 @@ bool read_unified_binary(
                 break;
             }
             case FieldID::TORQUE: {
-                std::vector<float> buf(N);
                 double* dst_ptrs[3] = { particles.torque_x, particles.torque_y, particles.torque_z };
                 for (int c = 0; c < cnt; ++c) {
-                    file.read(reinterpret_cast<char*>(buf.data()), N * sizeof(float));
-                    for (float value : buf) if (!std::isfinite(value)) { std::cerr << "ERROR: torque must be finite" << std::endl; return false; }
-                    std::vector<double> buf_d(N);
-                    for (int32_t i = 0; i < N; ++i) buf_d[i] = static_cast<double>(buf[i]);
-                    cudaMemcpy(dst_ptrs[c], buf_d.data(), N * sizeof(double), cudaMemcpyHostToDevice);
+                    std::vector<double> values(N);
+                    if (desc.dtype == static_cast<uint8_t>(DType::F64))
+                        file.read(reinterpret_cast<char*>(values.data()), N * sizeof(double));
+                    else {
+                        std::vector<float> legacy(N);
+                        file.read(reinterpret_cast<char*>(legacy.data()), N * sizeof(float));
+                        std::copy(legacy.begin(), legacy.end(), values.begin());
+                    }
+                    for (double value : values) if (!std::isfinite(value)) { std::cerr << "ERROR: torque must be finite" << std::endl; return false; }
+                    CUDA_CHECK(cudaMemcpy(dst_ptrs[c], values.data(), N * sizeof(double), cudaMemcpyHostToDevice));
                 }
                 break;
             }
@@ -720,23 +724,30 @@ bool read_unified_binary(
     }
 
     // --- Contact history blob (checkpoint only) ---
-    if (header.record_kind == static_cast<uint8_t>(BinaryRecordKind::CHECKPOINT) && header.total_contacts > 0) {
-        int32_t max_contacts = header.max_contacts_per_particle;
-        allocate_contact_history(state.contact_history, N, max_contacts);
-
-        int32_t history_size = N * max_contacts;
-        std::vector<ContactHistory> h_contact_history(history_size);
-        file.seekg(static_cast<std::streamoff>(payload_end), std::ios::beg);
-        file.read(reinterpret_cast<char*>(h_contact_history.data()),
-                  history_size * sizeof(ContactHistory));
-        if (!file) {
-            std::cerr << "ERROR: Failed to read contact history from: " << path << std::endl;
+    if (header.record_kind == static_cast<uint8_t>(BinaryRecordKind::CHECKPOINT) && header.max_contacts_per_particle > 0) {
+        // Capacity is continuation state even when every current contact is
+        // inactive. Preserve the declared stride instead of reverting to 32.
+        if (static_cast<uint64_t>(N) * header.max_contacts_per_particle > INT32_MAX) {
+            std::cerr << "ERROR: Checkpoint contact capacity exceeds supported range" << std::endl;
             return false;
         }
-        cudaMemcpy(state.contact_history.data, h_contact_history.data(),
-                   history_size * sizeof(ContactHistory), cudaMemcpyHostToDevice);
-        std::cout << "  Contact history: " << header.total_contacts
-                  << " contacts (capacity: " << history_size << ")" << std::endl;
+        int32_t max_contacts = header.max_contacts_per_particle;
+        allocate_contact_history(state.contact_history, N, max_contacts);
+        if (header.total_contacts > 0) {
+            int32_t history_size = N * max_contacts;
+            std::vector<ContactHistory> h_contact_history(history_size);
+            file.seekg(static_cast<std::streamoff>(payload_end), std::ios::beg);
+            file.read(reinterpret_cast<char*>(h_contact_history.data()),
+                      history_size * sizeof(ContactHistory));
+            if (!file) {
+                std::cerr << "ERROR: Failed to read contact history from: " << path << std::endl;
+                return false;
+            }
+            cudaMemcpy(state.contact_history.data, h_contact_history.data(),
+                       history_size * sizeof(ContactHistory), cudaMemcpyHostToDevice);
+            std::cout << "  Contact history: " << header.total_contacts
+                      << " contacts (capacity: " << history_size << ")" << std::endl;
+        }
     }
 
     file.close();

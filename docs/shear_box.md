@@ -64,9 +64,10 @@ shear_box:
 `vertical_frequency` defaults to `omega`. `time_origin` is the zero-shear
 phase and must remain fixed across restart. `input_velocity` is either `total`
 or `peculiar`; outputs use total velocity. `orbital_dt_factor` bounds the time
-step by an orbital scale, but it does not replace the stricter soft-contact
-time-step constraint. Optional `simulation.time.dt` is another upper bound,
-not a fixed step.
+step by an orbital scale. Set `simulation.time.dt` to the DEM integration step
+in seconds; a value above the orbital or contact critical limit is rejected.
+The deprecated factor-based fallback still takes the smaller contact/orbital
+candidate. See [timestep migration](YAML_Configuration_Guide.md#timestep-in-seconds).
 
 `gravity_images.layers_x=1` and `layers_y=1` evaluate the central patch plus
 the surrounding eight sheared replicas. Two layers evaluate a 5 by 5 set (24

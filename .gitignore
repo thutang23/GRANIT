@@ -1,4 +1,6 @@
 /build*/
+/build-cooperative-stop
+/checkpoint-stop-evidence
 /runs/
 /output/
 

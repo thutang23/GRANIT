@@ -13,7 +13,7 @@ are loaded from the material database; internal placeholders do not supply them.
 | `TimeConfig.stop_time` | 0 |
 | `TimeConfig.output_step` | 60 |
 | `TimeConfig.dt_factor` | 0.2 |
-| `TimeConfig.dt_upper_bound` | 0 |
+| `TimeConfig.dt` | 0 |
 | `ShearBoxConfig.enabled` | false |
 | `ShearBoxConfig.omega` | 0 |
 | `ShearBoxConfig.shear_parameter` | 1.5 |

@@ -84,7 +84,7 @@ def main():
         report['commands'].append({'argv':command,'returncode':result.returncode,'config_sha256':replay.digest(path)})
         save()
         if result.returncode:raise RuntimeError(f'{name}: see {folder / "run.log"}')
-        files=sorted((folder/'checkpoints').glob('checkpoint_step_*.bin'))
+        files=[p.resolve(strict=True) for p in sorted((folder/'checkpoints').glob('checkpoint_step_*.bin'))]
         assert files,name
         data=ordered(read_particle_binary(files[-1]));assert data.force.dtype==np.float64
         assert data.gravity_acceleration.dtype==np.float64
@@ -145,6 +145,7 @@ def main():
         elif kind=='physical':
             c['sph_parameters']['hsml_min']=1e-5
         elif kind=='corrupt':
+            checkpoint=checkpoint.resolve(strict=True)
             copied=folder/checkpoint.name
             for path in checkpoint.parent.glob(checkpoint.name+'*'):
                 shutil.copy2(path,folder/path.name)

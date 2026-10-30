@@ -99,6 +99,14 @@ int32_t bonded_rect_wall_get_states(
     BondedRectReaction* host_reactions
 );
 
+// Restore a closed-step checkpoint after initialization. Fixed wall identity,
+// geometry and inertia must still match the current configuration.
+void bonded_rect_wall_restore_states(
+    const BondedRectWallState* host_states,
+    const BondedRectReaction* host_reactions,
+    int32_t count
+);
+
 // Launch contact force kernel: per-particle box test → Hertz-Mindlin → atomicAdd.
 // Must be called before bonded_rect_wall_integrate on the same stream.
 void bonded_rect_wall_compute_forces(

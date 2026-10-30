@@ -82,9 +82,9 @@ data, and truncation.
 | 0x0011 | radius | f32 × 1 |
 | 0x0012 | mass | f32 × 1 |
 | 0x0013 | moment_of_inertia | f32 × 1 |
-| 0x0014 | force | f32 × 3; SPH checkpoints use f64 × 3 fast force |
-| 0x001E | gravity_acceleration | f64 × 3; SPH checkpoint slow acceleration |
-| 0x0015 | torque | f32 × 3 |
+| 0x0014 | force | f32 × 3 output; new DEM/SPH checkpoints use f64 × 3 |
+| 0x001E | gravity_acceleration | f64 × 3; checkpoint slow gravity cache |
+| 0x0015 | torque | f32 × 3 output; new DEM checkpoints use f64 × 3 |
 | 0x0016 | quaternion | f64 × 4 |
 | 0x0017 | num_contacts | i32 × 1 |
 | 0x0018 | clump_id | i32 × 1 |

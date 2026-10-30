@@ -1,4 +1,6 @@
 #include "src/core/constant/command_line_interface.h"
+#include "src/core/constant/dem_timestep_selection.h"
+#include <limits>
 #include <yaml-cpp/yaml.h>
 #include <filesystem>
 #include <fstream>
@@ -38,6 +40,29 @@ int main(int argc, char** argv) {
         throw std::runtime_error(std::string("unexpected acceptance: ") + expected);
     };
     try {
+        const double infinity = std::numeric_limits<double>::infinity();
+        check(select_dem_timestep(0.75, 0.2, 1.0, infinity) == 0.75,
+              "explicit dt above legacy fraction remains exact");
+        check(select_dem_timestep(0.0, 0.2, 1.0, infinity) == 0.2, "legacy default dt");
+        check(select_dem_timestep(0.0, 0.3, 1.0, 0.1) == 0.1, "legacy orbital clipping");
+        auto selection_rejects = [&](double dt, double factor, double critical, double orbital) {
+            try { select_dem_timestep(dt, factor, critical, orbital); }
+            catch (const std::runtime_error&) { return; }
+            throw std::runtime_error("invalid timestep accepted");
+        };
+        selection_rejects(1.01, 0.2, 1.0, infinity);
+        selection_rejects(0.5, 0.2, 1.0, 0.4);
+        selection_rejects(-1.0, 0.2, 1.0, infinity);
+        selection_rejects(infinity, 0.2, 1.0, infinity);
+        selection_rejects(0.0, infinity, 1.0, infinity);
+        validate_dem_checkpoint_timestep(0.5, 0.75, 0.0);
+        validate_dem_checkpoint_timestep(0.5, 0.5, 0.5);
+        for (const auto request : {0.25, 0.75}) {
+            bool rejected = false;
+            try { validate_dem_checkpoint_timestep(0.5, request, request); }
+            catch (const std::runtime_error&) { rejected = true; }
+            check(rejected, "checkpoint explicit dt mismatch rejected");
+        }
         const SimConfig raw;
         check(raw.acceleration.gravity_update_rate == 2, "raw RESPA default");
         check(raw.neighbor.method == NeighborMethod::LBVH, "raw LBVH default");
@@ -47,6 +72,25 @@ int main(int argc, char** argv) {
         check(!config.acceleration.enable_self_gravity && !config.acceleration.enable_inertial &&
               !config.acceleration.enable_tidal && !config.damping.enabled, "inactive forces/damping");
         check(!config.acceleration.unified_fmm.adaptive_depth.enabled, "inactive controller");
+        auto timestep = base();
+        timestep["simulation"]["time"]["dt"] = 0.75;
+        check(parse(timestep).time.dt == 0.75, "seconds timestep parsed exactly");
+        timestep["simulation"]["time"]["dt_factor"] = 0.1;
+        rejects(timestep, "mutually exclusive");
+        for (double invalid : {0.0, -1.0, infinity, std::numeric_limits<double>::quiet_NaN()}) {
+            timestep = base(); timestep["simulation"]["time"]["dt"] = invalid;
+            rejects(timestep, "simulation.time.dt must be finite");
+            timestep = base(); timestep["simulation"]["time"]["dt_factor"] = invalid;
+            rejects(timestep, "simulation.time.dt_factor must be finite");
+        }
+        timestep = base(); timestep["simulation"]["time"]["dt_factor"] = 0.1;
+        check(parse(timestep).time.dt_factor == 0.1 && parse(timestep).time.dt == 0.0,
+              "legacy factor preserved");
+        for (const char* key : {"dt", "dt_factor"}) {
+            timestep = base(); timestep["simulation"]["physics"] = "sph";
+            timestep["simulation"]["time"][key] = 0.1;
+            rejects(timestep, "SPH uses sph_parameters.dt_min and sph_parameters.dt_max");
+        }
         root["accelerations"]["self_gravity"]["enabled"] = true;
         auto gravity = YAML::Clone(root);
         config = parse(root);

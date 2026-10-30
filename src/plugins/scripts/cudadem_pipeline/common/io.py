@@ -295,7 +295,7 @@ def read_particle_binary(filepath: str | Path) -> ParticleData:
         if reserved != 0 or field_id in seen or field_id not in FIELD_REGISTRY:
             _fail("duplicate, unknown, or reserved descriptor")
         expected_name, expected_dtype, expected_count = FIELD_REGISTRY[field_id]
-        flexible_runtime_dtype = (field_id in SPH_RUNTIME_F64_FIELDS or field_id == 0x0014) and dtype_value in (0, 1)
+        flexible_runtime_dtype = (field_id in SPH_RUNTIME_F64_FIELDS or field_id in (0x0014, 0x0015)) and dtype_value in (0, 1)
         if (dtype_value != expected_dtype and not flexible_runtime_dtype) or count != expected_count:
             _fail(f"wrong dtype/count for {expected_name}")
         itemsize = DTYPE_MAP[dtype_value].itemsize
@@ -493,6 +493,8 @@ def write_particle_binary(filepath: str | Path, data: ParticleData, physics: str
                      FIELD_FLAWS_NTOT, FIELD_FLAWS_STRAIN_MIN,
                      FIELD_FLAWS_STRAIN_MAX, FIELD_FLAWS_M0,
                      0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0040, 0x0041, 0x0042])
+    if physics == "dem" and record_kind == "checkpoint":
+        optional.append(0x001E)  # Retained slow-gravity cache for RESPA continuation.
     arrays = {"material_id": material_id, "clump_id": clump_id, "lifecycle_state": lifecycle_state, "clump_offset": data.clump_offset,
               "winding_x": data.winding_x, "winding_y": data.winding_y,
               "winding_z": data.winding_z,
@@ -523,13 +525,13 @@ def write_particle_binary(filepath: str | Path, data: ParticleData, physics: str
     winding_fields = list(WINDING_FIELDS) if has_winding else []
     for field_id in field_ids + optional + clump_fields + lifecycle_fields + winding_fields:
         name, input_dtype_value, count = FIELD_REGISTRY[field_id]
-        dtype_value = (1 if physics == "sph" and record_kind != "input" and
-                       (field_id in SPH_RUNTIME_F64_FIELDS or (field_id == 0x0014 and record_kind == "checkpoint")) else input_dtype_value)
+        exact_runtime = ((physics == "sph" and record_kind != "input" and field_id in SPH_RUNTIME_F64_FIELDS) or
+                         (record_kind == "checkpoint" and field_id in (0x0014, 0x0015)))
+        dtype_value = 1 if exact_runtime else input_dtype_value
         attr = _NAME_REMAP.get(name, name)
         value = arrays[attr]
         if field_id in field_ids or value is not None:
-            if (physics == "sph" and record_kind != "input" and
-                    (field_id in SPH_RUNTIME_F64_FIELDS or (field_id == 0x0014 and record_kind == "checkpoint"))):
+            if exact_runtime:
                 runtime_value = np.asarray(value)
                 expected_shape = (n,) if count == 1 else (n, count)
                 if runtime_value.shape != expected_shape or runtime_value.dtype not in (

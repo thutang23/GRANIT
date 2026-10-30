@@ -89,9 +89,9 @@ enum class FieldID : uint16_t {
     RADIUS           = 0x0011,  // f32, 1
     MASS             = 0x0012,  // f32, 1
     MOMENT_OF_INERTIA = 0x0013, // f32, 1
-    FORCE            = 0x0014,  // f32, 3
-    GRAVITY_ACCELERATION = 0x001E, // f64, 3 (SPH checkpoint slow acceleration)
-    TORQUE           = 0x0015,  // f32, 3
+    FORCE            = 0x0014,  // f32 output, f64 checkpoint, 3
+    GRAVITY_ACCELERATION = 0x001E, // f64, 3 (checkpoint slow gravity cache)
+    TORQUE           = 0x0015,  // f32 output, f64 checkpoint, 3
     QUATERNION       = 0x0016,  // f64, 4 (checkpoint only)
     NUM_CONTACTS     = 0x0017,  // i32, 1 (checkpoint only)
     CLUMP_ID         = 0x0018,  // i32, 1 (optional input; mandatory output/checkpoint)
@@ -213,7 +213,7 @@ inline uint64_t compute_descriptor_offsets(std::vector<FieldDescriptor>& descrip
 // =============================================================================
 inline void write_double_array(std::ofstream& file, const double* d_ptr, int32_t N) {
     std::vector<double> buf(N);
-    cudaMemcpy(buf.data(), d_ptr, N * sizeof(double), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(buf.data(), d_ptr, static_cast<size_t>(N) * sizeof(double), cudaMemcpyDeviceToHost));
     file.write(reinterpret_cast<const char*>(buf.data()), N * sizeof(double));
 }
 
@@ -222,7 +222,7 @@ inline void write_double_array(std::ofstream& file, const double* d_ptr, int32_t
 // =============================================================================
 inline void write_double_as_float(std::ofstream& file, const double* d_ptr, int32_t N) {
     std::vector<double> buf_d(N);
-    cudaMemcpy(buf_d.data(), d_ptr, N * sizeof(double), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(buf_d.data(), d_ptr, static_cast<size_t>(N) * sizeof(double), cudaMemcpyDeviceToHost));
     std::vector<float> buf_f(N);
     for (int32_t i = 0; i < N; ++i) buf_f[i] = static_cast<float>(buf_d[i]);
     file.write(reinterpret_cast<const char*>(buf_f.data()), N * sizeof(float));
@@ -233,7 +233,7 @@ inline void write_double_as_float(std::ofstream& file, const double* d_ptr, int3
 // =============================================================================
 inline void write_float_array(std::ofstream& file, const float* d_ptr, int32_t N) {
     std::vector<float> buf(N);
-    cudaMemcpy(buf.data(), d_ptr, N * sizeof(float), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(buf.data(), d_ptr, static_cast<size_t>(N) * sizeof(float), cudaMemcpyDeviceToHost));
     file.write(reinterpret_cast<const char*>(buf.data()), N * sizeof(float));
 }
 
@@ -242,17 +242,17 @@ inline void write_float_array(std::ofstream& file, const float* d_ptr, int32_t N
 // =============================================================================
 inline void write_int32_array(std::ofstream& file, const int32_t* d_ptr, int32_t N) {
     std::vector<int32_t> buf(N);
-    cudaMemcpy(buf.data(), d_ptr, N * sizeof(int32_t), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(buf.data(), d_ptr, static_cast<size_t>(N) * sizeof(int32_t), cudaMemcpyDeviceToHost));
     file.write(reinterpret_cast<const char*>(buf.data()), N * sizeof(int32_t));
 }
 inline void write_uint8_array(std::ofstream& file, const uint8_t* d_ptr, int32_t N) {
-    std::vector<uint8_t> buf(N); cudaMemcpy(buf.data(), d_ptr, N * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+    std::vector<uint8_t> buf(N); CUDA_CHECK(cudaMemcpy(buf.data(), d_ptr, static_cast<size_t>(N) * sizeof(uint8_t), cudaMemcpyDeviceToHost));
     file.write(reinterpret_cast<const char*>(buf.data()), N * sizeof(uint8_t));
 }
 
 inline void write_int64_array(std::ofstream& file, const int64_t* d_ptr, int32_t N) {
     std::vector<int64_t> buf(N);
-    cudaMemcpy(buf.data(), d_ptr, static_cast<size_t>(N) * sizeof(int64_t), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(buf.data(), d_ptr, static_cast<size_t>(N) * sizeof(int64_t), cudaMemcpyDeviceToHost));
     file.write(reinterpret_cast<const char*>(buf.data()), static_cast<size_t>(N) * sizeof(int64_t));
 }
 
@@ -350,8 +350,9 @@ inline bool write_unified_binary(
             descriptors.emplace_back(FieldID::OMEGA,             DType::F64, 3, 0);
             descriptors.emplace_back(FieldID::MASS,              DType::F32, 1, 0);
             descriptors.emplace_back(FieldID::MOMENT_OF_INERTIA, DType::F32, 1, 0);
-            descriptors.emplace_back(FieldID::FORCE,             DType::F32, 3, 0);
-            descriptors.emplace_back(FieldID::TORQUE,            DType::F32, 3, 0);
+            descriptors.emplace_back(FieldID::FORCE,             DType::F64, 3, 0);
+            descriptors.emplace_back(FieldID::TORQUE,            DType::F64, 3, 0);
+            descriptors.emplace_back(FieldID::GRAVITY_ACCELERATION, DType::F64, 3, 0);
             descriptors.emplace_back(FieldID::QUATERNION,        DType::F64, 4, 0);
             descriptors.emplace_back(FieldID::NUM_CONTACTS,      DType::I32, 1, 0);
             descriptors.emplace_back(FieldID::CLUMP_OFFSET,      DType::F32, 3, 0);
@@ -454,7 +455,7 @@ inline bool write_unified_binary(
                 write_double_array(file, particles.gravity_force_z, N);
                 break;
             case FieldID::FORCE:
-                if (is_checkpoint && is_sph) {
+                if (is_checkpoint) {
                     write_double_array(file, particles.force_x, N);
                     write_double_array(file, particles.force_y, N);
                     write_double_array(file, particles.force_z, N);
@@ -465,9 +466,15 @@ inline bool write_unified_binary(
                 }
                 break;
             case FieldID::TORQUE:
-                write_double_as_float(file, particles.torque_x, N);
-                write_double_as_float(file, particles.torque_y, N);
-                write_double_as_float(file, particles.torque_z, N);
+                if (is_checkpoint) {
+                    write_double_array(file, particles.torque_x, N);
+                    write_double_array(file, particles.torque_y, N);
+                    write_double_array(file, particles.torque_z, N);
+                } else {
+                    write_double_as_float(file, particles.torque_x, N);
+                    write_double_as_float(file, particles.torque_y, N);
+                    write_double_as_float(file, particles.torque_z, N);
+                }
                 break;
             case FieldID::QUATERNION:
                 write_double_array(file, particles.quat_w, N);
@@ -546,8 +553,9 @@ inline bool write_unified_binary(
                    contact_data->size() * sizeof(ContactHistory));
     }
 
+    file.flush();
     file.close();
-    return true;
+    return static_cast<bool>(file);
 }
 
 } // namespace cudadem

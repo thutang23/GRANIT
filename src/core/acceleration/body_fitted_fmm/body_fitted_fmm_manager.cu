@@ -1009,10 +1009,21 @@ static void drain_live_adaptive_depth_diagnostics_to_backlog(
     int gpu_id, cudaStream_t stream)
 {
     auto& runtime = persistent_tree_runtime_[gpu_id];
-    if (!runtime.initialized || !runtime.adaptive_options.enabled ||
-        adaptive_depth_control_mode_[gpu_id] !=
-            AdaptiveFMMDepthControlMode::Autonomous)
+    if (!runtime.initialized || !runtime.adaptive_options.enabled)
         return;
+    if (adaptive_depth_control_mode_[gpu_id] != AdaptiveFMMDepthControlMode::Autonomous) {
+        // Externally controlled ranks can still emit capacity transitions.
+        // Preserve those records too before replacing their device ring.
+        AdaptiveFMMDepthDiagnostic records[ADAPTIVE_DEPTH_DIAGNOSTIC_RING_SIZE];
+        int count = 0; uint64_t dropped = 0;
+        body_fitted_fmm::consume_adaptive_depth_diagnostics(runtime, records,
+            ADAPTIVE_DEPTH_DIAGNOSTIC_RING_SIZE, count, dropped, stream);
+        adaptive_depth_diagnostic_drain_[gpu_id].backlog.insert(
+            adaptive_depth_diagnostic_drain_[gpu_id].backlog.end(), records, records + count);
+        if (dropped != 0)
+            throw std::runtime_error("Adaptive FMM depth diagnostic loss during runtime replacement");
+        return;
+    }
     // A periodic snapshot may still be queued.  Preserve it before reusing
     // the staging buffer, then capture all newer records at this boundary.
     (void)harvest_adaptive_depth_diagnostic_snapshot(gpu_id, true);
@@ -2444,12 +2455,13 @@ void UnifiedFMMDispatcher::initialize_adaptive(
         return;
     }
     if (initialized_[gpu_id]) {
+        // Preserve every old-ring row before capturing its consumer watermark.
+        // The replacement runtime resumes that watermark, while the host
+        // backlog retains the rows until the normal diagnostic writer flushes.
+        drain_live_adaptive_depth_diagnostics_to_backlog(gpu_id, stream);
         // Capacity service replaces the persistent/FMM arenas, but the
         // multi-GPU timing mailbox remains valid and can still be polled for
-        // completed pre-service epochs.  Final shutdown owns its teardown.
-        // A compatible particle-capacity reallocation must also retain the
-        // controller and diagnostic sequence; otherwise host-backlogged rows
-        // would be followed by a replacement ring restarting at sequence 1.
+        // completed pre-service epochs. Final shutdown owns its teardown.
         if (!has_pending_adaptive_depth_checkpoint_[gpu_id] &&
             persistent_depth_configuration_matches(
                 persistent_tree_runtime_[gpu_id], fmm)) {
@@ -2458,7 +2470,6 @@ void UnifiedFMMDispatcher::initialize_adaptive(
                     persistent_tree_runtime_[gpu_id], stream);
             has_pending_adaptive_depth_checkpoint_[gpu_id] = true;
         }
-        drain_live_adaptive_depth_diagnostics_to_backlog(gpu_id, stream);
         free_memory(gpu_id);
     }
     verbose_[gpu_id] = fmm.verbose;
@@ -3942,6 +3953,10 @@ bool UnifiedFMMDispatcher::service_adaptive_fmm_capacity(
         return false;
     }
 
+    // This checkpoint is restored during arena replacement. Capture only
+    // after old diagnostics are safely in the host backlog, so producer and
+    // consumer sequences describe the same lossless boundary.
+    drain_live_adaptive_depth_diagnostics_to_backlog(gpu_id, stream);
     AdaptiveFMMDepthCheckpoint checkpoint =
         body_fitted_fmm::snapshot_adaptive_depth_checkpoint(
             persistent_tree_runtime_[gpu_id], stream);
